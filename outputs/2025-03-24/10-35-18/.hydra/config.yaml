@@ -1,0 +1,27 @@
+model:
+  name: default_model
+  type: neural_network
+  input_size: 784
+  hidden_size: 128
+  output_size: 10
+  dropout: 0.1
+  init_method: xavier
+  init_gain: 1.0
+  _target_: your.model.path.ModelClass
+project_name: AMR
+run_name: ${now:%Y-%m-%d_%H-%M-%S}
+seed: 42
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+dataset:
+  _target_: your.datamodule.path.DataModuleClass
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 0.001
+wandb:
+  project: AMR
+  entity: hhayden-mit
+  mode: online
+  debug: false
+  log_model: true
+  save_code: true

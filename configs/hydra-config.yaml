@@ -1,0 +1,41 @@
+defaults:
+  - model: default
+  - _self_
+
+# Global configurations
+project_name: AMR
+run_name: ${now:%Y-%m-%d_%H-%M-%S}
+mode: online
+debug: false
+log_model: true
+save_code: true
+seed: 42
+
+# Training
+epochs: 10
+
+# Paths
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+
+# moide dir/ class file name/ class
+Encoder:
+  _target_: models.encoder.MyEncoder
+  hidden_dim: 256
+  num_layers: 3
+
+Decoder:
+  _target_: models.encoder.MyEncoder
+  hidden_dim: 256
+  num_layers: 3
+
+dataset:
+  _target_: your.datamodule.path.DataModuleClass
+  batch_size: 32
+  num_workers: 4
+  train_val_split: [0.7, 0.3]
+  random_seed: ${seed}
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 0.001

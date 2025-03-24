@@ -1,0 +1,60 @@
+import hydra
+from omegaconf import DictConfig
+import lightning as L
+from lightning.pytorch import Trainer
+from lightning.pytorch.loggers import WandbLogger
+
+@hydra.main(config_path="../configs", config_name="hydra-config")
+def main(cfg: DictConfig):
+    # Hydra automatically creates outputs directory and changes working directory
+    
+    # Initialize wandb logger with additional best practices
+    wandb_logger = WandbLogger(
+        project=cfg.project_name,
+        name=cfg.run_name,
+        offline=cfg.debug,
+        log_model=True  # Automatically upload model checkpoints
+    )
+    
+    # Log hyperparameters from config
+    wandb_logger.log_hyperparams(dict(cfg))
+    
+    # Instantiate objects directly from config
+    model = hydra.utils.instantiate(cfg.model)
+    datamodule = hydra.utils.instantiate(cfg.dataset)
+    optimizer = hydra.utils.instantiate(cfg.optimizer, params=model.parameters())
+
+    # checkpoint=path to ckpt checkpoint
+    ckpt_path = None
+    if hasattr(cfg, 'checkpoint') and cfg.checkpoint_path:
+        ckpt_path = cfg.checkpoint_path
+    
+
+    trainer = L.Trainer(
+        max_epochs=cfg.training.epochs,
+        logger=wandb_logger,
+        default_root_dir=".",
+        # save best three state dicts based off of val loss
+        callbacks=[
+            L.pytorch.callbacks.ModelCheckpoint(
+                monitor='val_loss',  # or whatever metric you want to track
+                mode='min',
+                save_top_k=3,
+                filename='model:{cfg.model}--{val_loss:.2f}',
+                dirpath='checkpoints'
+            ),
+            L.pytorch.callbacks.LearningRateMonitor(logging_interval='step'),
+        ],
+    )
+    
+    trainer.fit(
+        model,
+        datamodule,
+        max_epochs=cfg.epochs,
+        ckpt_path=ckpt_path
+    )
+
+    
+
+if __name__ == "__main__":
+    main()
