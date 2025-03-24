@@ -10,10 +10,11 @@ This project uses Weights & Biases (wandb) for experiment tracking and Hydra for
 ├── src/              # Source code
 │   ├── data/         # Data loading and processing
 │   ├── models/       # Model definitions
-│   ├── training/     # Training logic
 │   └── utils/        # Utility functions
 ├── tests/            # Test files
-└── notebooks/        # Jupyter notebooks
+├── venv              # Python Virtual Env
+└── notebooks/        # Jupyter notebooks for proof of concepts
+└── outputs/          # Model runs
 ```
 
 ## Setup
@@ -52,4 +53,3 @@ The project uses Hydra for configuration management. Main configuration files ar
 - `config.yaml`: Main configuration file
 - `model/`: Model-specific configurations
 - `data/`: Data-specific configurations
-- `training/`: Training-specific configurations
