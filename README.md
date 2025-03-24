@@ -13,8 +13,8 @@ This project uses Weights & Biases (wandb) for experiment tracking and Hydra for
 │   └── utils/        # Utility functions
 ├── tests/            # Test files
 ├── venv              # Python Virtual Env
+├── outputs/          # Model runs
 └── notebooks/        # Jupyter notebooks for proof of concepts
-└── outputs/          # Model runs
 ```
 
 ## Setup
