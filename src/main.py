@@ -19,14 +19,14 @@ def main(cfg: DictConfig):
     
     # Log hyperparameters from config
     wandb_logger.log_hyperparams(dict(cfg.hyperparams))
-    # Use the get_dataloaders function
+
+    # get our data loaders (batch_size, 2, 128)
     train_loader, val_loader = get_dataloaders(cfg.dataset)
     
-    optimizer = hydra.utils.instantiate(cfg.optimizer, params=model.parameters())
-
     # Instantiate objects directly from config
-    model = hydra.utils.instantiate(cfg.model)
-    # checkpoint=path to ckpt checkpoint
+    model = hydra.utils.instantiate(cfg.model, optimizer=cfg.optimizer)
+
+    # We save a checkpoint every time we train, we can specify this in the config if we want to load one 
     ckpt_path = None
     if hasattr(cfg, 'checkpoint') and cfg.checkpoint_path:
         ckpt_path = cfg.checkpoint_path
@@ -41,7 +41,7 @@ def main(cfg: DictConfig):
             L.pytorch.callbacks.ModelCheckpoint(
                 monitor='val_loss',  # or whatever metric you want to track
                 mode='min',
-                save_top_k=3,
+                save_top_k=1,
                 filename='model:{cfg.model}--{val_loss:.2f}',
                 dirpath='checkpoints'
             ),
@@ -57,7 +57,6 @@ def main(cfg: DictConfig):
         ckpt_path=ckpt_path
     )
 
-    
 
 if __name__ == "__main__":
     main()
