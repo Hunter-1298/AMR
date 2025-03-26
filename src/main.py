@@ -3,6 +3,7 @@ from omegaconf import DictConfig
 import lightning as L
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import WandbLogger
+from data.rfml_dataset_2016 import get_dataloaders
 
 @hydra.main(config_path="../configs", config_name="hydra-config")
 def main(cfg: DictConfig):
@@ -17,13 +18,14 @@ def main(cfg: DictConfig):
     )
     
     # Log hyperparameters from config
-    wandb_logger.log_hyperparams(dict(cfg))
+    wandb_logger.log_hyperparams(dict(cfg.hyperparams))
+    # Use the get_dataloaders function
+    train_loader, val_loader = get_dataloaders(cfg.dataset)
     
-    # Instantiate objects directly from config
-    model = hydra.utils.instantiate(cfg.model)
-    datamodule = hydra.utils.instantiate(cfg.dataset)
     optimizer = hydra.utils.instantiate(cfg.optimizer, params=model.parameters())
 
+    # Instantiate objects directly from config
+    model = hydra.utils.instantiate(cfg.model)
     # checkpoint=path to ckpt checkpoint
     ckpt_path = None
     if hasattr(cfg, 'checkpoint') and cfg.checkpoint_path:
@@ -49,8 +51,9 @@ def main(cfg: DictConfig):
     
     trainer.fit(
         model,
-        datamodule,
-        max_epochs=cfg.epochs,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        max_epochs=cfg.hyperparams.epochs,
         ckpt_path=ckpt_path
     )
 
