@@ -24,7 +24,7 @@ def main(cfg: DictConfig):
     train_loader, val_loader = get_dataloaders(cfg.dataset)
     
     # Instantiate objects directly from config
-    model = hydra.utils.instantiate(cfg.model, optimizer=cfg.optimizer)
+    model = hydra.utils.instantiate(cfg.Model)
 
     # We save a checkpoint every time we train, we can specify this in the config if we want to load one 
     ckpt_path = None

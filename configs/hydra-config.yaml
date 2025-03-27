@@ -22,6 +22,27 @@ data_dir: data/
 
 Model:
   _target_: models.router.Router
+  input_dim: 256 # Specify your input dimension
+  hidden_dim: 128 # Specify your hidden dimension
+  num_experts: 1 # Specify number of experts (should match number of experts in config)
+
+Classifier:
+  _target_: models.classifier.Classifier
+  input_dim: 256 # Input dim is the stacked output of all the experts
+  hidden_dim: 128 # hidden dim
+  num_classes: 11
+
+# Expert configurations
+experts:
+  # Spatial Expert
+  - _target_: models.experts.spatial.Spatial_CNN
+
+    # Add expert-specific configs here
+
+  # Add more experts here to match num_experts
+  # - _target_: path.to.expert.ExpertModel2
+  # - _target_: path.to.expert.ExpertModel3
+  # etc...
 
 dataset:
   batch_size: ${hyperparams.batch_size}
@@ -31,4 +52,5 @@ dataset:
 
 optimizer:
   _target_: torch.optim.Adam
+  __partial__: true # dont create the object yet, we pass model params later
   lr: ${hyperparams.learning_rate}
