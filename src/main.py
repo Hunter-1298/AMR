@@ -3,7 +3,7 @@ from omegaconf import DictConfig
 import lightning as L
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import WandbLogger
-from data.rfml_dataset_2016 import get_dataloaders
+from data.rfml_dataset_2016 import RFMLDataset, get_dataloaders 
 
 @hydra.main(config_path="../configs", config_name="hydra-config")
 def main(cfg: DictConfig):
@@ -33,7 +33,7 @@ def main(cfg: DictConfig):
     
 
     trainer = L.Trainer(
-        max_epochs=cfg.training.epochs,
+        max_epochs=cfg.hyperparams.epochs,
         logger=wandb_logger,
         default_root_dir=".",
         # save best three state dicts based off of val loss
@@ -53,7 +53,6 @@ def main(cfg: DictConfig):
         model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
-        max_epochs=cfg.hyperparams.epochs,
         ckpt_path=ckpt_path
     )
 

@@ -12,13 +12,14 @@ class Classifier(nn.Module):
             - hidden_dim (int): Hidden layer dimension 
             - num_classes (int): Number of output classes
     """
-    def __init__(self, cfg: DictConfig):
+    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int, dropout: float) -> None:
         super(Classifier, self).__init__()
+        self.input_dim = input_dim
         self.classifier = nn.Sequential(
-            nn.Linear(cfg.input_dim, cfg.hidden_dim),
+            nn.Linear(self.input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(cfg.hyperparams.dropout),
-            nn.Linear(cfg.hidden_dim, cfg.num_classes)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes)
         )
         
     def forward(self, x):

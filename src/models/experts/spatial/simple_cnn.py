@@ -13,7 +13,7 @@ class Spatial_CNN(nn.Module):
     Args:
         cfg (DictConfig): Configuration object containing model parameters
     """
-    def __init__(self, cfg: DictConfig):
+    def __init__(self):
         super(Spatial_CNN, self).__init__()
         # Define CNN layers
         # Input: [batch_size, 2, 128]
@@ -38,4 +38,5 @@ class Spatial_CNN(nn.Module):
         
         # Global average pooling - average across sequence dimension
         x = torch.mean(x, dim=2)  # [batch_size, 128]
+
         return x
