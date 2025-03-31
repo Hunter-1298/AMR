@@ -1,0 +1,43 @@
+project_name: AMR
+run_name: STF:${now:%Y-%m-%d_%H-%M-%S}
+mode: online
+debug: false
+log_model: true
+save_code: true
+seed: 42
+hyperparams:
+  epochs: 30
+  learning_rate: 0.005
+  batch_size: 32
+  dropout: 0.2
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+Model:
+  _target_: models.router.Router
+  input_dim: 256
+  hidden_dim: 128
+  lr: ${hyperparams.learning_rate}
+  load_balance_experts: false
+  experts:
+  - _target_: models.experts.spatial.simple_cnn.Spatial_CNN
+  - _target_: models.experts.temporal.simple_lstm.Temporal_LSTM
+    input_size: 2
+    hidden_dim: 128
+    num_layers: 2
+  - _target_: models.experts.frequency.frequency_fcnn.Frequency_CNN
+    input_channels: 2
+    hidden_dim: 128
+    dropout: ${hyperparams.dropout}
+  classifier:
+    _target_: models.classifier.Classifier
+    input_dim: 128
+    hidden_dim: 128
+    num_classes: 11
+    dropout: ${hyperparams.dropout}
+dataset:
+  batch_size: ${hyperparams.batch_size}
+  num_workers: 4
+  train_val_split:
+  - 0.7
+  - 0.3
+  random_seed: ${seed}

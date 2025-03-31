@@ -1,0 +1,3 @@
+- hyperparams.epochs=20
+- Model.experts.1.num_layers=3
+- Model.classifier.hidden_dim=32

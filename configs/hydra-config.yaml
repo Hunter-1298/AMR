@@ -1,6 +1,7 @@
 # Global configurations
 project_name: AMR
-run_name: Spatial_Only:${now:%Y-%m-%d_%H-%M-%S}
+sweeps: True
+run_name: Load_Balance:${now:%Y-%m-%d_%H-%M-%S}
 mode: online
 debug: false
 log_model: true
@@ -10,10 +11,13 @@ seed: 42
 # In your hydra config
 hyperparams:
   # Training
-  epochs: 10
+  epochs: 15
   learning_rate: 0.001
   batch_size: 32
   dropout: 0.2
+  hidden_dim: 128
+  feature_dim: 128
+  num_classes: 11
   # etc.
 
 # Paths
@@ -23,22 +27,36 @@ data_dir: data/
 Model:
   _target_: models.router.Router
   input_dim: 256
-  hidden_dim: 128
+  hidden_dim: ${hyperparams.hidden_dim}
+  feature_dim: ${hyperparams.feature_dim}
   lr: ${hyperparams.learning_rate}
+  num_classes: ${hyperparams.num_classes}
+  load_balance_experts: True
   experts:
     - _target_: models.experts.spatial.simple_cnn.Spatial_CNN
-    # - _target_: models.experts.temporal.Temporal_CNN
-    #   input_dim: 256
-    #   hidden_dim: 128
-    # - _target_: models.experts.spectral.Spectral_CNN
-    #   input_dim: 256
-    #   hidden_dim: 128
+      hidden_dim: ${hyperparams.hidden_dim} #output feature space
+
+    - _target_: models.experts.temporal.simple_lstm.Temporal_LSTM
+      input_size: 2 #num_channels
+      hidden_dim: ${hyperparams.hidden_dim} #output feature space
+      num_layers: 2
+
+    - _target_: models.experts.frequency.simple_cnn.Frequency_CNN
+      hidden_dim: ${hyperparams.hidden_dim} #output feature space
+
+    - _target_: models.experts.statistical.simple_cumulants.Cumulants
+      hidden_dim: ${hyperparams.hidden_dim} #output feature space
+
+    - _target_: models.experts.constellation.simple_cnn.Constellation_CNN
+      hidden_dim: ${hyperparams.hidden_dim} #output feature space
+      feature_dim: ${hyperparams.feature_dim} #output feature space
+
   classifier:
     # "-" deontes a list, exlude this here
     _target_: models.classifier.Classifier
     input_dim: 128
-    hidden_dim: 128
-    num_classes: 11
+    hidden_dim: ${hyperparams.hidden_dim}
+    num_classes: ${hyperparams.num_classes}
     dropout: ${hyperparams.dropout}
 
 dataset:

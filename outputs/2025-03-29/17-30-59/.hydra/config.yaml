@@ -1,0 +1,50 @@
+project_name: AMR
+run_name: STF:${now:%Y-%m-%d_%H-%M-%S}
+mode: online
+debug: false
+log_model: true
+save_code: true
+seed: 42
+hyperparams:
+  epochs: 50
+  learning_rate: 0.01
+  batch_size: 32
+  dropout: 0.2
+  hidden_dim: 128
+  feature_dim: 128
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+Model:
+  _target_: models.router.Router
+  input_dim: 256
+  hidden_dim: ${hyperparams.hidden_dim}
+  feature_dim: ${hyperparams.feature_dim}
+  lr: ${hyperparams.learning_rate}
+  load_balance_experts: false
+  experts:
+  - _target_: models.experts.spatial.simple_cnn.Spatial_CNN
+    hidden_dim: ${hyperparams.hidden_dim}
+  - _target_: models.experts.temporal.simple_lstm.Temporal_LSTM
+    input_size: 2
+    hidden_dim: ${hyperparams.hidden_dim}
+    num_layers: 2
+  - _target_: models.experts.frequency.simple_cnn.Frequency_CNN
+    hidden_dim: ${hyperparams.hidden_dim}
+  - _target_: models.experts.statistical.simple_cumulants.Cumulants
+    hidden_dim: ${hyperparams.hidden_dim}
+  - _target_: models.experts.constellation.simple_cnn.Constellation_CNN
+    hidden_dim: ${hyperparams.hidden_dim}
+    feature_dim: ${hyperparams.feature_dim}
+  classifier:
+    _target_: models.classifier.Classifier
+    input_dim: 128
+    hidden_dim: ${hyperparams.hidden_dim}
+    num_classes: 11
+    dropout: ${hyperparams.dropout}
+dataset:
+  batch_size: ${hyperparams.batch_size}
+  num_workers: 4
+  train_val_split:
+  - 0.7
+  - 0.3
+  random_seed: ${seed}

@@ -1,0 +1,26 @@
+program: src/main.py
+method: bayes
+metric:
+  name: val_acc
+  goal: maximize
+parameters:
+  hyperparams.learning_rate:
+    distribution: uniform
+    min: 0.0001
+    max: 0.01
+  hyperparams.batch_size:
+    values: [16, 32, 64]
+  hyperparams.epochs:
+    values: [10, 20, 30]
+  hyperparams.dropout:
+    distribution: uniform
+    min: 0.1
+    max: 0.5
+  hyperparams.hidden_dim:
+    values: [32, 64, 128]
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --multirun # allows hydra to accept multiple runs for sweeps
