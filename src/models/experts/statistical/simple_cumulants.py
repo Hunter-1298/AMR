@@ -12,9 +12,9 @@ class Cumulants(nn.Module):
     are then processed through an MLP to create a feature vector.
     
     Input shape: [batch_size, 2, 128] (I and Q channels)
-    Output shape: [batch_size, 128] (feature vector)
+    Output shape: [batch_size, feature_dim] (feature vector)
     """
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, feature_dim):
         super(Cumulants, self).__init__()
         
         # Number of cumulant features per channel
@@ -26,7 +26,7 @@ class Cumulants(nn.Module):
             nn.Linear(self.num_cumulant_features, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 128),
+            nn.Linear(hidden_dim, feature_dim),
         )
         
     def compute_cumulants(self, x):

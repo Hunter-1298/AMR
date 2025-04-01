@@ -12,9 +12,10 @@ class Frequency_CNN(nn.Module):
     then processes it through CNN layers with residual connections.
     
     Args:
-        hidden_dim (int): Output feature dimension (will be projected to 128)
+        hidden_dim (int): Hidden dimension size for intermediate layers
+        feature_dim (int): Output feature dimension
     """
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, feature_dim):
         super(Frequency_CNN, self).__init__()
         # Define CNN layers
         # Input: [batch_size, 2, 128]
@@ -31,8 +32,8 @@ class Frequency_CNN(nn.Module):
         self.pool = nn.MaxPool1d(2)  # Reduces sequence length by factor of 2
         self.relu = nn.ReLU()
 
-        # Final projection to 128 dim
-        self.final_proj = nn.Linear(hidden_dim, 128)
+        # Final projection to feature_dim
+        self.final_proj = nn.Linear(hidden_dim, feature_dim)
         
     def forward(self, x):
         # Input shape: [batch_size, 2, 128]
@@ -62,7 +63,7 @@ class Frequency_CNN(nn.Module):
         # Global average pooling - average across sequence dimension
         x = torch.mean(x, dim=2)  # [batch_size, hidden_dim]
 
-        # Project to 128 dimensions
-        x = self.final_proj(x)  # [batch_size, 128]
+        # Project to feature_dim dimensions
+        x = self.final_proj(x)  # [batch_size, feature_dim]
 
         return x

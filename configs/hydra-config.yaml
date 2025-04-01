@@ -1,28 +1,45 @@
 # Global configurations
 project_name: AMR
-sweeps: True
-run_name: Load_Balance:${now:%Y-%m-%d_%H-%M-%S}
+run_name: 32_Feature_Dim:${now:%Y-%m-%d_%H-%M-%S}
+train_tokenizer: True
 mode: online
-debug: false
-log_model: true
-save_code: true
+debug: True
+log_model: False
 seed: 42
 
 # In your hydra config
 hyperparams:
   # Training
   epochs: 15
-  learning_rate: 0.001
+  learning_rate: 0.009
   batch_size: 32
-  dropout: 0.2
-  hidden_dim: 128
-  feature_dim: 128
+  dropout: 0.25
+  hidden_dim: 64
+  feature_dim: 32
   num_classes: 11
   # etc.
 
 # Paths
 output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
 data_dir: data/
+
+Tokenizer:
+  _target_: models.vq_vae.vq_vae.RFVQVAE
+  input_dim: 2
+  embedding_dim: 64
+  codebook_size: 512
+  commitment_cost: 0.25
+  learning_rate: 0.01
+  iq_window: 1
+  epochs: 10
+  encoder:
+    _target_: models.vq_vae.encoder.Encoder
+    hidden_dim: 128
+    feature_dim: ${Tokenizer.embedding_dim} #output feature space
+  decoder:
+    _target_: models.vq_vae.decoder.Decoder
+    hidden_dim: 128 #output feature space
+    feature_dim: ${Tokenizer.embedding_dim} #output feature space
 
 Model:
   _target_: models.router.Router
@@ -31,30 +48,33 @@ Model:
   feature_dim: ${hyperparams.feature_dim}
   lr: ${hyperparams.learning_rate}
   num_classes: ${hyperparams.num_classes}
-  load_balance_experts: True
+  load_balance_experts: False
   experts:
     - _target_: models.experts.spatial.simple_cnn.Spatial_CNN
       hidden_dim: ${hyperparams.hidden_dim} #output feature space
+      feature_dim: ${hyperparams.feature_dim} #output feature space
 
     - _target_: models.experts.temporal.simple_lstm.Temporal_LSTM
       input_size: 2 #num_channels
       hidden_dim: ${hyperparams.hidden_dim} #output feature space
+      feature_dim: ${hyperparams.feature_dim} #output feature space
       num_layers: 2
 
     - _target_: models.experts.frequency.simple_cnn.Frequency_CNN
       hidden_dim: ${hyperparams.hidden_dim} #output feature space
+      feature_dim: ${hyperparams.feature_dim} #output feature space
 
     - _target_: models.experts.statistical.simple_cumulants.Cumulants
       hidden_dim: ${hyperparams.hidden_dim} #output feature space
+      feature_dim: ${hyperparams.feature_dim} #output feature space
 
     - _target_: models.experts.constellation.simple_cnn.Constellation_CNN
       hidden_dim: ${hyperparams.hidden_dim} #output feature space
       feature_dim: ${hyperparams.feature_dim} #output feature space
 
   classifier:
-    # "-" deontes a list, exlude this here
     _target_: models.classifier.Classifier
-    input_dim: 128
+    input_dim: ${hyperparams.feature_dim} #output feature space
     hidden_dim: ${hyperparams.hidden_dim}
     num_classes: ${hyperparams.num_classes}
     dropout: ${hyperparams.dropout}
