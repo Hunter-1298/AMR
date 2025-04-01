@@ -1,15 +1,11 @@
-# Global configurations
 project_name: VQ-VAE
 run_name: 32_Feature_Dim:${now:%Y-%m-%d_%H-%M-%S}
-train_tokenizer: True
+train_tokenizer: true
 mode: online
-debug: True
-log_model: False
+debug: true
+log_model: false
 seed: 42
-
-# In your hydra config
 hyperparams:
-  # Training
   epochs: 15
   learning_rate: 0.009
   batch_size: 32
@@ -17,12 +13,8 @@ hyperparams:
   hidden_dim: 64
   feature_dim: 32
   num_classes: 11
-  # etc.
-
-# Paths
 output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
 data_dir: data/
-
 Tokenizer:
   _target_: models.vq_vae.vq_vae.RFVQVAE
   commitment_cost: 0.25
@@ -37,16 +29,17 @@ Tokenizer:
     _target_: models.vq_vae.encoder.Encoder
     _partial_: true
     hidden_dim: 128
-    feature_dim: 32 #output feature space
+    feature_dim: 32
   decoder:
     _target_: models.vq_vae.decoder.Decoder
     _partial_: true
     latent_dim: ${Tokenizer.quantizer.embedding_dim}
-    output_dim: 128 #output feature space
-
+    output_dim: 128
 dataset:
   iq: false
   batch_size: ${hyperparams.batch_size}
   num_workers: 4
-  train_val_split: [0.7, 0.3]
+  train_val_split:
+  - 0.7
+  - 0.3
   random_seed: ${seed}

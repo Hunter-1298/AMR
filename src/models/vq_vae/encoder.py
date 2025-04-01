@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 class Encoder(nn.Module):
     """
-    Encoder network that maps windowed IQ data to latent representation
+    Encoder network that maps amplitude or phase signal to latent representation
     
     Args:
         hidden_dim (int): Size of hidden dimension
@@ -12,48 +12,32 @@ class Encoder(nn.Module):
     """
     def __init__(self, hidden_dim: int, feature_dim: int):
         super().__init__()
-        self.encoder = nn.Sequential(
-            # Input shape: [batch_size, channels=2, window_size]
-            nn.Conv1d(2, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Conv1d(hidden_dim, hidden_dim//2, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm1d(hidden_dim//2),
-            nn.ReLU(),
-            nn.Conv1d(hidden_dim//2, feature_dim, kernel_size=3, padding=1),
-            # Output shape: [batch_size, feature_dim, window_size//2]
-            nn.AdaptiveAvgPool1d(1)  # Average pool to get one vector per window
-            # Final output shape: [batch_size, feature_dim, 1]
-        )
-        self.projection = nn.Linear(2, feature_dim)
+        # First conv block
+        self.conv1 = nn.Conv1d(1, hidden_dim, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        
+        # Second conv block
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim//2, kernel_size=3, padding=1, stride=2)
+        self.bn2 = nn.BatchNorm1d(hidden_dim//2)
+        
+        # Final conv
+        self.conv3 = nn.Conv1d(hidden_dim//2, feature_dim, kernel_size=3, padding=1)
 
     def forward(self, x):
-        # 1. Initial input shape: [32, 2, 128, 1]
-        # [batch_size, channels, num_windows=128, iq_samples=1]
-        batch_size, channels, num_windows, iq_samples = x.shape
+        # First conv block with residual
+        identity = x
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = x + self.conv1(identity)  # Residual connection
         
-        # 2. Reshape to process each window:
-        x = x.squeeze(-1).transpose(1, 2)
-        # After squeeze: [32, 2, 128]
-        # After transpose: [32, 128, 2]
-        # Now each of the 128 windows has its 2 channel values ready for processing
+        # Second conv block with residual
+        identity = x
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = x + self.conv2(identity)  # Residual connection
         
-        # 3. Process each window independently:
-        encoded = x.reshape(-1, 2)
-        # Shape: [32*128, 2]
-        # Each row represents one window's I/Q values
-        
-        # 4. Project to feature dimension using a linear layer instead of CNN
-        encoded = self.projection(encoded)
-        # Shape: [32*128, feature_dim]
-        
-        # 5. Reshape back to separate batch and windows:
-        encoded = encoded.view(batch_size, num_windows, -1)
-        # Shape: [32, 128, feature_dim]
-        
-        # 6. Final reshape for vector quantizer:
-        encoded = encoded.transpose(1, 2).unsqueeze(1)
-        # Shape: [32, 1, feature_dim, 128]
-        # [batch_size, channels=1, feature_dim, num_windows]
-        
-        return encoded
+        # Final conv
+        x = self.conv3(x)
+        return x

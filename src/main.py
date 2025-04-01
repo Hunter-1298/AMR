@@ -45,7 +45,7 @@ def main(cfg: DictConfig):
         
         # Set up trainer for VQVAE
         vqvae_trainer = L.Trainer(
-            max_epochs=cfg.Tokenizer.epochs,
+            max_epochs=cfg.hyperparams.epochs,
             logger=wandb_logger,
             default_root_dir=".",
             log_every_n_steps=50,
@@ -63,7 +63,6 @@ def main(cfg: DictConfig):
         
         # Train VQVAE
         vqvae_trainer.fit(vqvae, train_loader, val_loader)
-        
         # Save final model
         torch.save(vqvae.state_dict(), "checkpoints/vqvae/vqvae_final.pth")
         print("VQVAE training complete! Model saved to checkpoints/vqvae/vqvae_final.pth")
@@ -81,31 +80,6 @@ def main(cfg: DictConfig):
         # Create and train MoE model
         model = hydra.utils.instantiate(cfg.Model, label_names=label_names, vqvae=vqvae)
 
-    # Make sure MoE checkpoint directory exists
-    os.makedirs("checkpoints/moe", exist_ok=True)
-
-    # Set up trainer for MoE
-    trainer = L.Trainer(
-        max_epochs=cfg.hyperparams.epochs,
-        logger=wandb_logger,
-        default_root_dir=".",
-        log_every_n_steps=10,
-        callbacks=[
-            ModelCheckpoint(
-                monitor="val_loss",
-                filename="moe_{epoch:02d}_{val_loss:.4f}",
-                dirpath="checkpoints/moe",
-                save_top_k=3,
-                mode="min",
-            ),
-            LearningRateMonitor(logging_interval="step"),
-        ],
-    )
-    
-    # Train MoE
-    trainer.fit(model, train_loader, val_loader)
-    
-    print("MoE training complete!")
     
 
 if __name__ == "__main__":
