@@ -43,7 +43,7 @@ wandb/
 logs/
 
 # Data
-data/
+# data/
 Dataset/
 *.csv
 *.json

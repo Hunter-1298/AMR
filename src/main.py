@@ -1,4 +1,5 @@
 import hydra
+from hydra.utils import get_original_cwd
 import wandb
 from omegaconf import DictConfig, OmegaConf
 import lightning.pytorch as L
@@ -38,10 +39,11 @@ def main(cfg: DictConfig):
         print("Training VQVAE encoder...")
         
         # Create VQVAE model
-        vqvae = hydra.utils.instantiate(cfg.Tokenizer)
+        vqvae = torch.compile(hydra.utils.instantiate(cfg.Tokenizer))
         
         # Make sure checkpoint directory exists
-        os.makedirs("checkpoints/vqvae", exist_ok=True)
+        checkpoint_dir = os.path.join(get_original_cwd(),"checkpoints","vqvae")
+        os.makedirs(checkpoint_dir, exist_ok=True)
         
         # Set up trainer for VQVAE
         vqvae_trainer = L.Trainer(
@@ -51,9 +53,9 @@ def main(cfg: DictConfig):
             log_every_n_steps=50,
             callbacks=[
                 ModelCheckpoint(
-                    monitor="val_loss",
-                    filename="vqvae_{epoch:02d}_{val_loss:.4f}",
-                    dirpath="checkpoints/vqvae",
+                    monitor="recon_loss",
+                    filename="vqvae_{epoch:02d}_{recon_loss:.4f}",
+                    dirpath=checkpoint_dir,
                     save_top_k=3,
                     mode="min",
                 ),
@@ -64,21 +66,57 @@ def main(cfg: DictConfig):
         # Train VQVAE
         vqvae_trainer.fit(vqvae, train_loader, val_loader)
         # Save final model
-        torch.save(vqvae.state_dict(), "checkpoints/vqvae/vqvae_final.pth")
-        print("VQVAE training complete! Model saved to checkpoints/vqvae/vqvae_final.pth")
+        print("VQVAE training complete! Model saved to checkpoints/vqvae/")
     else:
         # Load and freeze VQVAE
         vqvae = hydra.utils.instantiate(cfg.Tokenizer)
-        vqvae.load_state_dict(torch.load(cfg.vqvae_checkpoint))
+        checkpoint_dir = os.path.join(get_original_cwd(),"checkpoints","vqvae")
+        checkpoint = torch.load(checkpoint_dir + "/vqvae_epoch=14_recon_loss=2.6199.ckpt")
+        vqvae.load_state_dict(checkpoint['state_dict'])
         vqvae.eval()
         for param in vqvae.parameters():
             param.requires_grad = False
         
-        # Get tokenized dataloaders
-        train_loader, val_loader = get_tokenized_dataloaders(vqvae, train_loader, val_loader)
-        
-        # Create and train MoE model
-        model = hydra.utils.instantiate(cfg.Model, label_names=label_names, vqvae=vqvae)
+    
+    
+    #######################################################################################
+    # VQ-VAE Training Complete
+    # Now testing downstream architecture using the trained VQ-VAE as a feature extractor
+    #######################################################################################
+
+    # Get tokenized dataloaders
+    train_loader, val_loader = get_tokenized_dataloaders(cfg.dataset, vqvae, train_loader, val_loader)
+
+    # Create and train MoE model
+    model = hydra.utils.instantiate(cfg.Transformer, label_names=label_names)
+    # model = torch.compile(hydra.utils.instantiate(cfg.Transformer, label_names=label_names, vqvae=vqvae))
+
+    # Make sure checkpoint directory exists
+    checkpoint_dir = os.path.join(get_original_cwd(),"checkpoints","Transformer")
+    os.makedirs("checkpoints/Transformer", exist_ok=True)
+
+    # Set up trainer for MoE
+    trainer = L.Trainer(
+        max_epochs=cfg.hyperparams.epochs,
+        logger=wandb_logger,
+        default_root_dir=".",
+        log_every_n_steps=10,
+        callbacks=[
+            ModelCheckpoint(
+                monitor="val_loss",
+                filename="moe_{epoch:02d}_{val_loss:.4f}",
+                dirpath=checkpoint_dir,
+                save_top_k=3,
+                mode="min",
+            ),
+            LearningRateMonitor(logging_interval="step"),
+        ],
+    )
+    
+    # Train MoE
+    trainer.fit(model, train_loader, val_loader)
+    
+    print("Transformer training complete!")
 
     
 

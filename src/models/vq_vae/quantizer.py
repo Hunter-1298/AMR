@@ -14,6 +14,7 @@ class VectorQuantizer(nn.Module):
 
     def forward(self, z_e):
         # Compute distances between inputs and codebook embeddings
+        # Flatten [batch_size, kernels, embed_dim] -> [batch_size*kernels, embed_dim]
         z_e_flat = z_e.view(-1, self.embedding_dim)
         distances = (torch.sum(z_e_flat**2, dim=1, keepdim=True) /
                     + torch.sum(self.embedding.weight**2, dim=1) /
