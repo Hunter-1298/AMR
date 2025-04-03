@@ -55,6 +55,9 @@ class StackedBidirectionalCrossAttention(nn.Module):
             x: Tensor of the same shape [B, 2, num_tokens, embed_dim]
                after passing through all attention layers.
         """
+        # Ensure input is contiguous
+        x = x.contiguous()
+        
         # Pass through each layer
         for i, (attention, norm, ff, ff_norm) in enumerate(zip(
             self.layers, self.layer_norms, self.feedforward, self.ff_layer_norms
@@ -67,20 +70,20 @@ class StackedBidirectionalCrossAttention(nn.Module):
             
             # Apply layer normalization with residual connection
             # We need to apply LayerNorm to each modality (amp/phase) separately
-            amp_norm = norm(attn_output[:, 0, :, :] + residual[:, 0, :, :])
-            phase_norm = norm(attn_output[:, 1, :, :] + residual[:, 1, :, :])
-            x = torch.stack([amp_norm, phase_norm], dim=1)
+            amp_norm = norm(attn_output[:, 0, :, :].contiguous() + residual[:, 0, :, :].contiguous())
+            phase_norm = norm(attn_output[:, 1, :, :].contiguous() + residual[:, 1, :, :].contiguous())
+            x = torch.stack([amp_norm, phase_norm], dim=1).contiguous()
             
             # Second sublayer: Feedforward network with residual connection
             residual = x
             
             # Apply feedforward to each modality separately
-            amp_ff = ff(x[:, 0, :, :])
-            phase_ff = ff(x[:, 1, :, :])
+            amp_ff = ff(x[:, 0, :, :].contiguous())
+            phase_ff = ff(x[:, 1, :, :].contiguous())
             
             # Apply layer normalization with residual connection
-            amp_ff_norm = ff_norm(amp_ff + residual[:, 0, :, :])
-            phase_ff_norm = ff_norm(phase_ff + residual[:, 1, :, :])
-            x = torch.stack([amp_ff_norm, phase_ff_norm], dim=1)
+            amp_ff_norm = ff_norm(amp_ff + residual[:, 0, :, :].contiguous())
+            phase_ff_norm = ff_norm(phase_ff + residual[:, 1, :, :].contiguous())
+            x = torch.stack([amp_ff_norm, phase_ff_norm], dim=1).contiguous()
             
         return x 

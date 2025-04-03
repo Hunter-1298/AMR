@@ -104,17 +104,17 @@ class RFVQVAE(L.LightningModule):
         return total_loss
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=1, verbose=True
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-2)
+        # OneCycleLR automatically determines warm-up and decay schedules
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            max_lr=self.learning_rate,  # Peak LR at warmup end
+            total_steps=self.trainer.estimated_stepping_batches,  # Total training steps
+            pct_start=0.1,  # 5% of training is used for warm-up
+            anneal_strategy="cos",  # Cosine decay after warmup
+            final_div_factor=10  # Reduce LR by 10x at the end
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-            },
-        }
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
     def on_train_epoch_end(self):
         # Convert list of tensors to a single tensor using stack instead of cat

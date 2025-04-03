@@ -39,7 +39,7 @@ def main(cfg: DictConfig):
         print("Training VQVAE encoder...")
         
         # Create VQVAE model
-        vqvae = torch.compile(hydra.utils.instantiate(cfg.Tokenizer))
+        vqvae = hydra.utils.instantiate(cfg.Tokenizer)
         
         # Make sure checkpoint directory exists
         checkpoint_dir = os.path.join(get_original_cwd(),"checkpoints","vqvae")
@@ -71,7 +71,7 @@ def main(cfg: DictConfig):
         # Load and freeze VQVAE
         vqvae = hydra.utils.instantiate(cfg.Tokenizer)
         checkpoint_dir = os.path.join(get_original_cwd(),"checkpoints","vqvae")
-        checkpoint = torch.load(checkpoint_dir + "/vqvae_epoch=14_recon_loss=2.6199.ckpt")
+        checkpoint = torch.load(checkpoint_dir + "/vqvae_epoch=98_recon_loss=2.4166.ckpt")
         vqvae.load_state_dict(checkpoint['state_dict'])
         vqvae.eval()
         for param in vqvae.parameters():
@@ -89,7 +89,7 @@ def main(cfg: DictConfig):
 
     # Create and train MoE model
     model = hydra.utils.instantiate(cfg.Transformer, label_names=label_names)
-    # model = torch.compile(hydra.utils.instantiate(cfg.Transformer, label_names=label_names, vqvae=vqvae))
+    # model = torch.compile(hydra.utils.instantiate(cfg.Transformer, label_names=label_names))
 
     # Make sure checkpoint directory exists
     checkpoint_dir = os.path.join(get_original_cwd(),"checkpoints","Transformer")

@@ -30,9 +30,12 @@ class BidirectionalCrossAttention(nn.Module):
             fused: Tensor of the same shape [B, 2, num_tokens, embed_dim]
                    with fused amplitude and phase tokens.
         """
+        # Ensure input is contiguous
+        x = x.contiguous()
+        
         # Separate the channels: amplitude and phase
-        amplitude = x[:, 0, :, :]  # Shape: [B, num_tokens, embed_dim]
-        phase = x[:, 1, :, :]      # Shape: [B, num_tokens, embed_dim]
+        amplitude = x[:, 0, :, :].contiguous()  # Shape: [B, num_tokens, embed_dim]
+        phase = x[:, 1, :, :].contiguous()      # Shape: [B, num_tokens, embed_dim]
 
         # Cross-attention: Amplitude queries Phase
         # Query: amplitude, Key/Value: phase
@@ -43,10 +46,10 @@ class BidirectionalCrossAttention(nn.Module):
         attn_phase, _ = self.attn_phase_to_amp(phase, amplitude, amplitude)
 
         # Concatenate original and attended features, then project
-        fused_amp = self.proj(torch.cat([amplitude, attn_amp], dim=-1))
-        fused_phase = self.proj(torch.cat([phase, attn_phase], dim=-1))
+        fused_amp = self.proj(torch.cat([amplitude, attn_amp.contiguous()], dim=-1))
+        fused_phase = self.proj(torch.cat([phase, attn_phase.contiguous()], dim=-1))
 
         # Stack the fused representations back along the channel dimension
         fused = torch.stack([fused_amp, fused_phase], dim=1)  # Shape: [B, 2, num_tokens, embed_dim]
         
-        return fused 
+        return fused.contiguous() 

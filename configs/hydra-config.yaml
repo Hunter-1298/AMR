@@ -10,9 +10,9 @@ seed: 42
 # In your hydra config
 hyperparams:
   # Training
-  epochs: 15
-  learning_rate: 0.0001
-  batch_size: 128
+  epochs: 100
+  learning_rate: .0003
+  batch_size: 64
   dropout: 0.25
   hidden_dim: 64
   feature_dim: 32
@@ -28,15 +28,19 @@ Tokenizer:
   commitment_cost: 0.25
   learning_rate: 0.001
   quantizer_amp:
-    _target_: models.vq_vae.quantizer.VectorQuantizer
+    _target_: models.vq_vae.quantizer.VectorQuantizerEMA
     embedding_dim: 64
-    codebook_size: 1024
+    codebook_size: 512
     beta: 0.25
+    decay: 0.99
+    epsilon: .00001
   quantizer_phase:
-    _target_: models.vq_vae.quantizer.VectorQuantizer
+    _target_: models.vq_vae.quantizer.VectorQuantizerEMA
     embedding_dim: 64
-    codebook_size: 1024
+    codebook_size: 512
     beta: 0.25
+    decay: 0.99
+    epsilon: .00001
   encoder_amp:
     _target_: models.vq_vae.encoder.Encoder
     hidden_dim: 128
@@ -60,9 +64,10 @@ Tokenizer:
 
 Transformer:
   _target_: models.experts.attention.transformer_module.BidirectionalTransformer
+  epochs: ${hyperparams.epochs}
   embed_dim: ${Tokenizer.quantizer_amp.embedding_dim}
-  num_heads: 8
-  num_layers: 4
+  num_heads: 4
+  num_layers: 8
   dropout: 0.2
   num_classes: ${hyperparams.num_classes}
   learning_rate: ${hyperparams.learning_rate}

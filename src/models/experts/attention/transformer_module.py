@@ -4,10 +4,53 @@ import torch.nn.functional as F
 import lightning as L
 import wandb
 import matplotlib.pyplot as plt
+import math
 from .stacked_cross_attention import StackedBidirectionalCrossAttention
 
+class PositionalEncoding(nn.Module):
+    """
+    Adds positional encoding to token embeddings to provide sequence position information.
+    Uses the standard sinusoidal positional encoding from the Transformer paper.
+    """
+    def __init__(self, embed_dim, max_seq_length=64, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Create positional encoding matrix
+        pe = torch.zeros(max_seq_length, embed_dim)
+        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+        
+        # Apply sine to even indices and cosine to odd indices
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Register buffer (not a parameter but should be part of state_dict)
+        self.register_buffer('pe', pe.unsqueeze(0))  # [1, max_seq_length, embed_dim]
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape [batch_size, channels, seq_length, embed_dim]
+                for our case, channels=2 (amplitude and phase)
+        Returns:
+            x with positional encoding added
+        """
+        # Apply positional encoding separately to each channel
+        batch_size, channels, seq_length, embed_dim = x.shape
+        
+        # Get the appropriate positional encoding for this sequence length
+        pos_encoding = self.pe[:, :seq_length, :]  # [1, seq_length, embed_dim]
+        
+        # Add positional encoding to each channel
+        for i in range(channels):
+            # x[:, i] shape: [batch_size, seq_length, embed_dim]
+            x[:, i] = x[:, i] + pos_encoding
+            
+        return self.dropout(x)
+
 class BidirectionalTransformer(L.LightningModule):
-    def __init__(self, label_names, embed_dim=64, num_heads=8, num_layers=4, dropout=0.1,num_classes=11, learning_rate=1e-4):
+    def __init__(self, label_names, epochs, embed_dim=64, num_heads=8, num_layers=4, dropout=0.1,num_classes=11, learning_rate=1e-4):
         """
         PyTorch Lightning module for training a stacked bidirectional cross-attention transformer.
         
@@ -24,12 +67,20 @@ class BidirectionalTransformer(L.LightningModule):
         self.label_names = label_names
         self.learning_rate = learning_rate
         self.num_classes = num_classes
+        self.epochs = epochs
 
         # going to store [correct/total]
         self.snr_accuracy = [(0,0) for _ in range(20)]
 
         # going to store [correct/total]
         self.mod_accuracy = [(0,0) for _ in range(self.num_classes)]
+        
+        # Add positional encoding layer
+        self.positional_encoding = PositionalEncoding(
+            embed_dim=embed_dim,
+            max_seq_length=64,  # Max sequence length expected (adjust if needed)
+            dropout=dropout
+        )
         
         # Create the stacked transformer
         self.transformer = StackedBidirectionalCrossAttention(
@@ -62,12 +113,23 @@ class BidirectionalTransformer(L.LightningModule):
         """
         # x = [batch_size, channels, tokens, embed_dim]
         
-        # Pass through transformer - already handles the correct input shape and wuil return the same
+        # Ensure contiguous memory layout to prevent stride issues
+        x = x.contiguous()
+        
+        # Add positional encoding
+        x = self.positional_encoding(x)
+        
+        # Pass through transformer - already handles the correct input shape and will return the same
         output = self.transformer(x)
+        
+        # Ensure output is contiguous before further operations
+        output = output.contiguous()
         
         # Use the first token's embedding for classification (similar to [CLS] in BERT) -global context represenations
         # Average over both amplitude and phase channels
-        cls_token = output[:, :, 0, :].mean(dim=1)  # [batch_size, embed_dim]
+        # Extract first token and ensure proper memory layout
+        first_token = output[:, :, 0, :].contiguous()
+        cls_token = first_token.mean(dim=1)  # [batch_size, embed_dim]
         
         # Apply classifier
         logits = self.classifier(cls_token)  # [batch_size, num_classes]
@@ -143,17 +205,17 @@ class BidirectionalTransformer(L.LightningModule):
     
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=2, verbose=True
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-2)
+        # OneCycleLR automatically determines warm-up and decay schedules
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            max_lr=self.learning_rate,  # Peak LR at warmup end
+            total_steps=self.trainer.estimated_stepping_batches,  # Total training steps
+            pct_start=0.1,  # 5% of training is used for warm-up
+            anneal_strategy="cos",  # Cosine decay after warmup
+            final_div_factor=10  # Reduce LR by 10x at the end
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-            },
-        }
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
     def on_train_epoch_end(self):
 

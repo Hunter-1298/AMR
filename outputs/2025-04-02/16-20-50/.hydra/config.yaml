@@ -1,0 +1,83 @@
+project_name: Testing_Transformer
+run_name: Tokenized_AMR:${now:%Y-%m-%d_%H-%M-%S}
+train_tokenizer: false
+mode: online
+debug: false
+log_model: true
+seed: 42
+hyperparams:
+  epochs: 100
+  learning_rate: 0.0003
+  batch_size: 32
+  dropout: 0.25
+  hidden_dim: 64
+  feature_dim: 32
+  num_classes: 11
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+Tokenizer:
+  _target_: models.vq_vae.vq_vae.RFVQVAE
+  commitment_cost: 0.25
+  learning_rate: 0.001
+  quantizer_amp:
+    _target_: models.vq_vae.quantizer.VectorQuantizer
+    embedding_dim: 64
+    codebook_size: 1024
+    beta: 0.25
+  quantizer_phase:
+    _target_: models.vq_vae.quantizer.VectorQuantizer
+    embedding_dim: 64
+    codebook_size: 1024
+    beta: 0.25
+  encoder_amp:
+    _target_: models.vq_vae.encoder.Encoder
+    hidden_dim: 128
+    feature_dim: 64
+  encoder_phase:
+    _target_: models.vq_vae.encoder.Encoder
+    hidden_dim: 128
+    feature_dim: 64
+  decoder_amp:
+    _target_: models.vq_vae.decoder.Decoder
+    embedding_dim: ${Tokenizer.quantizer_amp.embedding_dim}
+    feature_dim: ${Tokenizer.encoder_amp.feature_dim}
+    output_channels: 1
+    output_dim: 128
+  decoder_phase:
+    _target_: models.vq_vae.decoder.Decoder
+    embedding_dim: ${Tokenizer.quantizer_phase.embedding_dim}
+    feature_dim: ${Tokenizer.encoder_phase.feature_dim}
+    output_channels: 1
+    output_dim: 128
+Transformer:
+  _target_: models.experts.attention.transformer_module.BidirectionalTransformer
+  epochs: ${hyperparams.epochs}
+  embed_dim: ${Tokenizer.quantizer_amp.embedding_dim}
+  num_heads: 8
+  num_layers: 6
+  dropout: 0.2
+  num_classes: ${hyperparams.num_classes}
+  learning_rate: ${hyperparams.learning_rate}
+Model:
+  _target_: models.router.Router
+  input_dim: 256
+  hidden_dim: ${hyperparams.hidden_dim}
+  feature_dim: ${hyperparams.feature_dim}
+  lr: ${hyperparams.learning_rate}
+  num_classes: ${hyperparams.num_classes}
+  load_balance_experts: false
+  experts: null
+  classifier:
+    _target_: models.classifier.Classifier
+    input_dim: ${hyperparams.feature_dim}
+    hidden_dim: ${hyperparams.hidden_dim}
+    num_classes: ${hyperparams.num_classes}
+    dropout: ${hyperparams.dropout}
+dataset:
+  iq: false
+  batch_size: ${hyperparams.batch_size}
+  num_workers: 4
+  train_val_split:
+  - 0.7
+  - 0.3
+  random_seed: ${seed}
