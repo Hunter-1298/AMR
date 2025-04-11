@@ -6,6 +6,7 @@ import torch.nn.functional as F
 class BasicBlock1D(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super(BasicBlock1D, self).__init__()
+
         self.conv1 = nn.Conv1d(
             in_channels,
             out_channels,
@@ -44,27 +45,37 @@ class BasicBlock1D(nn.Module):
 
 
 class ResNet1D(nn.Module):
+    # input size of signal is 2x128
     def __init__(
-        self, in_channels=2, num_blocks=[2, 2, 2], base_channels=64, out_dim=128
+        self,
+        in_channels=2,
+        num_blocks=[2, 2, 2],
+        base_channels=256,
+        out_dim=64,
+        adaptive_pool=16,
     ):
+        # TODO: Reshape to take in the new latent dimension shape for decoding
         super(ResNet1D, self).__init__()
         self.conv1 = nn.Conv1d(
             in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False
-        )
+        )  # Reduces input size by half (stride 2 with padding preserving spatial dims)
+
         self.bn1 = nn.BatchNorm1d(base_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(base_channels, base_channels, num_blocks[0])
+        # We have a small dim dataset, remove this for now
+        # self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(base_channels, base_channels // 2, num_blocks[0])
         self.layer2 = self._make_layer(
-            base_channels, base_channels * 2, num_blocks[1], stride=2
+            base_channels // 2, base_channels // 4, num_blocks[1], stride=1
         )
         self.layer3 = self._make_layer(
-            base_channels * 2, base_channels * 4, num_blocks[2], stride=2
+            base_channels // 4, base_channels // 8, num_blocks[2], stride=2
         )
 
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(base_channels * 4, out_dim)
+        self.global_pool = nn.AdaptiveAvgPool1d(adaptive_pool)
+        self.fc = nn.Linear(adaptive_pool, out_dim)
 
     def _make_layer(self, in_channels, out_channels, blocks, stride=1):
         layers = [BasicBlock1D(in_channels, out_channels, stride)]
@@ -73,14 +84,16 @@ class ResNet1D(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        # self.conv1 halfs the input size of x from 128 -> 64
         x = self.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)
-
+        # Do not apply maxpool on our small dataset currently
+        # x = self.maxpool(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
 
+        # before global pooling [batch_size, 256,8]
+        # We should have a higher dimension value with like 16-32 tokens
         x = self.global_pool(x).squeeze(-1)
         z = self.fc(x)
         return z
-

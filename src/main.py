@@ -5,9 +5,8 @@ from omegaconf import DictConfig, OmegaConf
 import lightning.pytorch as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
-from data.rfml_dataset_2016 import get_dataloaders, get_tokenized_dataloaders
+from data.rfml_dataset_2016 import get_dataloaders
 import os
-import torch
 
 
 @hydra.main(config_path="../configs", config_name="hydra-config", version_base="1.1")
