@@ -1,0 +1,25 @@
+Automatic Modulation Classification Based on CNN-Transformer Graph Neural Network
+[
+To solve the vulnerability of time–frequency representation to noise, Xu et al. [51]
+proposed a novel approach called deep TFT classification network (DTFTCNet), which
+integrates a time–frequency transform (TFT) and CNN within an end-to-end deep learning
+framework for radar signal modulation recognition
+
+
+Che et al. [53] introduced a spatial-temporal hybrid feature extraction
+network (STHFEN), which employs a dual feature extraction network to transform the
+signal into the spatial and temporal feature space and utilizes a hybrid inference classifier to combine the classification results
+
+Zheng et al. [56] introduced a multi-scale radio transformer (Ms-RaT) with dual-channel
+representation to fuse frequency, amplitude, and phase information.
+
+
+Lin et al. [63] proposed a joint learning framework for robust modulation recognition in
+the presence of noise. The framework integrates three modules, dual-channel spectrum
+fusion, signal enhancement (SE), and signal classification (SC) into a single architecture,
+employing a multistage attention mechanism to enhance recognition-related features.
+
+
+
+
+]
