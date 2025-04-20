@@ -108,6 +108,7 @@ class LatentDiffusion(L.LightningModule):
         Returns:
             Predicted noise
         """
+        print("forward")
         return self.unet(x, t, context)
 
     def p_losses(
@@ -149,6 +150,7 @@ class LatentDiffusion(L.LightningModule):
         Returns:
             Loss tensor
         """
+        print("training")
         # Unpack batch
         x, context = batch[:2] if len(batch) > 1 else (batch[0], None)
 

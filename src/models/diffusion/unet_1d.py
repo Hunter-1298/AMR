@@ -55,7 +55,7 @@ class UNet1DModel(nn.Module):
         block_out_channels: List[int] = [32, 32, 32],  # pyright: ignore
         num_attention_heads: int = 8,
         layers_per_block: int = 1,
-        conditional: int = 11,
+        conditional: int = 19,
         conditional_len: int = 64,
     ):
         super().__init__()
@@ -117,7 +117,9 @@ class UNet1DModel(nn.Module):
         for i, up_block_type in enumerate(up_block_types):
             prev_output_channel = output_channel
             output_channel = (
-                reversed_block_out_channels[i + 1] if i < len(up_block_types) - 1 else final_upsample_channels
+                reversed_block_out_channels[i + 1]
+                if i < len(up_block_types) - 1
+                else final_upsample_channels
             )
 
             is_final_block = i == len(block_out_channels) - 1
@@ -155,13 +157,6 @@ class UNet1DModel(nn.Module):
 
         # 1. time
         timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor(
-                [timesteps], dtype=torch.long, device=sample.device
-            )
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:  # pyright: ignore
-            timesteps = timesteps[None].to(sample.device)  # pyright: ignore
-
         timestep_embed = self.time_proj(timesteps)
         timestep_embed = self.time_mlp(timestep_embed.to(sample.dtype))
 
