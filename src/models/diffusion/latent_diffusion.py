@@ -26,7 +26,6 @@ class LatentDiffusion(L.LightningModule):
         self.encoder = encoder
 
         # Diffusion parameters
-        self.latent_scaling_factor = latent_scaling_factor
         self.n_steps = n_steps  # total noising steps
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -60,8 +59,8 @@ class LatentDiffusion(L.LightningModule):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode input to latent space and scale"""
-        z = self.encoder(x)
-        return z * self.latent_scaling_factor
+        z = self.encoder.encode(x)
+        return z 
 
     def q_sample(
         self,
@@ -108,7 +107,6 @@ class LatentDiffusion(L.LightningModule):
         Returns:
             Predicted noise
         """
-        print("forward")
         return self.unet(x, t, context)
 
     def p_losses(
