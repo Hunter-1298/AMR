@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import lightning as L
+from typing import Optional, Dict, Any, Tuple
 from .unet_1d import UNet1DModel
 from ..latent_encoder_models import ResNet1D, Decoder1D
 
@@ -8,150 +9,210 @@ from ..latent_encoder_models import ResNet1D, Decoder1D
 class LatentDiffusion(L.LightningModule):
     def __init__(
         self,
-        unet_config: dict,
-        vae_config: dict,
+        unet,
+        encoder,
         n_steps: int = 1000,
-        linear_start: float = 0.0001,
-        linear_end: float = 0.02,
+        linear_start: float = 0.0001,  # starting noise value for beta schedule
+        linear_end: float = 0.02,  # ending value for the beta schedule
         latent_scaling_factor: float = 0.18215,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-2,
     ):
         super().__init__()
-        
-        # Initialize VAE
-        self.encoder = ResNet1D(**vae_config['encoder'])
-        self.decoder = Decoder1D(**vae_config['decoder'])
-        
-        # Initialize UNet for latent space
-        self.unet = UNet1DModel(**unet_config)
-        
+        self.save_hyperparameters()
+
+        # Initialize UNet for latent space diffusion and the encoder for sampling
+        self.unet = unet
+        self.encoder = encoder
+
         # Diffusion parameters
         self.latent_scaling_factor = latent_scaling_factor
-        self.n_steps = n_steps
-        
-        # Noise schedule
-        beta = torch.linspace(linear_start**0.5, linear_end**0.5, n_steps, dtype=torch.float64) ** 2
+        self.n_steps = n_steps  # total noising steps
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+
+        # Setup noise schedule
+        # Create linearly spaced array - squared to get the beta values
+        # beta - variance of noise at each step
+        # alpha = 1-beta: proportion of original signal retained at each step
+        # alpha_bar = cumulative products of alpha which is the total retention up to step t
+        # sqrt_alpha_bar = precomputed square root of alpha for efficiency
+        # sqrt_one_minus_alpha_bar = precomputed square root for efficiency
+        beta = (
+            torch.linspace(
+                linear_start**0.5, linear_end**0.5, n_steps, dtype=torch.float64
+            )
+            ** 2
+        )
         self.beta = nn.Parameter(beta.to(torch.float32), requires_grad=False)
         alpha = 1 - beta
         alpha_bar = torch.cumprod(alpha, dim=0)
+        self.alpha = nn.Parameter(alpha.to(torch.float32), requires_grad=False)
         self.alpha_bar = nn.Parameter(alpha_bar.to(torch.float32), requires_grad=False)
-        
+
+        # Precompute values for sampling
+        self.sqrt_alpha_bar = nn.Parameter(
+            torch.sqrt(alpha_bar).to(torch.float32), requires_grad=False
+        )
+        self.sqrt_one_minus_alpha_bar = nn.Parameter(
+            torch.sqrt(1.0 - alpha_bar).to(torch.float32), requires_grad=False
+        )
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode input to latent space"""
-        return self.encoder(x) * self.latent_scaling_factor
-        
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latent to data space"""
-        return self.decoder(z / self.latent_scaling_factor)
-        
-    def get_noise(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Get noise prediction from UNet"""
-        return self.unet(x, t)
-        
-    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
-        """Add noise to input at timestep t"""
+        """Encode input to latent space and scale"""
+        z = self.encoder(x)
+        return z * self.latent_scaling_factor
+
+    def q_sample(
+        self,
+        x_start: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward diffusion process: q(x_t | x_0)
+        Add noise to x_start according to noise schedule at timestep t
+
+        Args:
+            x_start: Starting clean data [B, C, T]
+            t: Timesteps [B]
+            noise: Optional predetermined noise [B, C, T]
+
+        Returns:
+            x_t: Noised data
+            noise: The noise added
+        """
         if noise is None:
             noise = torch.randn_like(x_start)
-            
-        alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1)
-        return torch.sqrt(alpha_bar_t) * x_start + torch.sqrt(1 - alpha_bar_t) * noise
-        
-    def p_losses(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
-        """Calculate loss for training"""
-        if noise is None:
-            noise = torch.randn_like(x_start)
-            
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        predicted_noise = self.get_noise(x_noisy, t)
-        
-        return torch.nn.functional.mse_loss(noise, predicted_noise)
-        
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the model"""
-        # Encode to latent space
-        z = self.encode(x)
-        
-        # Get noise prediction
-        noise_pred = self.get_noise(z, t)
-        
-        return noise_pred
-        
-    def training_step(self, batch, batch_idx):
-        x, labels, snr = batch
-        
-        # Sample timesteps
-        t = torch.randint(0, self.n_steps, (x.shape[0],), device=x.device).long()
-        
-        # Encode to latent space
-        z = self.encode(x)
-        
+
+        # Extract appropriate alphas for this timestep
+        sqrt_alpha_bar_t = self.sqrt_alpha_bar[t].view(-1, 1, 1)
+        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+
+        # Generate x_t from x_0 and noise
+        x_t = sqrt_alpha_bar_t * x_start + sqrt_one_minus_alpha_bar_t * noise
+
+        return x_t, noise
+
+    def forward(
+        self, x: torch.Tensor, t: torch.Tensor, context: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Predict noise using the UNet model
+
+        Args:
+            x: Noisy data at timestep t [B, C, T]
+            t: Timesteps [B]
+            context: Optional conditioning [B, context_dim]
+
+        Returns:
+            Predicted noise
+        """
+        return self.unet(x, t, context)
+
+    def p_losses(
+        self,
+        x_start: torch.Tensor,
+        t: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Calculate diffusion loss for denoising score matching
+
+        Args:
+            x_start: Starting clean data [B, C, T]
+            t: Timesteps [B]
+            context: Optional conditioning [B, context_dim]
+
+        Returns:
+            MSE loss between predicted and actual noise
+        """
+        # Add noise to input
+        x_noisy, noise = self.q_sample(x_start, t)
+
+        # Predict noise
+        predicted_noise = self.forward(x_noisy, t, context)
+
         # Calculate loss
-        loss = self.p_losses(z, t)
-        
-        self.log("train_loss", loss)
+        loss = torch.nn.functional.mse_loss(noise, predicted_noise)
+
         return loss
-        
-    def validation_step(self, batch, batch_idx):
-        x, labels, snr = batch
-        
-        # Sample timesteps
-        t = torch.randint(0, self.n_steps, (x.shape[0],), device=x.device).long()
-        
-        # Encode to latent space
+
+    def training_step(self, batch, batch_idx) -> torch.Tensor:
+        """
+        Lightning training step
+
+        Args:
+            batch: Batch of data containing (x, context, _)
+            batch_idx: Batch index
+
+        Returns:
+            Loss tensor
+        """
+        # Unpack batch
+        x, context = batch[:2] if len(batch) > 1 else (batch[0], None)
+
+        # Sample random timesteps
+        t = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+
+        # Encode input to latent space
         z = self.encode(x)
-        
-        # Calculate loss
-        loss = self.p_losses(z, t)
-        
-        self.log("val_loss", loss)
+
+        # Calculate diffusion loss
+        loss = self.p_losses(z, t, context)
+
+        # Log loss
+        self.log("train_loss", loss, prog_bar=True)
+
         return loss
-        
+
+    def validation_step(self, batch, batch_idx) -> torch.Tensor:
+        """
+        Lightning validation step
+
+        Args:
+            batch: Batch of data containing (x, context, _)
+            batch_idx: Batch index
+
+        Returns:
+            Loss tensor
+        """
+        # Unpack batch
+        x, context = batch[:2] if len(batch) > 1 else (batch[0], None)
+
+        # Sample random timesteps
+        t = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+
+        # Encode input to latent space
+        z = self.encode(x)
+
+        # Calculate diffusion loss
+        loss = self.p_losses(z, t, context)
+
+        # Log loss
+        self.log("val_loss", loss, prog_bar=True)
+
+        return loss
+
     def configure_optimizers(self):
+        """Setup optimizer and learning rate scheduler"""
+        # Create optimizer
         optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=1e-4,
-            weight_decay=1e-2
+            self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
-        
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+
+        # Create scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            max_lr=1e-4,
-            total_steps=self.trainer.estimated_stepping_batches,
-            pct_start=0.1,
-            anneal_strategy="cos",
-            final_div_factor=10
+            T_max=self.trainer.estimated_stepping_batches,
+            eta_min=self.learning_rate / 10,
         )
-        
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "step",
-                "frequency": 1
-            }
+                "frequency": 1,
+            },
         }
-        
-    @torch.no_grad()
-    def sample(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Sample from the model"""
-        # Start with random noise
-        z = torch.randn(batch_size, self.unet.in_channels, self.unet.sample_size, device=device)
-        
-        # Denoise step by step
-        for t in range(self.n_steps - 1, -1, -1):
-            t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            noise_pred = self.get_noise(z, t_batch)
-            
-            alpha_t = 1 - self.beta[t]
-            alpha_bar_t = self.alpha_bar[t]
-            
-            if t > 0:
-                noise = torch.randn_like(z)
-            else:
-                noise = 0
-                
-            z = 1 / torch.sqrt(alpha_t) * (
-                z - (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t) * noise_pred
-            ) + torch.sqrt(self.beta[t]) * noise
-            
-        # Decode to data space
-        return self.decode(z)

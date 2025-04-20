@@ -1,9 +1,9 @@
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .embeddings import GaussianFourierProjection, TimestepEmbedding, Timesteps
-from .unet_1d_blocks import get_down_block, get_mid_block, get_out_block, get_up_block
+from .unet_blocks import get_down_block, get_mid_block, get_up_block
 
 
 class UNet1DModel(nn.Module):
@@ -38,34 +38,29 @@ class UNet1DModel(nn.Module):
         downsample_each_block (`int`, *optional*, defaults to `False`):
             Experimental feature for using a UNet without upsampling.
     """
+
     def __init__(
         self,
-        sample_size: int = 65536,
-        sample_rate: Optional[int] = None,
-        in_channels: int = 2,
-        out_channels: int = 2,
-        extra_in_channels: int = 0,
-        flip_sin_to_cos: bool = True,
-        use_timestep_embedding: bool = False,
-        freq_shift: float = 0.0,
-        down_block_types: Tuple[str] = (
+        sample_size: int = 128,
+        in_channels: int = 32,
+        out_channels: int = 32,
+        flip_sin_to_cos: bool = False,
+        down_block_types: List[str] = [
             "DownBlock1D",
             "AttnDownBlock1D",
             "AttnDownBlock1D",
-        ),  # pyright: ignore
-        up_block_types: Tuple[str] = ("AttnUpBlock1D", "AttnUpBlock1D", "UpBlock1D"),  # pyright: ignore
-        mid_block_type: str  = "UNetMidBlock1D",  # pyright: ignore
-        block_out_channels: Tuple[int] = (32, 32, 64),  # pyright: ignore
+        ],  # pyright: ignore
+        up_block_types: List[str] = ["AttnUpBlock1D", "AttnUpBlock1D", "UpBlock1D"],  # pyright: ignore
+        mid_block_type: str = "UNetMidBlock1D",  # pyright: ignore
+        block_out_channels: List[int] = [32, 32, 32],  # pyright: ignore
         num_attention_heads: int = 8,
-        act_fn: str = None,  # pyright: ignore
-        norm_num_groups: int = 8,
         layers_per_block: int = 1,
-        downsample_each_block: bool = False,
-        conditional: Optional[int] = None
+        conditional: int = 11,
+        conditional_len: int = 64,
     ):
         super().__init__()
 
-        #size of the input token dimensions
+        # size of the input token dimensions
         self.sample_size = sample_size
 
         ############################### TIME EMBEDDINGS ######################################
@@ -73,15 +68,17 @@ class UNet1DModel(nn.Module):
         # initalize to a size that is large enough to hold semantically meaningful information
         timestep_input_dim = block_out_channels[0]
         time_embed_dim = block_out_channels[0] * 4
-        
+
         # time_proj -> MLP projected timestep intervals
-        self.time_proj = Timesteps(timestep_input_dim, flip_sin_to_cos, freq_shift)
+        self.time_proj = Timesteps(timestep_input_dim, flip_sin_to_cos)
 
         # time embeddings -> Higher dimensional time_proj to containe time_embed_dim features
-        self.time_embedding = TimestepEmbedding(timestep_input_dim, time_embed_dim)
+        self.time_mlp = TimestepEmbedding(timestep_input_dim, time_embed_dim)
 
         # Set Conditional conditioning if we have it
-        self.cond_embeddings = nn.Embedding(conditional,time_embed_dim) if conditional else None
+        self.cond_embeddings = (
+            nn.Embedding(conditional, time_embed_dim) if conditional else None
+        )
 
         ######################################################################################
 
@@ -96,56 +93,42 @@ class UNet1DModel(nn.Module):
             input_channel = output_channel
             output_channel = block_out_channels[i]
 
-            is_final_block = i == len(block_out_channels) - 1
-
             # covert string to specific module we want
             down_block = get_down_block(
                 down_block_type,
-                num_layers=layers_per_block,
                 in_channels=input_channel,
                 out_channels=output_channel,
-                temb_channels=block_out_channels[0],
-                add_downsample=not is_final_block or downsample_each_block,
+                context_dim=conditional_len,
             )
             self.down_blocks.append(down_block)
 
         # mid
-        # self.mid_block = get_mid_block(
-        #     mid_block_type,
-        #     in_channels=block_out_channels[-1],
-        #     mid_channels=block_out_channels[-1],
-        #     out_channels=block_out_channels[-1],
-        #     embed_dim=block_out_channels[0],
-        #     num_layers=layers_per_block,
-        #     add_downsample=downsample_each_block,
-        # )
-        #
-        # # up 
-        # reversed_block_out_channels = list(reversed(block_out_channels))
-        # output_channel = reversed_block_out_channels[0]
-        # final_upsample_channels = block_out_channels[0]
-        # for i, up_block_type in enumerate(up_block_types):
-        #     prev_output_channel = output_channel
-        #     output_channel = (
-        #         reversed_block_out_channels[i + 1]
-        #         if i < len(up_block_types) - 1
-        #         else final_upsample_channels
-        #     )
-        #
-        #     is_final_block = i == len(block_out_channels) - 1
-        #
-        #     up_block = get_up_block(
-        #         up_block_type,
-        #         num_layers=layers_per_block,
-        #         in_channels=prev_output_channel,
-        #         out_channels=output_channel,
-        #         temb_channels=block_out_channels[0],
-        #         add_upsample=not is_final_block,
-        #     )
-        #     self.up_blocks.append(up_block)
-        #     prev_output_channel = output_channel
+        self.mid_block = get_mid_block(
+            mid_block_type,
+            in_channels=block_out_channels[-1],
+            mid_channels=block_out_channels[-1],
+            out_channels=block_out_channels[-1],
+            context_dim=conditional_len,
+        )
+        # up
+        reversed_block_out_channels = list(reversed(block_out_channels))
+        output_channel = reversed_block_out_channels[0]
+        final_upsample_channels = out_channels
+        for i, up_block_type in enumerate(up_block_types):
+            prev_output_channel = output_channel
+            output_channel = (
+                reversed_block_out_channels[i + 1] if i < len(up_block_types) - 1 else final_upsample_channels
+            )
 
-
+            is_final_block = i == len(block_out_channels) - 1
+            up_block = get_up_block(
+                up_block_type,
+                in_channels=prev_output_channel,
+                out_channels=output_channel,
+                context_dim=conditional_len,
+            )
+            self.up_blocks.append(up_block)
+            prev_output_channel = output_channel
 
     def forward(
         self,
@@ -170,50 +153,40 @@ class UNet1DModel(nn.Module):
         """
         pass
 
-        # # 1. time
-        # timesteps = timestep
-        # if not torch.is_tensor(timesteps):
-        #     timesteps = torch.tensor(
-        #         [timesteps], dtype=torch.long, device=sample.device
-        #     )
-        # elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:  # pyright: ignore
-        #     timesteps = timesteps[None].to(sample.device)  # pyright: ignore
-        #
-        # timestep_embed = self.time_proj(timesteps)
-        # if self.config.use_timestep_embedding:
-        #     timestep_embed = self.time_mlp(timestep_embed.to(sample.dtype))
-        # else:
-        #     timestep_embed = timestep_embed[..., None]
-        #     timestep_embed = timestep_embed.repeat([1, 1, sample.shape[2]]).to(
-        #         sample.dtype
-        #     )
-        #     timestep_embed = timestep_embed.broadcast_to(
-        #         (sample.shape[:1] + timestep_embed.shape[1:])
-        #     )
-        #
-        # # 2. down
-        # down_block_res_samples = ()
-        # for downsample_block in self.down_blocks:
-        #     sample, res_samples = downsample_block(
-        #         hidden_states=sample, temb=timestep_embed
-        #     )
-        #     down_block_res_samples += res_samples
-        #
-        # # 3. mid
-        # if self.mid_block:
-        #     sample = self.mid_block(sample, timestep_embed)
-        #
-        # # 4. up
-        # for i, upsample_block in enumerate(self.up_blocks):
-        #     res_samples = down_block_res_samples[-1:]
-        #     down_block_res_samples = down_block_res_samples[:-1]
-        #     sample = upsample_block(
-        #         sample, res_hidden_states_tuple=res_samples, temb=timestep_embed
-        #     )
-        #
-        # # 5. post-process
-        # if self.out_block:
-        #     sample = self.out_block(sample, timestep_embed)
-        #
-        # return sample
+        # 1. time
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor(
+                [timesteps], dtype=torch.long, device=sample.device
+            )
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:  # pyright: ignore
+            timesteps = timesteps[None].to(sample.device)  # pyright: ignore
 
+        timestep_embed = self.time_proj(timesteps)
+        timestep_embed = self.time_mlp(timestep_embed.to(sample.dtype))
+
+        # 2. down
+        down_block_res_samples = ()
+        for downsample_block in self.down_blocks:
+            sample, res_samples = downsample_block(
+                hidden_states=sample, temb=timestep_embed
+            )
+            down_block_res_samples += res_samples
+
+        # 3. mid
+        if self.mid_block:
+            sample = self.mid_block(sample, timestep_embed)
+
+        # 4. up
+        for i, upsample_block in enumerate(self.up_blocks):
+            res_samples = down_block_res_samples[-1:]
+            down_block_res_samples = down_block_res_samples[:-1]
+            sample = upsample_block(
+                sample, res_hidden_states_tuple=res_samples, temb=timestep_embed
+            )
+
+        # 5. post-process
+        if self.out_block:
+            sample = self.out_block(sample, timestep_embed)
+
+        return sample

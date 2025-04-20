@@ -19,10 +19,10 @@ class LatentEncoder(L.LightningModule):
         self.decoder = decoder
 
     def forward(self, x):
+        # x is shape [64,2,128]
         # Define the forward pass
         encoded = self.encoder(x)
-        # Encoded is [batch_size, 128]
-        # decoder is returing [batch_size, channels, 1024 instead of 128]
+        # encoded(x) is shape [64,32,64]
         decoded = self.decoder(encoded)
         return decoded
 

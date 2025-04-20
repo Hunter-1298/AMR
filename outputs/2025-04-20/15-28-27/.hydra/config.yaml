@@ -1,0 +1,61 @@
+project_name: Denoiser
+run_name: Denoiser_IQ_16Tokens_32HiddenDim:${now:%Y-%m-%d_%H-%M-%S}
+train_encoder: false
+checkpoint_name: vae_epoch=29_val_loss=0.0000.ckpt
+mode: online
+debug: true
+log_model: false
+seed: 42
+hyperparams:
+  epochs: 30
+  learning_rate: 0.001
+  batch_size: 64
+  dropout: 0.25
+  hidden_dim: 32
+  feature_dim: 16
+  num_classes: 11
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+Encoder:
+  _target_: models.encoder.LatentEncoder
+  learning_rate: ${hyperparams.learning_rate}
+  encoder:
+    _target_: models.latent_encoder_models.resnet_encoder.ResNet1D
+  decoder:
+    _target_: models.latent_encoder_models.decoder.Decoder1D
+Diffusion:
+  _target_: models.diffusion.latent_diffusion.LatentDiffusion
+  learning_rate: ${hyperparams.learning_rate}
+  n_steps: int = 1000,
+  linear_start: float = 0.0001,
+  linear_end: float = 0.02,
+  latent_scaling_factor: float = 0.18215,
+  weight_decay: float = 1e-2,
+  unet:
+    _target_: models.diffusion.unet_1d.UNet1DModel
+    sample_size: 128
+    in_channels: 32
+    out_channels: 32
+    down_block_types:
+    - DownBlock1D
+    - AttnDownBlock1D
+    - AttnDownBlock1D
+    up_block_types:
+    - AttnUpBlock1D
+    - AttnUpBlock1D
+    - UpBlock1D
+    mid_block_type: UNetMidBlock1D
+    block_out_channels:
+    - 32
+    - 32
+    - 32
+    conditional: ${hyperparams.num_classes}
+    conditional_len: 128
+dataset:
+  iq: true
+  batch_size: ${hyperparams.batch_size}
+  num_workers: 4
+  train_val_split:
+  - 0.7
+  - 0.3
+  random_seed: ${seed}

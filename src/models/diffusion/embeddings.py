@@ -3,7 +3,7 @@ from typing import Optional
 import math
 import torch.nn as nn
 import numpy as np
-from activations import get_activation
+from .activations import get_activation
 
 
 class TimestepEmbedding(nn.Module):
@@ -87,7 +87,7 @@ def get_timestep_embedding(
     exponent = -math.log(max_period) * torch.arange(
         start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
     )
-    exponent = exponent / (half_dim - downscale_freq_shift)
+    exponent = exponent / (half_dim)
 
     emb = torch.exp(exponent)
     emb = timesteps[:, None].float() * emb[None, :]
@@ -113,7 +113,7 @@ class Timesteps(nn.Module):
         self,
         num_channels: int,
         flip_sin_to_cos: bool,
-        downscale_freq_shift: float,
+        downscale_freq_shift: float = 1,
         scale: int = 1,
     ):
         super().__init__()
