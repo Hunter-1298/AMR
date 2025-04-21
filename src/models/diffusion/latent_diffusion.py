@@ -135,7 +135,7 @@ class LatentDiffusion(L.LightningModule):
         # Calculate loss
         loss = torch.nn.functional.mse_loss(noise, predicted_noise)
 
-        return loss
+        return loss, predicted_noise
 
     def training_step(self, batch, batch_idx) -> torch.Tensor:
         """
@@ -148,9 +148,8 @@ class LatentDiffusion(L.LightningModule):
         Returns:
             Loss tensor
         """
-        print("training")
         # Unpack batch
-        x, context = batch[:2] if len(batch) > 1 else (batch[0], None)
+        x, context, snr = batch
 
         # Sample random timesteps
         t = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
@@ -159,12 +158,12 @@ class LatentDiffusion(L.LightningModule):
         z = self.encode(x)
 
         # Calculate diffusion loss
-        loss = self.p_losses(z, t, context)
+        noise_loss, predicted_noise = self.p_losses(z, t, context)
 
         # Log loss
-        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_loss", noise_loss, prog_bar=True)
 
-        return loss
+        return noise_loss
 
     def validation_step(self, batch, batch_idx) -> torch.Tensor:
         """
@@ -178,7 +177,7 @@ class LatentDiffusion(L.LightningModule):
             Loss tensor
         """
         # Unpack batch
-        x, context = batch[:2] if len(batch) > 1 else (batch[0], None)
+        x, context, snr = batch
 
         # Sample random timesteps
         t = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
@@ -187,12 +186,13 @@ class LatentDiffusion(L.LightningModule):
         z = self.encode(x)
 
         # Calculate diffusion loss
-        loss = self.p_losses(z, t, context)
+        noise_loss, predicted_noise = self.p_losses(z, t, context)
 
         # Log loss
-        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_loss", noise_loss, prog_bar=True)
 
-        return loss
+
+        return noise_loss
 
     def configure_optimizers(self):
         """Setup optimizer and learning rate scheduler"""

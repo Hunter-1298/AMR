@@ -67,7 +67,7 @@ class UNet1DModel(nn.Module):
 
         # initalize to a size that is large enough to hold semantically meaningful information
         timestep_input_dim = block_out_channels[0]
-        time_embed_dim = block_out_channels[0] * 4
+        time_embed_dim = block_out_channels[0] * 2
 
         # time_proj -> MLP projected timestep intervals
         self.time_proj = Timesteps(timestep_input_dim, flip_sin_to_cos)
@@ -76,6 +76,9 @@ class UNet1DModel(nn.Module):
         self.time_mlp = TimestepEmbedding(timestep_input_dim, time_embed_dim)
 
         # Set Conditional conditioning if we have it
+
+        # TODO: implement this combined class for embeddings
+        # class CombinedTimestepLabelEmbeddings(nn.Module):
         self.cond_embeddings = (
             nn.Embedding(conditional, time_embed_dim) if conditional else None
         )
@@ -153,20 +156,21 @@ class UNet1DModel(nn.Module):
                 If `return_dict` is True, an [`~models.unets.unet_1d.UNet1DOutput`] is returned, otherwise a `tuple` is
                 returned where the first element is the sample tensor.
         """
-        pass
 
-        # 1. time
+        # 1. time - batch_size timesteps x higher_dim 
         timesteps = timestep
         timestep_embed = self.time_proj(timesteps)
+        # make the timesteps learnable in a higher dimension
         timestep_embed = self.time_mlp(timestep_embed.to(sample.dtype))
 
         # 2. down
-        down_block_res_samples = ()
+        down_block_res_samples = []
+        # original sample [64,32,64]
+        # after downsample [64,32,32]
+        # before first cross attention [64,32,32]
         for downsample_block in self.down_blocks:
-            sample, res_samples = downsample_block(
-                hidden_states=sample, temb=timestep_embed
-            )
-            down_block_res_samples += res_samples
+            sample = downsample_block(hidden_states=sample, temb=timestep_embed)
+            down_block_res_samples.append(sample)
 
         # 3. mid
         if self.mid_block:
@@ -174,11 +178,8 @@ class UNet1DModel(nn.Module):
 
         # 4. up
         for i, upsample_block in enumerate(self.up_blocks):
-            res_samples = down_block_res_samples[-1:]
-            down_block_res_samples = down_block_res_samples[:-1]
-            sample = upsample_block(
-                sample, res_hidden_states_tuple=res_samples, temb=timestep_embed
-            )
+            res_samples = down_block_res_samples.pop()
+            sample = upsample_block(sample, res_hidden_state=res_samples, temb=timestep_embed)
 
         # 5. post-process
         if self.out_block:

@@ -49,7 +49,7 @@ Diffusion:
     mid_block_type: "UNetMidBlock1D"
     block_out_channels: [32, 32, 32]
     conditional: 19 # different snr values
-    conditional_len: 128
+    conditional_len: 64
 
 dataset:
   iq: true #true

@@ -140,61 +140,73 @@ class ResConvBlock(nn.Module):
 class SelfAttention1d(nn.Module):
     def __init__(self, in_channels: int, n_head: int = 1, dropout_rate: float = 0.0):
         super().__init__()
-        self.channels = in_channels
-        self.group_norm = nn.GroupNorm(1, num_channels=in_channels)
+        assert in_channels % n_head == 0, "in_channels must be divisible by n_head"
+
+        self.in_channels = in_channels
         self.num_heads = n_head
+        self.head_dim = in_channels // n_head
 
-        self.query = nn.Linear(self.channels, self.channels)
-        self.key = nn.Linear(self.channels, self.channels)
-        self.value = nn.Linear(self.channels, self.channels)
+        # normalize over feature channels
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=in_channels)
 
-        self.proj_attn = nn.Linear(self.channels, self.channels, bias=True)
+        # linear projections for Q, K, V over feature dim
+        self.query = nn.Linear(in_channels, in_channels)
+        self.key   = nn.Linear(in_channels, in_channels)
+        self.value = nn.Linear(in_channels, in_channels)
 
-        self.dropout = nn.Dropout(dropout_rate, inplace=True)
+        # output projection
+        self.out_proj = nn.Linear(in_channels, in_channels)
 
-    def transpose_for_scores(self, projection: torch.Tensor) -> torch.Tensor:
-        new_projection_shape = projection.size()[:-1] + (self.num_heads, -1)
-        # move heads to 2nd position (B, T, H * D) -> (B, T, H, D) -> (B, H, T, D)
-        new_projection = projection.view(new_projection_shape).permute(0, 2, 1, 3)
-        return new_projection
+        self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        residual = hidden_states
-        batch, channel_dim, seq = hidden_states.shape
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, C, T] where
+            B = batch size,
+            C = in_channels (feature dimension),
+            T = sequence length / spatial positions
+        """
+        residual = x
+        B, C, T = x.size()
 
-        hidden_states = self.group_norm(hidden_states)
-        hidden_states = hidden_states.transpose(1, 2)
+        # 1. Normalize features per channel
+        x = self.norm(x)
 
-        query_proj = self.query(hidden_states)
-        key_proj = self.key(hidden_states)
-        value_proj = self.value(hidden_states)
+        # 2. Prepare for attention: tokens = positions (T)
+        #    shape -> [B, T, C]
+        x = x.permute(0, 2, 1)
 
-        query_states = self.transpose_for_scores(query_proj)
-        key_states = self.transpose_for_scores(key_proj)
-        value_states = self.transpose_for_scores(value_proj)
+        # 3. Linear projections
+        q = self.query(x)  # [B, T, C]
+        k = self.key(x)
+        v = self.value(x)
 
-        scale = 1 / math.sqrt(math.sqrt(key_states.shape[-1]))
+        # 4. Split into heads -> [B, T, H, D] then -> [B, H, T, D]
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        attention_scores = torch.matmul(
-            query_states * scale, key_states.transpose(-1, -2) * scale
-        )
-        attention_probs = torch.softmax(attention_scores, dim=-1)
+        # 5. Scaled dot-product attention over positions
+        scale = self.head_dim ** -0.5
+        attn_logits = (q * scale) @ (k * scale).transpose(-1, -2)  # [B, H, T, T]
+        attn = F.softmax(attn_logits, dim=-1)
+        attn = self.dropout(attn)
 
-        # compute attention output
-        hidden_states = torch.matmul(attention_probs, value_states)
+        # 6. Attend to values -> [B, H, T, D]
+        out = attn @ v
 
-        hidden_states = hidden_states.permute(0, 2, 1, 3).contiguous()
-        new_hidden_states_shape = hidden_states.size()[:-2] + (self.channels,)
-        hidden_states = hidden_states.view(new_hidden_states_shape)
+        # 7. Merge heads -> [B, T, C]
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
 
-        # compute next hidden_states
-        hidden_states = self.proj_attn(hidden_states)
-        hidden_states = hidden_states.transpose(1, 2)
-        hidden_states = self.dropout(hidden_states)
+        # 8. Final linear projection -> [B, T, C]
+        out = self.out_proj(out)
 
-        output = hidden_states + residual
+        # 9. Back to original shape -> [B, C, T]
+        out = out.permute(0, 2, 1)
+        out = self.dropout(out)
 
-        return output
+        # 10. Residual connection
+        return out + residual
 
 
 class CrossAttention1d(nn.Module):
@@ -206,73 +218,80 @@ class CrossAttention1d(nn.Module):
         dropout_rate: float = 0.0,
     ):
         super().__init__()
-        self.channels = in_channels
+        assert in_channels % n_head == 0, "in_channels must be divisible by n_head"
+
+        self.in_channels = in_channels
         self.context_dim = context_dim
         self.num_heads = n_head
+        self.head_dim = in_channels // n_head
 
-        self.group_norm = nn.GroupNorm(1, num_channels=in_channels)
+        # normalize over feature channels
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=in_channels)
 
-        # For 1D sequences, we'll use Conv1d instead of Linear for query
-        self.query = nn.Conv1d(in_channels, in_channels, 1)
-        # Key and Value still use Linear as they operate on the context
-        self.key = nn.Linear(self.context_dim, self.channels)
-        self.value = nn.Linear(self.context_dim, self.channels)
+        # query from hidden_states: use Conv1d on feature channels
+        self.query = nn.Conv1d(in_channels, in_channels, kernel_size=1)
+        # key/value from context: project context_dim to in_channels
+        self.key = nn.Linear(context_dim, in_channels)
+        self.value = nn.Linear(context_dim, in_channels)
 
-        self.proj_attn = nn.Conv1d(in_channels, in_channels, 1)
-        self.dropout = nn.Dropout(dropout_rate, inplace=True)
+        # output projection back to in_channels
+        self.out_proj = nn.Conv1d(in_channels, in_channels, kernel_size=1)
 
-    def transpose_for_scores(self, projection: torch.Tensor) -> torch.Tensor:
-        new_projection_shape = projection.size()[:-1] + (self.num_heads, -1)
-        # For 1D data: (B, C, T) -> (B, H, T, D)
-        if projection.dim() == 3:
-            B, C, T = projection.shape
-            projection = projection.transpose(1, 2)  # (B, T, C)
-        new_projection = projection.view(new_projection_shape).permute(0, 2, 1, 3)
-        return new_projection
+        self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(
-        self, hidden_states: torch.Tensor, context: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """
+        hidden_states: [B, C, T]
+        context: [B, context_dim]
+        Returns: [B, C, T]
+        """
         residual = hidden_states
-        batch, channel_dim, seq_len = hidden_states.shape
+        B, C, T = hidden_states.size()
 
-        hidden_states = self.group_norm(hidden_states)
+        # 1. Normalize features per channel
+        x = self.norm(hidden_states)
 
-        # Process query while maintaining 1D structure
-        query_states = self.query(hidden_states)  # (B, C, T)
-        query_states = self.transpose_for_scores(query_states)  # (B, H, T, D)
+        # 2. Compute queries: Conv1d over feature channels
+        # hidden_states: [B, C, T] -> q: [B, C, T]
+        q = self.query(x)
+        # prepare for heads: [B, C, T] -> [B, T, C]
+        q = q.permute(0, 2, 1)
 
-        # Process context
+        # 3. Prepare key/value from context
+        # ensure context has shape [B, S, context_dim]
+        B_ctx, ctx_dim = context.size()
+        # 3. If context is [B, context_dim], make it [B, 1, context_dim]
         if context.dim() == 2:
-            context = context.unsqueeze(1)  # Add sequence dimension if needed
+            context = context.unsqueeze(1)  # [B, 1, context_dim]
+        # Now context: [B, S=1, context_dim]
+        # project to feature dimension: [B, S, C]
+        k = self.key(context)
+        v = self.value(context)
 
-        # Process key and value from context
-        key_states = self.transpose_for_scores(self.key(context))  # (B, H, S, D)
-        value_states = self.transpose_for_scores(self.value(context))  # (B, H, S, D)
+        S = context.size(1)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
+        k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, S, D]
+        v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, S, D]
 
-        scale = 1 / math.sqrt(math.sqrt(key_states.shape[-1]))
+        # 5. Scaled dot-product attention: [B, H, T, S]
+        scale = self.head_dim ** -0.5
+        attn_logits = (q * scale) @ (k * scale).transpose(-1, -2)
+        attn = F.softmax(attn_logits, dim=-1)
+        attn = self.dropout(attn)
 
-        # Compute attention scores
-        attention_scores = torch.matmul(
-            query_states * scale, key_states.transpose(-1, -2) * scale
-        )
-        attention_probs = torch.softmax(attention_scores, dim=-1)
+        # 6. Weighted sum: [B, H, T, D]
+        out = attn @ v
 
-        # Apply attention
-        hidden_states = torch.matmul(attention_probs, value_states)  # (B, H, T, D)
+        # 7. Merge heads -> [B, T, C]
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Reshape back to 1D sequence format
-        hidden_states = hidden_states.permute(0, 2, 1, 3).contiguous()
-        new_hidden_states_shape = hidden_states.size()[:-2] + (self.channels,)
-        hidden_states = hidden_states.view(new_hidden_states_shape)  # (B, T, C)
-        hidden_states = hidden_states.transpose(1, 2)  # (B, C, T)
+        # 8. Project back to channels and restore shape [B, C, T]
+        out = out.permute(0, 2, 1)
+        out = self.out_proj(out)
+        out = self.dropout(out)
 
-        # Final projection
-        hidden_states = self.proj_attn(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-
-        output = hidden_states + residual
-        return output
+        # 9. Residual connection
+        return out + residual
 
 
 #######################################################################################
@@ -322,7 +341,7 @@ class DownBlock1D(nn.Module):
         hidden_states = self.down(hidden_states)
         for resnet in self.resnets:
             hidden_states = resnet(hidden_states)
-        return hidden_states, (hidden_states,)
+        return hidden_states
 
 
 class AttnDownBlock1D(nn.Module):
@@ -362,12 +381,9 @@ class AttnDownBlock1D(nn.Module):
         self.cross_attentions = nn.ModuleList(cross_attentions)
         self.resnets = nn.ModuleList(resnets)
 
-    def forward(
-        self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
-        # hidden_states shape: (B, C, T) where T is the sequence length
+    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
         hidden_states = self.down(hidden_states)
-
+        
         for resnet, self_attn, cross_attn in zip(
             self.resnets, self.self_attentions, self.cross_attentions
         ):
@@ -375,8 +391,8 @@ class AttnDownBlock1D(nn.Module):
             hidden_states = self_attn(hidden_states)
             if temb is not None:
                 hidden_states = cross_attn(hidden_states, temb)
-
-        return hidden_states, (hidden_states,)
+            
+        return hidden_states
 
 
 ######################## MIDDLE Bottleneck CLASES ########################
@@ -395,6 +411,7 @@ class UNetMidBlock1D(nn.Module):
 
         # there is always at least one resnet
         self.down = Downsample1d("cubic")
+        self.up = Upsample1d("cubic")
         resnets = [
             ResConvBlock(in_channels, mid_channels, mid_channels),
             ResConvBlock(mid_channels, mid_channels, mid_channels),
@@ -433,7 +450,9 @@ class UNetMidBlock1D(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+    # [batch_size, channels, 8dim]
         hidden_states = self.down(hidden_states)
+    # [batch_size, channels, 4dim]
 
         # Update forward pass to include both self and cross attention
         for resnet, self_attn, cross_attn in zip(
@@ -444,6 +463,7 @@ class UNetMidBlock1D(nn.Module):
             if temb is not None:
                 hidden_states = cross_attn(hidden_states, temb)
 
+        # upsample by 2
         hidden_states = self.up(hidden_states)
 
         return hidden_states
@@ -497,11 +517,10 @@ class UpBlock1D(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        res_hidden_states_tuple: Tuple[torch.Tensor, ...],
+        res_hidden_state: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        res_hidden_states = res_hidden_states_tuple[-1]
-        hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+        hidden_states = torch.cat([hidden_states, res_hidden_state], dim=1)
 
         for resnet in self.resnets:
             hidden_states = resnet(hidden_states)
@@ -523,12 +542,13 @@ class AttnUpBlock1D(nn.Module):
         super().__init__()
         mid_channels = out_channels if mid_channels is None else mid_channels
 
+        # We concatentate our reisudal connections, so 2x the input channels
         resnets = [
-            ResConvBlock(2 * in_channels, mid_channels, mid_channels),
+            ResConvBlock(2* in_channels, mid_channels, mid_channels),
             ResConvBlock(mid_channels, mid_channels, mid_channels),
             ResConvBlock(mid_channels, mid_channels, out_channels),
         ]
-        attentions = [
+        self_attentions = [
             SelfAttention1d(mid_channels, mid_channels // 32),
             SelfAttention1d(mid_channels, mid_channels // 32),
             SelfAttention1d(out_channels, out_channels // 32),
@@ -541,17 +561,21 @@ class AttnUpBlock1D(nn.Module):
             CrossAttention1d(out_channels, context_dim, n_head=num_heads),
         ]
 
-        self.attentions = nn.ModuleList(attentions)
+        self.self_attentions = nn.ModuleList(self_attentions)
         self.cross_attentions = nn.ModuleList(cross_attentions)
         self.resnets = nn.ModuleList(resnets)
         self.up = Upsample1d(kernel="cubic")
 
     def forward(
-        self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
-        # hidden_states shape: (B, C, T) where T is the sequence length
-        hidden_states = self.down(hidden_states)
+        self,
+        hidden_states: torch.Tensor,
+        res_hidden_state: torch.Tensor,
+        temb: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
 
+        # concatenate the residual connection 
+        hidden_states = torch.cat([hidden_states, res_hidden_state], dim=1)
+        
         for resnet, self_attn, cross_attn in zip(
             self.resnets, self.self_attentions, self.cross_attentions
         ):
@@ -559,5 +583,6 @@ class AttnUpBlock1D(nn.Module):
             hidden_states = self_attn(hidden_states)
             if temb is not None:
                 hidden_states = cross_attn(hidden_states, temb)
-
-        return hidden_states, (hidden_states,)
+                
+        # Upsample for next iteration
+        return self.up(hidden_states)
