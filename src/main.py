@@ -4,7 +4,7 @@ from hydra.utils import get_original_cwd
 import wandb
 from omegaconf import DictConfig, OmegaConf
 import lightning.pytorch as L
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, checkpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
 from data.rfml_dataset_2016 import get_dataloaders
 import os
@@ -102,7 +102,7 @@ def main(cfg: DictConfig):
         ],
     )
 
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, val_loader) #pyright: ignore
     print("Diffusion Model Finished Training")
 
 

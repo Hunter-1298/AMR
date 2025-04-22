@@ -60,7 +60,7 @@ class LatentDiffusion(L.LightningModule):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode input to latent space and scale"""
         z = self.encoder.encode(x)
-        return z 
+        return z
 
     def q_sample(
         self,
@@ -68,6 +68,7 @@ class LatentDiffusion(L.LightningModule):
         t: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
         """
         Forward diffusion process: q(x_t | x_0)
         Add noise to x_start according to noise schedule at timestep t
@@ -114,7 +115,7 @@ class LatentDiffusion(L.LightningModule):
         x_start: torch.Tensor,
         t: torch.Tensor,
         context: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate diffusion loss for denoising score matching
 
@@ -194,7 +195,7 @@ class LatentDiffusion(L.LightningModule):
 
         return noise_loss
 
-    def configure_optimizers(self):
+    def configure_optimizers(self): #pyright: ignore
         """Setup optimizer and learning rate scheduler"""
         # Create optimizer
         optimizer = torch.optim.AdamW(
@@ -204,7 +205,7 @@ class LatentDiffusion(L.LightningModule):
         # Create scheduler
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.trainer.estimated_stepping_batches,
+            T_max=int(self.trainer.estimated_stepping_batches),
             eta_min=self.learning_rate / 10,
         )
 
