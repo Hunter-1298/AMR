@@ -206,7 +206,7 @@ class LatentDiffusion(L.LightningModule):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=int(self.trainer.estimated_stepping_batches),
-            eta_min=self.learning_rate / 10,
+            eta_min=self.learning_rate / 100,
         )
 
         return {
