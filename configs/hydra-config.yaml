@@ -36,7 +36,7 @@ Diffusion:
     learning_rate: ${hyperparams.learning_rate}
     n_steps: 1000
     linear_start: 0.0001 # starting noise value for beta schedule
-    linear_end: 0.02 # ending value for the beta schedule
+    linear_end: 0.01 # ending value for the beta schedule
     weight_decay: 1e-2
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel

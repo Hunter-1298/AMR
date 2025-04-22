@@ -19,43 +19,59 @@ class LatentDiffusion(L.LightningModule):
         weight_decay: float = 1e-2,
     ):
         super().__init__()
+        # save hyperparms to lightning and wandb
         self.save_hyperparameters()
+
+        self.learning_rate = learning_rate
+        self.n_steps = n_steps
 
         # Initialize UNet for latent space diffusion and the encoder for sampling
         self.unet = unet
         self.encoder = encoder
 
-        # Diffusion parameters
-        self.n_steps = n_steps  # total noising steps
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-
-        # Setup noise schedule
-        # Create linearly spaced array - squared to get the beta values
-        # beta - variance of noise at each step
-        # alpha = 1-beta: proportion of original signal retained at each step
-        # alpha_bar = cumulative products of alpha which is the total retention up to step t
-        # sqrt_alpha_bar = precomputed square root of alpha for efficiency
-        # sqrt_one_minus_alpha_bar = precomputed square root for efficiency
+        # Create noise schedule
         beta = (
             torch.linspace(
                 linear_start**0.5, linear_end**0.5, n_steps, dtype=torch.float64
             )
             ** 2
         )
-        self.beta = nn.Parameter(beta.to(torch.float32), requires_grad=False)
-        alpha = 1 - beta
-        alpha_bar = torch.cumprod(alpha, dim=0)
-        self.alpha = nn.Parameter(alpha.to(torch.float32), requires_grad=False)
-        self.alpha_bar = nn.Parameter(alpha_bar.to(torch.float32), requires_grad=False)
 
-        # Precompute values for sampling
-        self.sqrt_alpha_bar = nn.Parameter(
-            torch.sqrt(alpha_bar).to(torch.float32), requires_grad=False
-        )
-        self.sqrt_one_minus_alpha_bar = nn.Parameter(
-            torch.sqrt(1.0 - alpha_bar).to(torch.float32), requires_grad=False
-        )
+        # Convert to float32 and create self attributes first
+        # 1. Beta (β) - Amount of noise added at each step
+        beta = beta.to(torch.float32)  # [0.0001 -> 0.02]
+        # - Controls how much noise is added at each timestep
+        # - Starts small (0.0001) and increases to final value (0.02)
+        # - Like a schedule of how much noise to add at each step
+
+        # 2. Alpha (α) - Amount of original signal preserved
+        alpha = 1 - beta  # [0.9999 -> 0.98]
+        # - Opposite of beta
+        # - How much of original signal remains at each step
+        # - Starts high (0.9999) and decreases
+
+        # 3. Alpha_bar (ᾱ) - Cumulative signal preservation
+        alpha_bar = torch.cumprod(alpha, dim=0)  # [0.9999 -> ~0.02]
+        # - Cumulative product of alphas
+        # - Total amount of original signal remaining after t steps
+        # - Decreases more rapidly than alpha
+
+        # 4. sqrt_alpha_bar (√ᾱ) - For scaling original signal
+        sqrt_alpha_bar = torch.sqrt(alpha_bar)
+        # - Used to scale the original signal in noise addition
+        # - Square root for numerical stability
+
+        # 5. sqrt_one_minus_alpha_bar (√(1-ᾱ)) - For scaling noise
+        sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
+        # - Used to scale the noise in noise addition
+        # - Complement to sqrt_alpha_bar
+
+        # Now register them as buffers
+        self.register_buffer('beta', beta)
+        self.register_buffer('alpha', alpha)
+        self.register_buffer('alpha_bar', alpha_bar)
+        self.register_buffer('sqrt_alpha_bar', sqrt_alpha_bar)
+        self.register_buffer('sqrt_one_minus_alpha_bar', sqrt_one_minus_alpha_bar)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode input to latent space and scale"""
@@ -85,13 +101,14 @@ class LatentDiffusion(L.LightningModule):
         if noise is None:
             noise = torch.randn_like(x_start)
 
-        # Extract appropriate alphas for this timestep
-        sqrt_alpha_bar_t = self.sqrt_alpha_bar[t].view(-1, 1, 1)
-        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+        # Get appropriate alphas for timestep t
+        # Forward diffusion formula:
+        # x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
+        sqrt_alpha_bar_t = self.sqrt_alpha_bar[t].view(-1, 1, 1) #pyright: ignore
+        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1) #pyright: ignore
 
-        # Generate x_t from x_0 and noise
+        # Add noise according to schedule
         x_t = sqrt_alpha_bar_t * x_start + sqrt_one_minus_alpha_bar_t * noise
-
         return x_t, noise
 
     def forward(
@@ -196,24 +213,14 @@ class LatentDiffusion(L.LightningModule):
         return noise_loss
 
     def configure_optimizers(self): #pyright: ignore
-        """Setup optimizer and learning rate scheduler"""
-        # Create optimizer
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
-        )
-
-        # Create scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+        # OneCycleLR automatically determines warm-up and decay schedules
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            T_max=int(self.trainer.estimated_stepping_batches),
-            eta_min=self.learning_rate / 100,
+            max_lr=self.learning_rate,  # Peak LR at warmup end
+            total_steps=int(self.trainer.estimated_stepping_batches),  # Total training steps
+            pct_start=0.1,  # 5% of training is used for warm-up
+            anneal_strategy="cos",  # Cosine decay after warmup
+            final_div_factor=100  # Reduce LR by 10x at the end
         )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-        }
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
