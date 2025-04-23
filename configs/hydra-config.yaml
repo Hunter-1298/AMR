@@ -43,10 +43,12 @@ Diffusion:
         sample_size: 64
         in_channels: 32
         out_channels: 32
-        down_block_types: ["DownBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
-        up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpBlock1D"]
+        down_block_types:
+            ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
+        up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
         mid_block_type: "UNetMidBlock1D"
         block_out_channels: [32, 32, 32]
+        layers_per_block: 1
         conditional: 19 # different snr values
         conditional_len: 64
 

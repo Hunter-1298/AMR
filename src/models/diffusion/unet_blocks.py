@@ -1,22 +1,10 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import math
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from .activations import get_activation
 
 _kernels = {
     "linear": [1 / 8, 3 / 8, 3 / 8, 1 / 8],
@@ -52,12 +40,25 @@ def get_down_block(
     in_channels: int,
     out_channels: int,
     context_dim: int,
+    num_layers: int,
+    temb_channels: int,
+    add_downsample: bool,
 ):
-    if down_block_type == "DownBlock1D":
-        return DownBlock1D(out_channels=out_channels, in_channels=in_channels)
+    if down_block_type == "DownResnetBlock1D":
+        return DownResnetBlock1D(
+            in_channels=in_channels,
+            num_layers=num_layers,
+            out_channels=out_channels,
+            temb_channels=temb_channels,
+            add_downsample=add_downsample,
+        )
     elif down_block_type == "AttnDownBlock1D":
         return AttnDownBlock1D(
-            out_channels=out_channels, in_channels=in_channels, context_dim=context_dim
+            out_channels=out_channels,
+            in_channels=in_channels,
+            context_dim=context_dim,
+            temb_channels=temb_channels,
+            add_downsample=add_downsample,
         )
     raise ValueError(f"{down_block_type} does not exist.")
 
@@ -67,6 +68,7 @@ def get_mid_block(
     in_channels: int,
     mid_channels: int,
     out_channels: int,
+    temb_channels: int,
     context_dim: int,
 ):
     if mid_block_type == "UNetMidBlock1D":
@@ -84,16 +86,117 @@ def get_up_block(
     in_channels: int,
     out_channels: int,
     context_dim: int,
+    num_layers: int,
+    temb_channels: int,
+    add_upsample: bool,
 ):
-    if up_block_type == "UpBlock1D":
-        return UpBlock1D(in_channels=in_channels, out_channels=out_channels)
+    if up_block_type == "UpResnetBlock1D":
+        return UpResnetBlock1D(
+            in_channels=in_channels,
+            num_layers=num_layers,
+            out_channels=out_channels,
+            temb_channels=temb_channels,
+            add_upsample=add_upsample,
+        )
     elif up_block_type == "AttnUpBlock1D":
-        return AttnUpBlock1D(in_channels=in_channels, out_channels=out_channels, context_dim=context_dim)
+        return AttnUpBlock1D(in_channels=in_channels,
+            out_channels=out_channels,
+            context_dim=context_dim,
+            temb_channels=temb_channels,
+        )
     raise ValueError(f"{up_block_type} does not exist.")
 
+def rearrange_dims(tensor: torch.Tensor) -> torch.Tensor:
+    if len(tensor.shape) == 2:
+        return tensor[:, :, None]
+    if len(tensor.shape) == 3:
+        return tensor[:, :, None, :]
+    elif len(tensor.shape) == 4:
+        return tensor[:, :, 0, :]
+    else:
+        raise ValueError(f"`len(tensor)`: {len(tensor)} has to be 2, 3 or 4.")
 
 #################### GLOBAL CLASSES for UP and DOWN Sampling #########################
 
+class Conv1dBlock(nn.Module):
+    """
+    Conv1d --> GroupNorm --> Mish
+
+    Parameters:
+        inp_channels (`int`): Number of input channels.
+        out_channels (`int`): Number of output channels.
+        kernel_size (`int` or `tuple`): Size of the convolving kernel.
+        n_groups (`int`, default `8`): Number of groups to separate the channels into.
+        activation (`str`, defaults to `mish`): Name of the activation function.
+    """
+
+    def __init__(
+        self,
+        inp_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]],
+        n_groups: int = 8,
+        activation: str = "mish",
+    ):
+        super().__init__()
+
+        self.conv1d = nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2)
+        self.group_norm = nn.GroupNorm(n_groups, out_channels)
+        self.mish = get_activation(activation)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        intermediate_repr = self.conv1d(inputs)
+        intermediate_repr = rearrange_dims(intermediate_repr)
+        intermediate_repr = self.group_norm(intermediate_repr)
+        intermediate_repr = rearrange_dims(intermediate_repr)
+        output = self.mish(intermediate_repr)
+        return output
+
+class ResidualTemporalBlock1D(nn.Module):
+    """
+    Residual 1D block with temporal convolutions.
+
+    Parameters:
+        inp_channels (`int`): Number of input channels.
+        out_channels (`int`): Number of output channels.
+        embed_dim (`int`): Embedding dimension.
+        kernel_size (`int` or `tuple`): Size of the convolving kernel.
+        activation (`str`, defaults `mish`): It is possible to choose the right activation function.
+    """
+
+    def __init__(
+        self,
+        inp_channels: int,
+        out_channels: int,
+        embed_dim: int,
+        kernel_size: Union[int, Tuple[int, int]] = 5,
+        activation: str = "mish",
+    ):
+        super().__init__()
+        self.conv_in = Conv1dBlock(inp_channels, out_channels, kernel_size)
+        self.conv_out = Conv1dBlock(out_channels, out_channels, kernel_size)
+
+        self.time_emb_act = get_activation(activation)
+        self.time_emb = nn.Linear(embed_dim, out_channels)
+
+        self.residual_conv = (
+            nn.Conv1d(inp_channels, out_channels, 1) if inp_channels != out_channels else nn.Identity()
+        )
+
+    def forward(self, inputs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            inputs : [ batch_size x inp_channels x horizon ]
+            t : [ batch_size x embed_dim ]
+
+        returns:
+            out : [ batch_size x out_channels x horizon ]
+        """
+        t = self.time_emb_act(t)
+        t = self.time_emb(t)
+        out = self.conv_in(inputs) + rearrange_dims(t)
+        out = self.conv_out(out)
+        return out + self.residual_conv(inputs)
 
 class ResConvBlock(nn.Module):
     def __init__(
@@ -298,50 +401,48 @@ class CrossAttention1d(nn.Module):
 
 
 ############### DOWN BLOCK CLASSES ##########################
+class Downsample1D(nn.Module):
+    """A 1D downsampling layer with an optional convolution.
 
+    Parameters:
+        channels (`int`):
+            number of channels in the inputs and outputs.
+        use_conv (`bool`, default `False`):
+            option to use a convolution.
+        out_channels (`int`, optional):
+            number of output channels. Defaults to `channels`.
+        padding (`int`, default `1`):
+            padding for the convolution.
+        name (`str`, default `conv`):
+            name of the downsampling 1D layer.
+    """
 
-class Downsample1d(nn.Module):
-    def __init__(self, kernel: str = "linear", pad_mode: str = "reflect"):
-        super().__init__()
-        self.pad_mode = pad_mode
-        kernel_1d = torch.tensor(_kernels[kernel])
-        self.pad = kernel_1d.shape[0] // 2 - 1
-        self.register_buffer("kernel", kernel_1d)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = F.pad(hidden_states, (self.pad,) * 2, self.pad_mode)
-        weight = hidden_states.new_zeros(
-            [hidden_states.shape[1], hidden_states.shape[1], self.kernel.shape[0]]
-        )
-        indices = torch.arange(hidden_states.shape[1], device=hidden_states.device)
-        kernel = self.kernel.to(weight)[None, :].expand(hidden_states.shape[1], -1)
-        weight[indices, indices] = kernel
-        return F.conv1d(hidden_states, weight, stride=2)
-
-
-class DownBlock1D(nn.Module):
     def __init__(
-        self, out_channels: int, in_channels: int, mid_channels: Optional[int] = None
+        self,
+        channels: int,
+        use_conv: bool = False,
+        out_channels: Optional[int] = None,
+        padding: int = 1,
+        name: str = "conv",
     ):
         super().__init__()
-        mid_channels = out_channels if mid_channels is None else mid_channels
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.padding = padding
+        stride = 2
+        self.name = name
 
-        self.down = Downsample1d("cubic")
-        resnets = [
-            ResConvBlock(in_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, out_channels),
-        ]
+        if use_conv:
+            self.conv = nn.Conv1d(self.channels, self.out_channels, 3, stride=stride, padding=padding)
+        else:
+            assert self.channels == self.out_channels
+            self.conv = nn.AvgPool1d(kernel_size=stride, stride=stride)
 
-        self.resnets = nn.ModuleList(resnets)
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        assert inputs.shape[1] == self.channels
+        return self.conv(inputs)
 
-    def forward(
-        self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        hidden_states = self.down(hidden_states)
-        for resnet in self.resnets:
-            hidden_states = resnet(hidden_states)
-        return hidden_states
 
 
 class AttnDownBlock1D(nn.Module):
@@ -350,17 +451,21 @@ class AttnDownBlock1D(nn.Module):
         out_channels: int,
         in_channels: int,
         context_dim: int,
+        temb_channels: int,
         mid_channels: Optional[int] = None,
+        add_downsample: bool = True,
         num_heads: int = 8,
     ):
         super().__init__()
         mid_channels = out_channels if mid_channels is None else mid_channels
 
-        self.down = Downsample1d("cubic")
+        self.downsample = None
+        if add_downsample:
+            self.downsample = Downsample1D(out_channels, use_conv=True, padding=1)
         resnets = [
-            ResConvBlock(in_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, out_channels),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels)
         ]
 
         # Self-attention layers for 1D sequences
@@ -382,8 +487,8 @@ class AttnDownBlock1D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
     def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
-        hidden_states = self.down(hidden_states)
-        
+        hidden_states = self.downsample(hidden_states) #pyright: ignore
+
         for resnet, self_attn, cross_attn in zip(
             self.resnets, self.self_attentions, self.cross_attentions
         ):
@@ -391,8 +496,64 @@ class AttnDownBlock1D(nn.Module):
             hidden_states = self_attn(hidden_states)
             if temb is not None:
                 hidden_states = cross_attn(hidden_states, temb)
-            
+
         return hidden_states
+
+class DownResnetBlock1D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: Optional[int] = None,
+        num_layers: int = 1,
+        conv_shortcut: bool = False,
+        temb_channels: int = 32,
+        non_linearity: Optional[str] = None,
+        time_embedding_norm: str = "default",
+        output_scale_factor: float = 1.0,
+        add_downsample: bool = True,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        out_channels = in_channels if out_channels is None else out_channels
+        self.out_channels = out_channels
+        self.use_conv_shortcut = conv_shortcut
+        self.time_embedding_norm = time_embedding_norm
+        self.add_downsample = add_downsample
+        self.output_scale_factor = output_scale_factor
+
+        # there will always be at least one resnet
+        resnets = [ResidualTemporalBlock1D(in_channels, out_channels, embed_dim=temb_channels)]
+
+        for _ in range(num_layers):
+            resnets.append(ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels))
+
+        self.resnets = nn.ModuleList(resnets)
+
+        if non_linearity is None:
+            self.nonlinearity = None
+        else:
+            self.nonlinearity = get_activation(non_linearity)
+
+        self.downsample = None
+        if add_downsample:
+            self.downsample = Downsample1D(out_channels, use_conv=True, padding=1)
+
+    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
+        output_states = ()
+
+        hidden_states = self.resnets[0](hidden_states, temb)
+        for resnet in self.resnets[1:]:
+            hidden_states = resnet(hidden_states, temb)
+
+        output_states += (hidden_states,)
+
+        if self.nonlinearity is not None:
+            hidden_states = self.nonlinearity(hidden_states)
+
+        if self.downsample is not None:
+            hidden_states = self.downsample(hidden_states)
+
+        return hidden_states, output_states
 
 
 ######################## MIDDLE Bottleneck CLASES ########################
@@ -401,6 +562,7 @@ class UNetMidBlock1D(nn.Module):
         self,
         mid_channels: int,
         in_channels: int,
+        temb_channels: int,
         context_dim: int,  # Add context dimension parameter
         out_channels: Optional[int] = None,
         num_heads: int = 8,  # Add number of heads parameter
@@ -410,22 +572,17 @@ class UNetMidBlock1D(nn.Module):
         out_channels = in_channels if out_channels is None else out_channels
 
         # there is always at least one resnet
-        self.down = Downsample1d("cubic")
-        self.up = Upsample1d("cubic")
+        self.downsample = Downsample1D(out_channels, use_conv=True, padding=1)
+        self.upsample = Upsample1D(out_channels, use_conv_transpose=True)
+
         resnets = [
-            ResConvBlock(in_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, out_channels),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels)
         ]
 
         # Self attention layers
         self_attentions = [
-            SelfAttention1d(mid_channels, n_head=num_heads),
-            SelfAttention1d(mid_channels, n_head=num_heads),
-            SelfAttention1d(mid_channels, n_head=num_heads),
             SelfAttention1d(mid_channels, n_head=num_heads),
             SelfAttention1d(mid_channels, n_head=num_heads),
             SelfAttention1d(out_channels, n_head=num_heads),
@@ -433,9 +590,6 @@ class UNetMidBlock1D(nn.Module):
 
         # Add cross attention layers
         cross_attentions = [
-            CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
-            CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
-            CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
             CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
             CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
             CrossAttention1d(out_channels, context_dim, n_head=num_heads),
@@ -451,7 +605,7 @@ class UNetMidBlock1D(nn.Module):
         self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
     # [batch_size, channels, 8dim]
-        hidden_states = self.down(hidden_states)
+        hidden_states = self.downsample(hidden_states)
     # [batch_size, channels, 4dim]
 
         # Update forward pass to include both self and cross attention
@@ -464,7 +618,7 @@ class UNetMidBlock1D(nn.Module):
                 hidden_states = cross_attn(hidden_states, temb)
 
         # upsample by 2
-        hidden_states = self.up(hidden_states)
+        hidden_states = self.upsample(hidden_states)
 
         return hidden_states
 
@@ -473,30 +627,53 @@ class UNetMidBlock1D(nn.Module):
 
 
 ######################## UP CLASSES ########################
+class Upsample1D(nn.Module):
+    """A 1D upsampling layer with an optional convolution.
 
+    Parameters:
+        channels (`int`):
+            number of channels in the inputs and outputs.
+        use_conv (`bool`, default `False`):
+            option to use a convolution.
+        use_conv_transpose (`bool`, default `False`):
+            option to use a convolution transpose.
+        out_channels (`int`, optional):
+            number of output channels. Defaults to `channels`.
+        name (`str`, default `conv`):
+            name of the upsampling 1D layer.
+    """
 
-class Upsample1d(nn.Module):
-    def __init__(self, kernel: str = "linear", pad_mode: str = "reflect"):
+    def __init__(
+        self,
+        channels: int,
+        use_conv: bool = False,
+        use_conv_transpose: bool = False,
+        out_channels: Optional[int] = None,
+        name: str = "conv",
+    ):
         super().__init__()
-        self.pad_mode = pad_mode
-        kernel_1d = torch.tensor(_kernels[kernel]) * 2
-        self.pad = kernel_1d.shape[0] // 2 - 1
-        self.register_buffer("kernel", kernel_1d)
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.use_conv_transpose = use_conv_transpose
+        self.name = name
 
-    def forward(
-        self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        hidden_states = F.pad(hidden_states, ((self.pad + 1) // 2,) * 2, self.pad_mode)
-        weight = hidden_states.new_zeros(
-            [hidden_states.shape[1], hidden_states.shape[1], self.kernel.shape[0]]
-        )
-        indices = torch.arange(hidden_states.shape[1], device=hidden_states.device)
-        kernel = self.kernel.to(weight)[None, :].expand(hidden_states.shape[1], -1)
-        weight[indices, indices] = kernel
-        return F.conv_transpose1d(
-            hidden_states, weight, stride=2, padding=self.pad * 2 + 1
-        )
+        if use_conv_transpose:
+            self.conv = nn.ConvTranspose1d(channels, self.out_channels, 4, 2, 1)
+        elif use_conv:
+            self.conv = nn.Conv1d(self.channels, self.out_channels, 3, padding=1)
 
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        assert inputs.shape[1] == self.channels
+        if self.use_conv_transpose:
+            return self.conv(inputs)
+
+        outputs = F.interpolate(inputs, scale_factor=2.0, mode="nearest")
+
+        if self.use_conv:
+            outputs = self.conv(outputs)
+
+        return outputs
 
 class UpBlock1D(nn.Module):
     def __init__(
@@ -536,6 +713,7 @@ class AttnUpBlock1D(nn.Module):
         in_channels: int,
         out_channels: int,
         context_dim: int,
+        temb_channels: int,
         num_heads: int = 8,
         mid_channels: Optional[int] = None,
     ):
@@ -544,9 +722,9 @@ class AttnUpBlock1D(nn.Module):
 
         # We concatentate our reisudal connections, so 2x the input channels
         resnets = [
-            ResConvBlock(2* in_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, out_channels),
+            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_channels),
+            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_channels),
+            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_channels)
         ]
         self_attentions = [
             SelfAttention1d(mid_channels, mid_channels // 32),
@@ -564,7 +742,7 @@ class AttnUpBlock1D(nn.Module):
         self.self_attentions = nn.ModuleList(self_attentions)
         self.cross_attentions = nn.ModuleList(cross_attentions)
         self.resnets = nn.ModuleList(resnets)
-        self.up = Upsample1d(kernel="cubic")
+        self.upsample = Upsample1D(out_channels, use_conv_transpose=True)
 
     def forward(
         self,
@@ -573,9 +751,9 @@ class AttnUpBlock1D(nn.Module):
         temb: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
 
-        # concatenate the residual connection 
+        # concatenate the residual connection
         hidden_states = torch.cat([hidden_states, res_hidden_state], dim=1)
-        
+
         for resnet, self_attn, cross_attn in zip(
             self.resnets, self.self_attentions, self.cross_attentions
         ):
@@ -583,6 +761,65 @@ class AttnUpBlock1D(nn.Module):
             hidden_states = self_attn(hidden_states)
             if temb is not None:
                 hidden_states = cross_attn(hidden_states, temb)
-                
+
         # Upsample for next iteration
-        return self.up(hidden_states)
+        return self.upsample(hidden_states)
+
+class UpResnetBlock1D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: Optional[int] = None,
+        num_layers: int = 1,
+        temb_channels: int = 32,
+        non_linearity: Optional[str] = None,
+        time_embedding_norm: str = "default",
+        output_scale_factor: float = 1.0,
+        add_upsample: bool = True,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        out_channels = in_channels if out_channels is None else out_channels
+        self.out_channels = out_channels
+        self.time_embedding_norm = time_embedding_norm
+        self.add_upsample = add_upsample
+        self.output_scale_factor = output_scale_factor
+
+        # there will always be at least one resnet
+        resnets = [ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_channels)]
+
+        for _ in range(num_layers):
+            resnets.append(ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels))
+
+        self.resnets = nn.ModuleList(resnets)
+
+        if non_linearity is None:
+            self.nonlinearity = None
+        else:
+            self.nonlinearity = get_activation(non_linearity)
+
+        self.upsample = None
+        if add_upsample:
+            self.upsample = Upsample1D(out_channels, use_conv_transpose=True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        res_hidden_states_tuple: Optional[Tuple[torch.Tensor, ...]] = None,
+        temb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if res_hidden_states_tuple is not None:
+            res_hidden_states = res_hidden_states_tuple[-1]
+            hidden_states = torch.cat((hidden_states, res_hidden_states), dim=1)
+
+        hidden_states = self.resnets[0](hidden_states, temb)
+        for resnet in self.resnets[1:]:
+            hidden_states = resnet(hidden_states, temb)
+
+        if self.nonlinearity is not None:
+            hidden_states = self.nonlinearity(hidden_states)
+
+        if self.upsample is not None:
+            hidden_states = self.upsample(hidden_states)
+
+        return hidden_states
