@@ -4,8 +4,8 @@ run_name: Denoiser_Train_LDM:${now:%Y-%m-%d_%H-%M-%S}
 train_encoder: False
 checkpoint_name: vae_epoch=29_val_loss=0.0000.ckpt
 mode: online
-debug: False
-log_model: True
+debug: True
+log_model: False
 seed: 42
 
 # In your hydra config

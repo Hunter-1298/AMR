@@ -103,7 +103,7 @@ class UNet1DModel(nn.Module):
                 out_channels=output_channel,
                 context_dim=conditional_len,
                 num_layers=layers_per_block,
-                temb_channels=block_out_channels[0],
+                temb_dim=time_embed_dim,
                 add_downsample=True
             )
             self.down_blocks.append(down_block)
@@ -114,6 +114,7 @@ class UNet1DModel(nn.Module):
             in_channels=block_out_channels[-1],
             mid_channels=block_out_channels[-1],
             out_channels=block_out_channels[-1],
+            temb_dim=time_embed_dim,
             context_dim=conditional_len,
         )
         # up
@@ -134,7 +135,7 @@ class UNet1DModel(nn.Module):
                 num_layers=layers_per_block,
                 in_channels=prev_output_channel,
                 out_channels=output_channel,
-                temb_channels=block_out_channels[0],
+                temb_dim=time_embed_dim,
                 context_dim=conditional_len,
                 add_upsample=not is_final_block,
             )
@@ -168,6 +169,9 @@ class UNet1DModel(nn.Module):
         timestep_embed = self.time_proj(timesteps)
         # make the timesteps learnable in a higher dimension
         timestep_embed = self.time_mlp(timestep_embed.to(sample.dtype))
+
+
+        import pdb; pdb.set_trace()
 
         # 2. down
         down_block_res_samples = ()

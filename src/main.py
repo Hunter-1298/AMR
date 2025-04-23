@@ -82,7 +82,7 @@ def main(cfg: DictConfig):
 
     # Train Diffusion Model
     model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     # Set up trainer for MoE
     trainer = L.Trainer(

@@ -41,7 +41,7 @@ def get_down_block(
     out_channels: int,
     context_dim: int,
     num_layers: int,
-    temb_channels: int,
+    temb_dim: int,
     add_downsample: bool,
 ):
     if down_block_type == "DownResnetBlock1D":
@@ -49,7 +49,7 @@ def get_down_block(
             in_channels=in_channels,
             num_layers=num_layers,
             out_channels=out_channels,
-            temb_channels=temb_channels,
+            temb_dim=temb_dim,
             add_downsample=add_downsample,
         )
     elif down_block_type == "AttnDownBlock1D":
@@ -57,7 +57,7 @@ def get_down_block(
             out_channels=out_channels,
             in_channels=in_channels,
             context_dim=context_dim,
-            temb_channels=temb_channels,
+            temb_dim=temb_dim,
             add_downsample=add_downsample,
         )
     raise ValueError(f"{down_block_type} does not exist.")
@@ -68,7 +68,7 @@ def get_mid_block(
     in_channels: int,
     mid_channels: int,
     out_channels: int,
-    temb_channels: int,
+    temb_dim: int,
     context_dim: int,
 ):
     if mid_block_type == "UNetMidBlock1D":
@@ -76,6 +76,7 @@ def get_mid_block(
             in_channels=in_channels,
             mid_channels=mid_channels,
             out_channels=out_channels,
+            temb_dim=temb_dim,
             context_dim=context_dim
         )
     raise ValueError(f"{mid_block_type} does not exist.")
@@ -87,7 +88,7 @@ def get_up_block(
     out_channels: int,
     context_dim: int,
     num_layers: int,
-    temb_channels: int,
+    temb_dim: int,
     add_upsample: bool,
 ):
     if up_block_type == "UpResnetBlock1D":
@@ -95,14 +96,14 @@ def get_up_block(
             in_channels=in_channels,
             num_layers=num_layers,
             out_channels=out_channels,
-            temb_channels=temb_channels,
+            temb_dim=temb_dim,
             add_upsample=add_upsample,
         )
     elif up_block_type == "AttnUpBlock1D":
         return AttnUpBlock1D(in_channels=in_channels,
             out_channels=out_channels,
             context_dim=context_dim,
-            temb_channels=temb_channels,
+            temb_dim=temb_dim,
         )
     raise ValueError(f"{up_block_type} does not exist.")
 
@@ -172,6 +173,7 @@ class ResidualTemporalBlock1D(nn.Module):
         kernel_size: Union[int, Tuple[int, int]] = 5,
         activation: str = "mish",
     ):
+
         super().__init__()
         self.conv_in = Conv1dBlock(inp_channels, out_channels, kernel_size)
         self.conv_out = Conv1dBlock(out_channels, out_channels, kernel_size)
@@ -192,6 +194,7 @@ class ResidualTemporalBlock1D(nn.Module):
         returns:
             out : [ batch_size x out_channels x horizon ]
         """
+        import pdb; pdb.set_trace()
         t = self.time_emb_act(t)
         t = self.time_emb(t)
         out = self.conv_in(inputs) + rearrange_dims(t)
@@ -451,7 +454,7 @@ class AttnDownBlock1D(nn.Module):
         out_channels: int,
         in_channels: int,
         context_dim: int,
-        temb_channels: int,
+        temb_dim: int,
         mid_channels: Optional[int] = None,
         add_downsample: bool = True,
         num_heads: int = 8,
@@ -463,9 +466,9 @@ class AttnDownBlock1D(nn.Module):
         if add_downsample:
             self.downsample = Downsample1D(out_channels, use_conv=True, padding=1)
         resnets = [
-            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels),
-            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels),
-            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels)
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_dim),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_dim),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_dim)
         ]
 
         # Self-attention layers for 1D sequences
@@ -486,18 +489,23 @@ class AttnDownBlock1D(nn.Module):
         self.cross_attentions = nn.ModuleList(cross_attentions)
         self.resnets = nn.ModuleList(resnets)
 
-    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> torch.Tensor:
-        hidden_states = self.downsample(hidden_states) #pyright: ignore
+    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
+
+        outputs = ()
+        if self.downsample is not None:
+            hidden_states = self.downsample(hidden_states)
 
         for resnet, self_attn, cross_attn in zip(
             self.resnets, self.self_attentions, self.cross_attentions
         ):
-            hidden_states = resnet(hidden_states)
+            hidden_states = resnet(hidden_states, temb)
             hidden_states = self_attn(hidden_states)
             if temb is not None:
                 hidden_states = cross_attn(hidden_states, temb)
+            outputs += (hidden_states,)
 
-        return hidden_states
+        # return tuple for skip connections
+        return hidden_states, outputs #pyright: ignore
 
 class DownResnetBlock1D(nn.Module):
     def __init__(
@@ -506,9 +514,8 @@ class DownResnetBlock1D(nn.Module):
         out_channels: Optional[int] = None,
         num_layers: int = 1,
         conv_shortcut: bool = False,
-        temb_channels: int = 32,
+        temb_dim: int = 128,
         non_linearity: Optional[str] = None,
-        time_embedding_norm: str = "default",
         output_scale_factor: float = 1.0,
         add_downsample: bool = True,
     ):
@@ -517,15 +524,14 @@ class DownResnetBlock1D(nn.Module):
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
-        self.time_embedding_norm = time_embedding_norm
         self.add_downsample = add_downsample
         self.output_scale_factor = output_scale_factor
 
         # there will always be at least one resnet
-        resnets = [ResidualTemporalBlock1D(in_channels, out_channels, embed_dim=temb_channels)]
+        resnets = [ResidualTemporalBlock1D(in_channels, out_channels, embed_dim=temb_dim)]
 
         for _ in range(num_layers):
-            resnets.append(ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels))
+            resnets.append(ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_dim))
 
         self.resnets = nn.ModuleList(resnets)
 
@@ -540,7 +546,7 @@ class DownResnetBlock1D(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
         output_states = ()
-
+        import pdb; pdb.set_trace()
         hidden_states = self.resnets[0](hidden_states, temb)
         for resnet in self.resnets[1:]:
             hidden_states = resnet(hidden_states, temb)
@@ -562,7 +568,7 @@ class UNetMidBlock1D(nn.Module):
         self,
         mid_channels: int,
         in_channels: int,
-        temb_channels: int,
+        temb_dim: int,
         context_dim: int,  # Add context dimension parameter
         out_channels: Optional[int] = None,
         num_heads: int = 8,  # Add number of heads parameter
@@ -576,9 +582,9 @@ class UNetMidBlock1D(nn.Module):
         self.upsample = Upsample1D(out_channels, use_conv_transpose=True)
 
         resnets = [
-            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels),
-            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels),
-            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels)
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_dim),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_dim),
+            ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_dim)
         ]
 
         # Self attention layers
@@ -675,36 +681,6 @@ class Upsample1D(nn.Module):
 
         return outputs
 
-class UpBlock1D(nn.Module):
-    def __init__(
-        self, in_channels: int, out_channels: int, mid_channels: Optional[int] = None
-    ):
-        super().__init__()
-        mid_channels = in_channels if mid_channels is None else mid_channels
-
-        resnets = [
-            ResConvBlock(2 * in_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, mid_channels),
-            ResConvBlock(mid_channels, mid_channels, out_channels),
-        ]
-
-        self.resnets = nn.ModuleList(resnets)
-        self.up = Upsample1d(kernel="cubic")
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        res_hidden_state: torch.Tensor,
-        temb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        hidden_states = torch.cat([hidden_states, res_hidden_state], dim=1)
-
-        for resnet in self.resnets:
-            hidden_states = resnet(hidden_states)
-
-        hidden_states = self.up(hidden_states)
-
-        return hidden_states
 
 
 class AttnUpBlock1D(nn.Module):
@@ -713,7 +689,7 @@ class AttnUpBlock1D(nn.Module):
         in_channels: int,
         out_channels: int,
         context_dim: int,
-        temb_channels: int,
+        temb_dim: int,
         num_heads: int = 8,
         mid_channels: Optional[int] = None,
     ):
@@ -722,9 +698,9 @@ class AttnUpBlock1D(nn.Module):
 
         # We concatentate our reisudal connections, so 2x the input channels
         resnets = [
-            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_channels),
-            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_channels),
-            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_channels)
+            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_dim),
+            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_dim),
+            ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_dim)
         ]
         self_attentions = [
             SelfAttention1d(mid_channels, mid_channels // 32),
@@ -771,9 +747,8 @@ class UpResnetBlock1D(nn.Module):
         in_channels: int,
         out_channels: Optional[int] = None,
         num_layers: int = 1,
-        temb_channels: int = 32,
+        temb_dim: int = 32,
         non_linearity: Optional[str] = None,
-        time_embedding_norm: str = "default",
         output_scale_factor: float = 1.0,
         add_upsample: bool = True,
     ):
@@ -781,15 +756,14 @@ class UpResnetBlock1D(nn.Module):
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
-        self.time_embedding_norm = time_embedding_norm
         self.add_upsample = add_upsample
         self.output_scale_factor = output_scale_factor
 
         # there will always be at least one resnet
-        resnets = [ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_channels)]
+        resnets = [ResidualTemporalBlock1D(2 * in_channels, out_channels, embed_dim=temb_dim)]
 
         for _ in range(num_layers):
-            resnets.append(ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_channels))
+            resnets.append(ResidualTemporalBlock1D(out_channels, out_channels, embed_dim=temb_dim))
 
         self.resnets = nn.ModuleList(resnets)
 

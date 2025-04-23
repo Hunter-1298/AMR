@@ -42,10 +42,9 @@ wandb/
 *.log
 logs/
 src/outputs/
+/outputs
 
 # Data
-# data/
-Dataset/
 *.csv
 *.json
 *.pkl
