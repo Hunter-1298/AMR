@@ -39,6 +39,10 @@ ENV/
 # W&B
 wandb/
 
+Dataset/    
+*.tar*
+*.pkl
+
 # Logs
 *.log
 logs/
@@ -50,7 +54,6 @@ src/outputs/
 *.json
 *.pkl
 *.h5
-Dataset/    
 
 # Model checkpoints
 checkpoints/
