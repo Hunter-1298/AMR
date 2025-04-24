@@ -24,23 +24,21 @@ class DiffusionVisualizationCallback(L.Callback):
             batch = pl_module.example_batch
 
             # 1. Visualize forward and reverse diffusion
-            forward_fig, reverse_fig = self.create_diffusion_visualizations(pl_module, batch)
+            denoising_fig = self.create_diffusion_visualizations(pl_module, batch)
 
             # Log to wandb
             trainer.logger.experiment.log({
-                "diffusion/forward": wandb.Image(forward_fig),
-                "diffusion/reverse": wandb.Image(reverse_fig),
+                "diffusion/forward": wandb.Image(denoising_fig),
                 "epoch": trainer.current_epoch
             })
 
-            plt.close(forward_fig)
-            plt.close(reverse_fig)
+            plt.close(denoising_fig)
 
         else:
             print("No example batch found for visualization")
 
     def create_diffusion_visualizations(self, model, batch):
-        """Create forward and reverse diffusion visualizations"""
+        """Create forward and reverse diffusion visualizations with direct comparison"""
         x, context, _ = batch
         x = x[:1].to(model.device)  # Just use first example
 
@@ -48,69 +46,69 @@ class DiffusionVisualizationCallback(L.Callback):
         n_steps = 5
         timesteps = torch.linspace(0, model.n_steps-1, n_steps).long().to(model.device)
 
-        # 1. Forward Diffusion (Adding Noise)
-        forward_fig, forward_axes = plt.subplots(1, n_steps, figsize=(n_steps*3, 3))
+        # Create figure with two rows
+        fig, axes = plt.subplots(2, n_steps, figsize=(n_steps*3, 6))
+
+        # Store noisy latents for each timestep
+        noisy_latents = []
 
         with torch.no_grad():
             z = model.encode(x)
+
+            # 1. Forward Diffusion (Adding Noise) - Top row
             for i, t in enumerate(timesteps):
                 # Apply noise
                 noisy_z, _ = model.q_sample(z, t.unsqueeze(0))
+                noisy_latents.append(noisy_z.clone())  # Store for later denoising
+
                 # Decode to signal space
                 decoded = model.encoder.decoder(noisy_z)
 
                 # Plot
-                forward_axes[i].plot(decoded[0, 0].cpu().numpy(), label='Real')
-                forward_axes[i].plot(decoded[0, 1].cpu().numpy(), label='Imag')
-                forward_axes[i].set_title(f"t={t.item()}")
+                axes[0, i].plot(decoded[0, 0].cpu().numpy(), label='Real' if i==0 else None)
+                axes[0, i].plot(decoded[0, 1].cpu().numpy(), label='Imag' if i==0 else None)
+                axes[0, i].set_title(f"Noisy t={t.item()}")
+                # axes[0, i].set_ylim(-1.5, 1.5)
 
-        forward_axes[0].legend()
-        forward_fig.suptitle("Forward Diffusion (Adding Noise)")
-        forward_fig.tight_layout()
+            # Add legend to first plot
+            axes[0, 0].legend()
 
-        # 2. Reverse Diffusion (Denoising)
-        reverse_fig, reverse_axes = plt.subplots(1, n_steps, figsize=(n_steps*3, 3))
+            # 2. Reverse Diffusion (Denoising) - Bottom row
+            # Now we denoise each noisy latent independently
+            for i, t in enumerate(timesteps):
+                # Get the corresponding noisy latent
+                noisy_z = noisy_latents[i]
 
-        with torch.no_grad():
-            # Start with noisy latent
-            noisy_z, _ = model.q_sample(z, torch.tensor([model.n_steps-1], device=model.device))
-            current_z = noisy_z.clone()
-
-            for i, t in enumerate(reversed(timesteps)):
                 # Predict noise
-                predicted_noise = model(current_z, t.unsqueeze(0))
+                predicted_noise = model(noisy_z, t.unsqueeze(0))
 
-                # Denoising step
-                alpha_t = model.alpha[t]
+                # Stable formula to predict x0 directly
+                #x₀ = (x_t - sqrt(1-α̅ₜ) * ε_θ(x_t, t)) / sqrt(α̅ₜ)
+                # Where:
+                # - `α̅ₜ` is alpha_bar_t (cumulative product of alphas up to timestep t)
+                # - `ε_θ` is the predicted noise from our model
                 alpha_bar_t = model.alpha_bar[t]
-                beta_t = model.beta[t]
 
-                # Estimate clean latent (x_0) from noisy latent (x_t) using the DDPM formula:
-                # In the forward process: x_t = sqrt(α̅_t) * x_0 + sqrt(1-α̅_t) * ε
-                # Solving for x_0: x_0 = (x_t - sqrt(1-α̅_t) * ε) / sqrt(α̅_t)
-                # where ε is the predicted noise from the UNet model
-                # More stable formula with clipping
-                pred_original = (current_z - (1-alpha_t).sqrt() * predicted_noise) / alpha_t.sqrt()
+                # Proper formula using alpha_bar_t
+                pred_original = (noisy_z - torch.sqrt(1-alpha_bar_t) * predicted_noise) / torch.sqrt(alpha_bar_t)
 
-                # Add clipping to prevent extreme values
-                pred_original = torch.clamp(pred_original, -10.0, 10.0)
-
-                # For visualization, we can directly use the predicted clean latent
-                decoded = model.encoder.decoder(pred_original)
+                # Decode to see result
+                denoised = model.encoder.decoder(pred_original)
 
                 # Plot
-                reverse_axes[i].plot(decoded[0, 0].cpu().numpy(), label='Real' if i==0 else None)
-                reverse_axes[i].plot(decoded[0, 1].cpu().numpy(), label='Imag' if i==0 else None)
-                reverse_axes[i].set_title(f"t={t.item()}")
+                axes[1, i].plot(denoised[0, 0].cpu().numpy(), label='Real' if i==0 else None)
+                axes[1, i].plot(denoised[0, 1].cpu().numpy(), label='Imag' if i==0 else None)
+                axes[1, i].set_title(f"Denoised from t={t.item()}")
+                # axes[1, i].set_ylim(-1.5, 1.5)  # Fixed y-axis scale
 
-                # Update for next step (if not the last step)
-                if i < n_steps - 1:
-                    next_t = timesteps[-(i+2)]
-                    noise = torch.randn_like(current_z)
-                    current_z = alpha_t.sqrt() * pred_original
+            # Add legend to first denoised plot
+            axes[1, 0].legend()
 
-        reverse_axes[0].legend()
-        reverse_fig.suptitle("Reverse Diffusion (Denoising)")
-        reverse_fig.tight_layout()
+        # Add row labels
+        fig.text(0.02, 0.75, 'Forward\n(Adding Noise)', ha='center', va='center', rotation=90, fontsize=12)
+        fig.text(0.02, 0.25, 'Reverse\n(Denoising)', ha='center', va='center', rotation=90, fontsize=12)
 
-        return forward_fig, reverse_fig
+        fig.suptitle("Diffusion Process: \n Top: Forward Diffusion Process \n Bottom: Reverse Diffusion Process")
+        fig.tight_layout()
+
+        return fig

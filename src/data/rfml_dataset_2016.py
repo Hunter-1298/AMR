@@ -66,11 +66,15 @@ class RFMLDataset(Dataset):
 
     def _normalize_data(self, data):
         # data shape: [batch_size, 2, 128] or [2, 128]
-        if len(data.shape) == 2:
-            power = torch.sqrt(torch.sum(data**2, dim=1, keepdim=True))
-        else:  # batch mode
-            power = torch.sqrt(torch.sum(data**2, dim=2, keepdim=True))
-        return data / (power + 1e-8)  # Add small epsilon to avoid division by zero
+        # if len(data.shape) == 2:
+        #     power = torch.sqrt(torch.sum(data**2, dim=1, keepdim=True))
+        # else:  # batch mode
+        #     power = torch.sqrt(torch.sum(data**2, dim=2, keepdim=True))
+        # return data / (power + 1e-8)  # Add small epsilon to avoid division by zero
+        dims = (0, 2) if data.dim() == 3 else (1,)
+        mean = data.mean(dim=dims, keepdim=True)
+        std  = data.std(dim=dims, keepdim=True)
+        return (data - mean) / (std + 1e-8)
 
     def _process_signals(self, signals):
         i_data = signals[:,0,:]

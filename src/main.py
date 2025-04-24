@@ -57,7 +57,7 @@ def main(cfg: DictConfig):
             callbacks=[
                 ModelCheckpoint(
                     monitor="val_loss",
-                    filename="vae_{epoch:02d}_{val_loss:.7f}",
+                    filename="vae_phase{epoch:02d}_{val_loss:.7f}",
                     dirpath=checkpoint_dir,
                     save_top_k=3,
                     mode="min",
@@ -83,10 +83,9 @@ def main(cfg: DictConfig):
 
     # Train Diffusion Model
     model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-    # model = torch.compile(model)
+    model = torch.compile(model)
 
     # Set up trainer for MoE
-    tmp = DiffusionVisualizationCallback(every_n_epochs=1)
     trainer = L.Trainer(
         max_epochs=cfg.hyperparams.epochs,
         logger=wandb_logger,
@@ -101,7 +100,7 @@ def main(cfg: DictConfig):
                 mode="min",
             ),
             LearningRateMonitor(logging_interval="step"),
-            tmp
+            DiffusionVisualizationCallback(every_n_epochs=1)
         ],
     )
 
