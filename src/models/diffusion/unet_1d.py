@@ -101,10 +101,10 @@ class UNet1DModel(nn.Module):
                 down_block_type,
                 in_channels=input_channel,
                 out_channels=output_channel,
-                context_dim=conditional_len,
                 num_layers=layers_per_block,
-                temb_dim=time_embed_dim,
+                embed_channels=time_embed_dim, #converts time_embed to channels to broadcast
                 add_downsample=True
+                # context_dim=conditional_len,
             )
             self.down_blocks.append(down_block)
 
@@ -114,8 +114,8 @@ class UNet1DModel(nn.Module):
             in_channels=block_out_channels[-1],
             mid_channels=block_out_channels[-1],
             out_channels=block_out_channels[-1],
-            temb_dim=time_embed_dim,
-            context_dim=conditional_len,
+            embed_channels=time_embed_dim, #converts time_embed to channels to broadcast
+            # context_dim=conditional_len,
         )
         # up
         reversed_block_out_channels = list(reversed(block_out_channels))
@@ -135,8 +135,7 @@ class UNet1DModel(nn.Module):
                 num_layers=layers_per_block,
                 in_channels=prev_output_channel,
                 out_channels=output_channel,
-                temb_dim=time_embed_dim,
-                context_dim=conditional_len,
+                embed_channels=time_embed_dim,
                 add_upsample=not is_final_block,
             )
             self.up_blocks.append(up_block)
@@ -171,10 +170,11 @@ class UNet1DModel(nn.Module):
         timestep_embed = self.time_mlp(timestep_embed.to(sample.dtype))
 
 
-        import pdb; pdb.set_trace()
 
         # 2. down
+        # saving residual connections as tuple incase we want to save intermediate results
         down_block_res_samples = ()
+
         # original sample [64,32,64]
         # after downsample [64,32,32]
         # before first cross attention [64,32,32]
