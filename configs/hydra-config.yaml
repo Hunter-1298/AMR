@@ -11,8 +11,8 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 50
-    learning_rate: .0001
+    epochs: 20
+    learning_rate: .001
     batch_size: 64
     dropout: 0.25
     hidden_dim: 32

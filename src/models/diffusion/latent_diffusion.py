@@ -4,6 +4,7 @@ import lightning as L
 from typing import Optional, Dict, Any, Tuple
 from .unet_1d import UNet1DModel
 from ..latent_encoder_models import ResNet1D, Decoder1D
+from matplotlib import pyplot as plt
 
 
 class LatentDiffusion(L.LightningModule):
@@ -209,6 +210,9 @@ class LatentDiffusion(L.LightningModule):
         # Log loss
         self.log("val_loss", noise_loss, prog_bar=True)
 
+        # save first batch of visualizations
+        if batch_idx == 0:
+            self.example_batch = batch
 
         return noise_loss
 
@@ -219,8 +223,65 @@ class LatentDiffusion(L.LightningModule):
             optimizer,
             max_lr=self.learning_rate,  # Peak LR at warmup end
             total_steps=int(self.trainer.estimated_stepping_batches),  # Total training steps
-            pct_start=0.1,  # 5% of training is used for warm-up
+            pct_start=0.2,  # 5% of training is used for warm-up
             anneal_strategy="cos",  # Cosine decay after warmup
             final_div_factor=100  # Reduce LR by 10x at the end
         )
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
+
+    # Sample class so we can visualize how we are doing with denoising
+    def sample(
+        self,
+        batch_size=1,
+        sequence_length=64,
+        return_intermediates=False,
+    ):
+        """
+        Sample from the latent diffusion model
+
+        Args:
+            batch_size: Number of samples to generate
+            sequence_length: Length of the latent sequence
+            return_intermediates: Whether to return intermediate steps
+
+        Returns:
+            Generated samples in latent space (and optionally intermediates)
+        """
+        device = self.device
+
+        # Start with random noise
+        z = torch.randn((batch_size, 32, sequence_length), device=device)
+
+        # Store intermediates if requested
+        intermediates = [z.clone()] if return_intermediates else None
+
+        # Iteratively denoise
+        for t in range(self.n_steps - 1, -1, -1):
+            # Create timestep tensor
+            timestep = torch.full((batch_size,), t, device=device, dtype=torch.long)
+
+            # Predict noise
+            predicted_noise = self.forward(z, timestep)
+
+            # Get parameters for this timestep
+            alpha_t = self.alpha[t]  # pyright: ignore
+            alpha_bar_t = self.alpha_bar[t]  # pyright: ignore
+            beta_t = self.beta[t]  # pyright: ignore
+
+            # No noise at the last step
+            noise_t = torch.randn_like(z) if t > 0 else torch.zeros_like(z)
+
+            # Compute prediction
+            z = 1/torch.sqrt(alpha_t) * (z - (1-alpha_t)/torch.sqrt(1-alpha_bar_t) * predicted_noise)
+
+            # Add noise based on variance schedule
+            if t > 0:
+                z = z + torch.sqrt(beta_t) * noise_t
+
+            # Store intermediate if requested (store only a subset to save memory)
+            if return_intermediates and t % (self.n_steps // 10) == 0:
+                intermediates.append(z.clone()) #pyright: ignore
+
+        if return_intermediates:
+            return z, intermediates
+        return z

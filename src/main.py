@@ -7,6 +7,7 @@ import lightning.pytorch as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
 from data.rfml_dataset_2016 import get_dataloaders
+from callbacks import DiffusionVisualizationCallback
 import os
 
 
@@ -82,9 +83,10 @@ def main(cfg: DictConfig):
 
     # Train Diffusion Model
     model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     # Set up trainer for MoE
+    tmp = DiffusionVisualizationCallback(every_n_epochs=1)
     trainer = L.Trainer(
         max_epochs=cfg.hyperparams.epochs,
         logger=wandb_logger,
@@ -99,6 +101,7 @@ def main(cfg: DictConfig):
                 mode="min",
             ),
             LearningRateMonitor(logging_interval="step"),
+            tmp
         ],
     )
 
