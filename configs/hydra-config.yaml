@@ -2,7 +2,9 @@
 project_name: Denoiser
 run_name: Denoise:${now:%Y-%m-%d_%H-%M-%S}
 train_encoder: False
-checkpoint_name: vae_phaseepoch=26_val_loss=0.0018801.ckpt
+train_diffusion: False
+encoder_checkpoint_name: vae_phaseepoch=26_val_loss=0.0018801.ckpt
+diffusion_checkpoint_name: vae_epoch=33_val_loss=0.0374.ckpt
 mode: online
 debug: False
 log_model: True

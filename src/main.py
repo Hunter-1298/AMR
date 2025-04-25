@@ -74,38 +74,67 @@ def main(cfg: DictConfig):
         # Load and freeze the encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
         checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/checkpoints/encoder/"
-        checkpoint_name = cfg.checkpoint_name
+        checkpoint_name = cfg.encoder_checkpoint_name
         checkpoint = torch.load(checkpoint_dir + checkpoint_name)
         encoder.load_state_dict(checkpoint["state_dict"])
         encoder.eval()
         for param in encoder.parameters():
             param.requires_grad = False
 
-    # Train Diffusion Model
-    model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-    model = torch.compile(model)
+    if cfg.train_diffusion:
+        # Train Diffusion Model
+        model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
+        model = torch.compile(model)
 
-    # Set up trainer for MoE
-    trainer = L.Trainer(
-        max_epochs=cfg.hyperparams.epochs,
-        logger=wandb_logger,
-        default_root_dir=".",
-        log_every_n_steps=10,
-        callbacks=[
-            ModelCheckpoint(
-                monitor="val_loss",
-                filename="vae_{epoch:02d}_{val_loss:.4f}",
-                dirpath=checkpoint_dir,
-                save_top_k=3,
-                mode="min",
-            ),
-            LearningRateMonitor(logging_interval="step"),
-            DiffusionVisualizationCallback(every_n_epochs=1)
-        ],
-    )
+        # Create checkpoint dir
+        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion")
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-    trainer.fit(model, train_loader, val_loader) #pyright: ignore
-    print("Diffusion Model Finished Training")
+        # Set up trainer for MoE
+        trainer = L.Trainer(
+            max_epochs=cfg.hyperparams.epochs,
+            logger=wandb_logger,
+            default_root_dir=".",
+            log_every_n_steps=10,
+            callbacks=[
+                ModelCheckpoint(
+                    monitor="val_loss",
+                    filename="diffusion_{epoch:02d}_{val_loss:.4f}",
+                    dirpath=checkpoint_dir,
+                    save_top_k=3,
+                    mode="min",
+                ),
+                LearningRateMonitor(logging_interval="step"),
+                DiffusionVisualizationCallback(every_n_epochs=3)
+            ],
+        )
+
+        trainer.fit(model, train_loader, val_loader) #pyright: ignore
+        print("Diffusion Model Finished Training")
+
+    else:
+        # Load and freeze the diffusion model
+        diffusion = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
+        checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/checkpoints/diffusion/"
+        checkpoint_name = cfg.diffusion_checkpoint_name
+        checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
+        diffusion.load_state_dict(checkpoint["state_dict"])
+        diffusion.eval()
+        for param in diffusion.parameters():
+            param.requires_grad = False
+
+
+        # Set up trainer for MoE
+        trainer = L.Trainer(
+            max_epochs=cfg.hyperparams.epochs,
+            logger=wandb_logger,
+            callbacks=[
+                DiffusionVisualizationCallback(every_n_epochs=1)
+            ],
+        )
+
+        trainer.validate(model=diffusion, dataloaders=val_loader) #pyright: ignore
+        print("Diffusion Model Finished Training")
 
 
 if __name__ == "__main__":
