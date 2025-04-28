@@ -15,7 +15,7 @@ class LatentDiffusion(L.LightningModule):
         n_steps: int = 1000,
         linear_start: float = 0.0001,  # starting noise value for beta schedule
         linear_end: float = 0.02,  # ending value for the beta schedule
-        latent_scaling_factor: float = 0.18215,
+        latent_scaling: float = 0.18215,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-2,
     ):
@@ -25,6 +25,7 @@ class LatentDiffusion(L.LightningModule):
 
         self.learning_rate = learning_rate
         self.n_steps = n_steps
+        self.latent_scaling = latent_scaling
 
         # Initialize UNet for latent space diffusion and the encoder for sampling
         self.unet = unet
@@ -74,10 +75,29 @@ class LatentDiffusion(L.LightningModule):
         self.register_buffer('sqrt_alpha_bar', sqrt_alpha_bar)
         self.register_buffer('sqrt_one_minus_alpha_bar', sqrt_one_minus_alpha_bar)
 
+    # def encode(self, x: torch.Tensor) -> torch.Tensor:
+    #     """Encode input to latent space and scale"""
+    #     z = self.encoder.encode(x) * self.latent_scaling
+    #     return z
+
+    # def decode(self, z: torch.Tensor) -> torch.Tensor:
+    #     """Encode input to latent space and scale"""
+    #     z = self.encoder.decoder(z / self.latent_scaling)
+    #     return z
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode input to latent space and scale"""
         z = self.encoder.encode(x)
+        std_before = z.std().item()
+        z = z * self.latent_scaling
+        std_after = z.std().item()
+        print(f"Encoding scalign factor:{self.latent_scaling}: std before scaling: {std_before:.4f}, after: {std_after:.4f}")
         return z
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        std_before = z.std().item()
+        z = z / self.latent_scaling
+        std_after = z.std().item()
+        print(f"Decoding: std before unscaling: {std_before:.4f}, after: {std_after:.4f}")
+        return self.encoder.decoder(z)
 
     def q_sample(
         self,

@@ -8,6 +8,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
 from data.rfml_dataset_2016 import get_dataloaders
 from callbacks import DiffusionVisualizationCallback
+from utils.latent_scaling import calculate_latent_scaling_factor
 import os
 
 
@@ -81,6 +82,11 @@ def main(cfg: DictConfig):
         for param in encoder.parameters():
             param.requires_grad = False
 
+    # Calculate scaling factor
+    if not cfg.Diffusion.latent_scaling:
+        cfg.Diffusion.latent_scaling = calculate_latent_scaling_factor(encoder, val_loader)
+        print(f"Calculated latent scaling factor: {cfg.Diffusion.latent_scaling:.5f}")
+
     if cfg.train_diffusion:
         # Train Diffusion Model
         model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
@@ -105,7 +111,7 @@ def main(cfg: DictConfig):
                     mode="min",
                 ),
                 LearningRateMonitor(logging_interval="step"),
-                DiffusionVisualizationCallback(every_n_epochs=3)
+                DiffusionVisualizationCallback(every_n_epochs=5)
             ],
         )
 
@@ -129,7 +135,7 @@ def main(cfg: DictConfig):
             max_epochs=cfg.hyperparams.epochs,
             logger=wandb_logger,
             callbacks=[
-                DiffusionVisualizationCallback(every_n_epochs=1)
+                DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True)
             ],
         )
 
