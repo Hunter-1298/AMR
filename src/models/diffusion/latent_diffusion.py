@@ -75,29 +75,16 @@ class LatentDiffusion(L.LightningModule):
         self.register_buffer('sqrt_alpha_bar', sqrt_alpha_bar)
         self.register_buffer('sqrt_one_minus_alpha_bar', sqrt_one_minus_alpha_bar)
 
-    # def encode(self, x: torch.Tensor) -> torch.Tensor:
-    #     """Encode input to latent space and scale"""
-    #     z = self.encoder.encode(x) * self.latent_scaling
-    #     return z
-
-    # def decode(self, z: torch.Tensor) -> torch.Tensor:
-    #     """Encode input to latent space and scale"""
-    #     z = self.encoder.decoder(z / self.latent_scaling)
-    #     return z
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.encoder.encode(x)
-        std_before = z.std().item()
-        z = z * self.latent_scaling
-        std_after = z.std().item()
-        print(f"Encoding scalign factor:{self.latent_scaling}: std before scaling: {std_before:.4f}, after: {std_after:.4f}")
+        """Encode input to latent space and scale"""
+        z = self.encoder.encode(x) * self.latent_scaling
         return z
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        std_before = z.std().item()
-        z = z / self.latent_scaling
-        std_after = z.std().item()
-        print(f"Decoding: std before unscaling: {std_before:.4f}, after: {std_after:.4f}")
-        return self.encoder.decoder(z)
+        """Decode from latent space after removing scaling"""
+        z_unscaled = z / self.latent_scaling  # First remove scaling
+        x_recon = self.encoder.decoder(z_unscaled)  # Then decode
+        return x_recon
 
     def q_sample(
         self,
@@ -245,6 +232,6 @@ class LatentDiffusion(L.LightningModule):
             total_steps=int(self.trainer.estimated_stepping_batches),  # Total training steps
             pct_start=0.1,  # 5% of training is used for warm-up
             anneal_strategy="cos",  # Cosine decay after warmup
-            final_div_factor=10  # Reduce LR by 10x at the end
+            final_div_factor=100  # Reduce LR by 10x at the end
         )
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
