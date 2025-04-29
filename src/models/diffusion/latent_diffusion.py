@@ -69,11 +69,11 @@ class LatentDiffusion(L.LightningModule):
         # - Complement to sqrt_alpha_bar
 
         # Now register them as buffers
-        self.register_buffer('beta', beta)
-        self.register_buffer('alpha', alpha)
-        self.register_buffer('alpha_bar', alpha_bar)
-        self.register_buffer('sqrt_alpha_bar', sqrt_alpha_bar)
-        self.register_buffer('sqrt_one_minus_alpha_bar', sqrt_one_minus_alpha_bar)
+        self.register_buffer("beta", beta)
+        self.register_buffer("alpha", alpha)
+        self.register_buffer("alpha_bar", alpha_bar)
+        self.register_buffer("sqrt_alpha_bar", sqrt_alpha_bar)
+        self.register_buffer("sqrt_one_minus_alpha_bar", sqrt_one_minus_alpha_bar)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode input to latent space and scale"""
@@ -92,7 +92,6 @@ class LatentDiffusion(L.LightningModule):
         t: torch.Tensor,
         noise: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         """
         Forward diffusion process: q(x_t | x_0)
         Add noise to x_start according to noise schedule at timestep t
@@ -112,8 +111,8 @@ class LatentDiffusion(L.LightningModule):
         # Get appropriate alphas for timestep t
         # Forward diffusion formula:
         # x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
-        sqrt_alpha_bar_t = self.sqrt_alpha_bar[t].view(-1, 1, 1) #pyright: ignore
-        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1) #pyright: ignore
+        sqrt_alpha_bar_t = self.sqrt_alpha_bar[t].view(-1, 1, 1)  # pyright: ignore
+        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)  # pyright: ignore
 
         # Add noise according to schedule
         x_t = sqrt_alpha_bar_t * x_start + sqrt_one_minus_alpha_bar_t * noise
@@ -223,15 +222,22 @@ class LatentDiffusion(L.LightningModule):
 
         return noise_loss
 
-    def configure_optimizers(self): #pyright: ignore
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+    def configure_optimizers(self):  # pyright: ignore
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.learning_rate, weight_decay=1e-4
+        )
         # OneCycleLR automatically determines warm-up and decay schedules
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=self.learning_rate,  # Peak LR at warmup end
-            total_steps=int(self.trainer.estimated_stepping_batches),  # Total training steps
-            pct_start=0.1,  # 5% of training is used for warm-up
+            total_steps=int(
+                self.trainer.estimated_stepping_batches
+            ),  # Total training steps
+            pct_start=0.05,  # 5% of training is used for warm-up
             anneal_strategy="cos",  # Cosine decay after warmup
-            final_div_factor=100  # Reduce LR by 10x at the end
+            final_div_factor=100,  # Reduce LR by 10x at the end
         )
-        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
