@@ -15,6 +15,9 @@ import os
 @hydra.main(config_path="../configs", config_name="hydra-config", version_base="1.1")
 def main(cfg: DictConfig):
     # Initialize wandb first
+    if not torch.cuda.is_available():
+        raise RuntimeError("Cuda is not available")
+
     wandb.init(
         project=cfg.project_name,
         name=cfg.run_name,
@@ -44,6 +47,7 @@ def main(cfg: DictConfig):
 
         # Create and train VAE model
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
+        encoder = torch.compile(encoder)
 
         # Create checkpoint dir
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "encoder")
@@ -78,7 +82,7 @@ def main(cfg: DictConfig):
     else:
         # Load and freeze the encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
-        checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/checkpoints/encoder/"
+        checkpoint_dir = "/workspace/hhayden/AMR/best_checkpoints/"
         checkpoint_name = cfg.encoder_checkpoint_name
         checkpoint = torch.load(checkpoint_dir + checkpoint_name)
         encoder.load_state_dict(checkpoint["state_dict"])
@@ -94,7 +98,7 @@ def main(cfg: DictConfig):
     if cfg.train_diffusion:
         # Train Diffusion Model
         model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-        model = torch.compile(model, mode="reduce")
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
         # Create checkpoint dir
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion")
@@ -108,7 +112,7 @@ def main(cfg: DictConfig):
             log_every_n_steps=10,
             accelerator="gpu",
             devices=2,
-            strategy="auto",
+            strategy="ddp_find_unused_parameters_true",
             precision="16-mixed",
             callbacks=[
                 ModelCheckpoint(
@@ -129,7 +133,7 @@ def main(cfg: DictConfig):
     else:
         # Load and freeze the diffusion model
         diffusion = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-        checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/checkpoints/diffusion/"
+        checkpoint_dir = "/workspace/hhayden/AMR/checkpoints/diffusion/"
         checkpoint_name = cfg.diffusion_checkpoint_name
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         diffusion.load_state_dict(checkpoint["state_dict"])
