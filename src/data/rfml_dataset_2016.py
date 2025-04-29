@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 
 class RFMLDataset(Dataset):
-    def __init__(self, dataPath = '/workspace/hhayden/AMR/Dataset/RML2016.10a_dict.pkl', iq=False):
+    def __init__(self, dataPath = '/home/hshayde/Projects/MIT/AMR/Dataset/RML2016.10a_dict.pkl', iq=False):
         # Data in the shape of dict[('Mod_type','snr')] = [1000,2,128]
         data = self._load_data(dataPath)
 

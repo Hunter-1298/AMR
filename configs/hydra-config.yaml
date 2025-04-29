@@ -6,8 +6,8 @@ train_diffusion: True
 encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
 diffusion_checkpoint_name: vae_epoch=33_val_loss=0.0374.ckpt
 mode: online
-debug: False
-log_model: True
+debug: True
+log_model: False
 seed: 42
 
 # In your hydra config
@@ -50,7 +50,7 @@ Diffusion:
             ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
         up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
         mid_block_type: "UNetMidBlock1D"
-        block_out_channels: [32, 32, 32]
+        block_out_channels: [32, 64, 128]
         layers_per_block: 1
         conditional: 19 # different snr values
         conditional_len: 64

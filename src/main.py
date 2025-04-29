@@ -60,7 +60,7 @@ def main(cfg: DictConfig):
             default_root_dir=".",
             log_every_n_steps=10,
             accelerator="gpu",
-            devices=2,
+            devices=1,
             strategy="auto",
             precision="16-mixed",
             callbacks=[
@@ -82,7 +82,7 @@ def main(cfg: DictConfig):
     else:
         # Load and freeze the encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
-        checkpoint_dir = "/workspace/hhayden/AMR/best_checkpoints/"
+        checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
         checkpoint_name = cfg.encoder_checkpoint_name
         checkpoint = torch.load(checkpoint_dir + checkpoint_name)
         encoder.load_state_dict(checkpoint["state_dict"])
@@ -92,13 +92,15 @@ def main(cfg: DictConfig):
 
     # Calculate scaling factor
     if not cfg.Diffusion.latent_scaling:
-        cfg.Diffusion.latent_scaling = calculate_latent_scaling_factor(encoder, val_loader)
+        cfg.Diffusion.latent_scaling = calculate_latent_scaling_factor(
+            encoder, val_loader
+        )
         print(f"Calculated latent scaling factor: {cfg.Diffusion.latent_scaling:.5f}")
 
     if cfg.train_diffusion:
         # Train Diffusion Model
         model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+        # model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
         # Create checkpoint dir
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion")
@@ -111,8 +113,8 @@ def main(cfg: DictConfig):
             default_root_dir=".",
             log_every_n_steps=10,
             accelerator="gpu",
-            devices=2,
-            strategy="ddp_find_unused_parameters_true",
+            devices=1,
+            strategy="auto",
             precision="16-mixed",
             callbacks=[
                 ModelCheckpoint(
@@ -123,24 +125,23 @@ def main(cfg: DictConfig):
                     mode="min",
                 ),
                 LearningRateMonitor(logging_interval="step"),
-                DiffusionVisualizationCallback(every_n_epochs=5)
+                DiffusionVisualizationCallback(every_n_epochs=5),
             ],
         )
 
-        trainer.fit(model, train_loader, val_loader) #pyright: ignore
+        trainer.fit(model, train_loader, val_loader)  # pyright: ignore
         print("Diffusion Model Finished Training")
 
     else:
         # Load and freeze the diffusion model
         diffusion = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-        checkpoint_dir = "/workspace/hhayden/AMR/checkpoints/diffusion/"
+        checkpoint_dir = "/home/hshayde/Projects/AMR/best_checkpoints/"
         checkpoint_name = cfg.diffusion_checkpoint_name
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         diffusion.load_state_dict(checkpoint["state_dict"])
         diffusion.eval()
         for param in diffusion.parameters():
             param.requires_grad = False
-
 
         # Set up trainer for MoE
         trainer = L.Trainer(
@@ -151,7 +152,7 @@ def main(cfg: DictConfig):
             ],
         )
 
-        trainer.validate(model=diffusion, dataloaders=val_loader) #pyright: ignore
+        trainer.validate(model=diffusion, dataloaders=val_loader)  # pyright: ignore
         print("Diffusion Model Finished Training")
 
 

@@ -468,7 +468,7 @@ class AttnDownBlock1D(nn.Module):
         if add_downsample:
             self.downsample = Downsample1D(out_channels, use_conv=True, padding=1)
         resnets = [
-            ResidualTemporalBlock1D(out_channels, out_channels, embed_channels=embed_channels),
+            ResidualTemporalBlock1D(in_channels, out_channels, embed_channels=embed_channels),
             ResidualTemporalBlock1D(out_channels, out_channels, embed_channels=embed_channels),
             ResidualTemporalBlock1D(out_channels, out_channels, embed_channels=embed_channels)
         ]
@@ -590,6 +590,7 @@ class UNetMidBlock1D(nn.Module):
         # there is always at least one resnet
         self.downsample = Downsample1D(out_channels, use_conv=True, padding=1)
         self.upsample = Upsample1D(out_channels, use_conv_transpose=True)
+
 
         resnets = [
             ResidualTemporalBlock1D(out_channels, out_channels, embed_channels=embed_channels),
