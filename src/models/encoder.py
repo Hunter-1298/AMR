@@ -60,9 +60,9 @@ class LatentEncoder(L.LightningModule):
             optimizer,
             max_lr=self.learning_rate,  # Peak LR at warmup end
             total_steps=self.trainer.estimated_stepping_batches,  # pyright: ignore
-            pct_start=0.1,  # 10% of training is used for warm-up
+            pct_start=0.05,  # 10% of training is used for warm-up
             anneal_strategy="cos",  # Cosine decay after warmup
-            final_div_factor=10,  # Reduce LR by 10x at the end
+            final_div_factor=100,  # Reduce LR by 10x at the end
         )
         return {
             "optimizer": optimizer,

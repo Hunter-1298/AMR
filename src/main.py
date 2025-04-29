@@ -55,6 +55,10 @@ def main(cfg: DictConfig):
             logger=wandb_logger,
             default_root_dir=".",
             log_every_n_steps=10,
+            accelerator="gpu",
+            devices=2,
+            strategy="auto",
+            precision="16-mixed",
             callbacks=[
                 ModelCheckpoint(
                     monitor="val_loss",
@@ -90,7 +94,7 @@ def main(cfg: DictConfig):
     if cfg.train_diffusion:
         # Train Diffusion Model
         model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-        model = torch.compile(model)
+        model = torch.compile(model, mode="reduce")
 
         # Create checkpoint dir
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion")
@@ -102,6 +106,10 @@ def main(cfg: DictConfig):
             logger=wandb_logger,
             default_root_dir=".",
             log_every_n_steps=10,
+            accelerator="gpu",
+            devices=2,
+            strategy="auto",
+            precision="16-mixed",
             callbacks=[
                 ModelCheckpoint(
                     monitor="val_loss",

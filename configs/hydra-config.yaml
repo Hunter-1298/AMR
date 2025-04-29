@@ -1,7 +1,7 @@
 # Global configurations
 project_name: Denoiser_LatentScaling
-run_name: Denoise:${now:%Y-%m-%d_%H-%M-%S}
-train_encoder: False
+run_name: Denoiser_Encoder:${now:%Y-%m-%d_%H-%M-%S}
+train_encoder: True
 train_diffusion: True
 encoder_checkpoint_name: vae_phaseepoch=26_val_loss=0.0018801.ckpt
 diffusion_checkpoint_name: vae_epoch=33_val_loss=0.0374.ckpt
@@ -13,7 +13,7 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 50
+    epochs: 100
     learning_rate: .0001
     batch_size: 64
     dropout: 0.25
@@ -27,7 +27,7 @@ data_dir: data/
 
 Encoder:
     _target_: models.encoder.LatentEncoder
-    learning_rate: ${hyperparams.learning_rate}
+    learning_rate: .0005
     encoder:
         _target_: models.latent_encoder_models.resnet_encoder.ResNet1D
     decoder:
