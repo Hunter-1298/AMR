@@ -140,20 +140,50 @@ def main(cfg: DictConfig):
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         diffusion.load_state_dict(checkpoint["state_dict"])
         diffusion.eval()
-        for param in diffusion.parameters():
-            param.requires_grad = False
+        # make the classifier decide if we want to freeze these weights or not
+        # for param in diffusion.parameters():
+        #     param.requires_grad = False
 
-        # Set up trainer for MoE
-        trainer = L.Trainer(
-            max_epochs=cfg.hyperparams.epochs,
+    if cfg.train_classifier:
+        print("Training Classifier on Latent Representations...")
+
+        # Create the classifier
+        classifier = hydra.utils.instantiate(
+            cfg.Classifier,
+            diffusion=diffusion, #pyright: ignore -- need to change model to diffusion in training
+            encoder=encoder,
+            label_names=label_names
+        )
+
+        # Create checkpoint dir for classifier
+        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "classifier")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Set up trainer for classifier
+        classifier_trainer = L.Trainer(
+            max_epochs=cfg.hyperparams.classifier_epochs,
             logger=wandb_logger,
+            default_root_dir=".",
+            log_every_n_steps=10,
+            accelerator="gpu",
+            devices=1,
+            strategy="auto",
+            precision="16-mixed",
             callbacks=[
-                DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True)
+                ModelCheckpoint(
+                    monitor="val_acc",
+                    filename="classifier_{epoch:02d}_{val_acc:.4f}",
+                    dirpath=checkpoint_dir,
+                    save_top_k=3,
+                    mode="max",
+                ),
+                LearningRateMonitor(logging_interval="step"),
             ],
         )
 
-        trainer.validate(model=diffusion, dataloaders=val_loader)  # pyright: ignore
-        print("Diffusion Model Finished Training")
+        # Train the classifier
+        classifier_trainer.fit(classifier, train_loader, val_loader)
+        print("Classifier Training Complete")
 
 
 if __name__ == "__main__":
