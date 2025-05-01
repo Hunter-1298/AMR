@@ -1,9 +1,9 @@
 # Global configurations
-project_name: Classifier
-run_name: Classifier_Unfrozen:${now:%Y-%m-%d_%H-%M-%S}
+project_name: Diffusion_Conditoned
+run_name: Diffusion_Conditioned_Class:${now:%Y-%m-%d_%H-%M-%S}
 train_encoder: False
-train_diffusion: False
-train_classifier: True
+train_diffusion: True
+train_classifier: False
 encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
 diffusion_checkpoint_name: diffusion_epoch=191_val_loss=0.0754.ckpt
 mode: online
@@ -54,8 +54,8 @@ Diffusion:
         mid_block_type: "UNetMidBlock1D"
         block_out_channels: [32, 64, 128]
         layers_per_block: 3
-        conditional: 19 # different snr values
-        conditional_len: 64
+        condition: True
+        conditional: 11 # Class conditioning
 
 Classifier:
     _target_: models.classifier.classifier.LatentClassifier

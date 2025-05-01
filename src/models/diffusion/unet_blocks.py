@@ -42,7 +42,7 @@ def get_down_block(
     num_layers: int,
     embed_channels: int,
     add_downsample: bool,
-    context_dim: Optional[int] = None,
+    condition: bool,
 ):
     if down_block_type == "DownResnetBlock1D":
         return DownResnetBlock1D(
@@ -56,8 +56,8 @@ def get_down_block(
         return AttnDownBlock1D(
             out_channels=out_channels,
             in_channels=in_channels,
-            context_dim=context_dim,
             embed_channels=embed_channels,
+            condition=condition,
             add_downsample=add_downsample,
         )
     raise ValueError(f"{down_block_type} does not exist.")
@@ -69,15 +69,15 @@ def get_mid_block(
     mid_channels: int,
     out_channels: int,
     embed_channels: int,
-    context_dim: Optional[int] = None,
+    condition: bool,
 ):
     if mid_block_type == "UNetMidBlock1D":
         return UNetMidBlock1D(
             in_channels=in_channels,
             mid_channels=mid_channels,
             out_channels=out_channels,
+            condition=condition,
             embed_channels=embed_channels,
-            context_dim=context_dim
         )
     raise ValueError(f"{mid_block_type} does not exist.")
 
@@ -89,7 +89,7 @@ def get_up_block(
     num_layers: int,
     embed_channels: int,
     add_upsample: bool,
-    context_dim: Optional[int] = None,
+    condition: bool
 ):
     if up_block_type == "UpResnetBlock1D":
         return UpResnetBlock1D(
@@ -102,8 +102,8 @@ def get_up_block(
     elif up_block_type == "AttnUpBlock1D":
         return AttnUpBlock1D(in_channels=in_channels,
             out_channels=out_channels,
-            context_dim=context_dim,
             embed_channels=embed_channels,
+            condition=condition,
         )
     raise ValueError(f"{up_block_type} does not exist.")
 
@@ -321,17 +321,20 @@ class CrossAttention1d(nn.Module):
     def __init__(
         self,
         in_channels: int,
-        context_dim: int,
+        context_channels: int,
         n_head: int = 1,
         dropout_rate: float = 0.0,
+        activation: str = "mish",
     ):
         super().__init__()
         assert in_channels % n_head == 0, "in_channels must be divisible by n_head"
 
         self.in_channels = in_channels
-        self.context_dim = context_dim
+        self.context_channels = context_channels
         self.num_heads = n_head
         self.head_dim = in_channels // n_head
+
+        self.cond_emb_act = get_activation(activation)
 
         # normalize over feature channels
         self.norm = nn.GroupNorm(num_groups=1, num_channels=in_channels)
@@ -339,8 +342,8 @@ class CrossAttention1d(nn.Module):
         # query from hidden_states: use Conv1d on feature channels
         self.query = nn.Conv1d(in_channels, in_channels, kernel_size=1)
         # key/value from context: project context_dim to in_channels
-        self.key = nn.Linear(context_dim, in_channels)
-        self.value = nn.Linear(context_dim, in_channels)
+        self.key = nn.Linear(context_channels, in_channels)
+        self.value = nn.Linear(context_channels, in_channels)
 
         # output projection back to in_channels
         self.out_proj = nn.Conv1d(in_channels, in_channels, kernel_size=1)
@@ -353,6 +356,9 @@ class CrossAttention1d(nn.Module):
         context: [B, context_dim]
         Returns: [B, C, T]
         """
+        # Apply activation since last act was linear projection
+        context = self.cond_emb_act(context.to(hidden_states.dtype))
+
         residual = hidden_states
         B, C, T = hidden_states.size()
 
@@ -457,7 +463,7 @@ class AttnDownBlock1D(nn.Module):
         in_channels: int,
         embed_channels: int,
         mid_channels: Optional[int] = None,
-        context_dim: Optional[int] = None,
+        condition: bool = True,
         add_downsample: bool = True,
         num_heads: int = 8,
     ):
@@ -481,18 +487,18 @@ class AttnDownBlock1D(nn.Module):
         ]
 
         # Cross-attention layers for 1D sequences
-        if context_dim:
+        if condition:
             cross_attentions = [
-                CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
-                CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
-                CrossAttention1d(out_channels, context_dim, n_head=num_heads),
+                CrossAttention1d(mid_channels, embed_channels, n_head=num_heads),
+                CrossAttention1d(mid_channels, embed_channels, n_head=num_heads),
+                CrossAttention1d(out_channels, embed_channels, n_head=num_heads),
             ]
             self.cross_attentions = nn.ModuleList(cross_attentions)
 
         self.self_attentions = nn.ModuleList(self_attentions)
         self.resnets = nn.ModuleList(resnets)
 
-    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
+    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None,context: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
 
         outputs = ()
         # if we have a context we can apply cross attention
@@ -502,7 +508,7 @@ class AttnDownBlock1D(nn.Module):
             ):
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = self_attn(hidden_states)
-                hidden_states = cross_attn(hidden_states, temb)
+                hidden_states = cross_attn(hidden_states, context)
             outputs += (hidden_states,)
         else:
             for resnet, self_attn in zip(
@@ -555,7 +561,7 @@ class DownResnetBlock1D(nn.Module):
         if add_downsample:
             self.downsample = Downsample1D(out_channels, use_conv=True, padding=1)
 
-    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
+    def forward(self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None, context: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
         output_states = ()
         hidden_states = self.resnets[0](hidden_states, temb)
         for resnet in self.resnets[1:]:
@@ -579,7 +585,7 @@ class UNetMidBlock1D(nn.Module):
         mid_channels: int,
         in_channels: int,
         embed_channels: int,
-        context_dim: Optional[int] = None,
+        condition: bool = True,
         out_channels: Optional[int] = None,
         num_heads: int = 8,  # Add number of heads parameter
     ):
@@ -606,11 +612,11 @@ class UNetMidBlock1D(nn.Module):
         ]
 
         # Add cross attention layers
-        if context_dim:
+        if condition:
             cross_attentions = [
-                CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
-                CrossAttention1d(mid_channels, context_dim, n_head=num_heads),
-                CrossAttention1d(out_channels, context_dim, n_head=num_heads),
+                CrossAttention1d(mid_channels, embed_channels, n_head=num_heads),
+                CrossAttention1d(mid_channels, embed_channels, n_head=num_heads),
+                CrossAttention1d(out_channels, embed_channels, n_head=num_heads),
             ]
             self.cross_attentions = nn.ModuleList(cross_attentions)
 
@@ -618,7 +624,7 @@ class UNetMidBlock1D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
     def forward(
-        self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None
+        self, hidden_states: torch.Tensor, temb: Optional[torch.Tensor] = None,context: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
     # [batch_size, channels, 8dim]
         # hidden_states = self.downsample(hidden_states)
@@ -631,7 +637,7 @@ class UNetMidBlock1D(nn.Module):
             ):
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = self_attn(hidden_states)
-                hidden_states = cross_attn(hidden_states, temb)
+                hidden_states = cross_attn(hidden_states, context)
         else:
             for resnet, self_attn in zip(
                 self.resnets, self.self_attentions
@@ -705,8 +711,8 @@ class AttnUpBlock1D(nn.Module):
         in_channels: int,
         out_channels: int,
         embed_channels: int,
-        context_dim: Optional[int] = None,
         num_heads: int = 8,
+        condition: bool = True,
         mid_channels: Optional[int] = None,
     ):
         super().__init__()
@@ -725,11 +731,11 @@ class AttnUpBlock1D(nn.Module):
         ]
 
         # Cross-attention layers for 1D sequences
-        if context_dim:
+        if condition:
             cross_attentions = [
-                CrossAttention1d(out_channels, context_dim, n_head=num_heads),
-                CrossAttention1d(out_channels, context_dim, n_head=num_heads),
-                CrossAttention1d(out_channels, context_dim, n_head=num_heads),
+                CrossAttention1d(out_channels, embed_channels, n_head=num_heads),
+                CrossAttention1d(out_channels, embed_channels, n_head=num_heads),
+                CrossAttention1d(out_channels, embed_channels, n_head=num_heads),
             ]
             self.cross_attentions = nn.ModuleList(cross_attentions)
 
@@ -741,9 +747,9 @@ class AttnUpBlock1D(nn.Module):
         self,
         hidden_states: torch.Tensor,
         res_hidden_state: torch.Tensor,
-        temb: Optional[torch.Tensor] = None
+        temb: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-
         # concatenate the residual connection
         hidden_states = torch.cat([hidden_states, res_hidden_state[0]], dim=1)
 
@@ -754,7 +760,7 @@ class AttnUpBlock1D(nn.Module):
             ):
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = self_attn(hidden_states)
-                hidden_states = cross_attn(hidden_states, temb)
+                hidden_states = cross_attn(hidden_states, context)
         else:
             for resnet, self_attn in zip(
                 self.resnets, self.self_attentions
@@ -804,6 +810,7 @@ class UpResnetBlock1D(nn.Module):
         hidden_states: torch.Tensor,
         res_hidden_state: Optional[Tuple[torch.Tensor, ...]] = None,
         temb: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if res_hidden_state is not None:
             res_hidden_states = res_hidden_state[0]

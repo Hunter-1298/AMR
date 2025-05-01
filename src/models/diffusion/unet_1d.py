@@ -2,7 +2,7 @@ from typing import Optional, Tuple, Union, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .embeddings import GaussianFourierProjection, TimestepEmbedding, Timesteps
+from .embeddings import GaussianFourierProjection, LabelEmbedding, TimestepEmbedding, Timesteps
 from .unet_blocks import get_down_block, get_mid_block, get_up_block
 
 
@@ -55,8 +55,8 @@ class UNet1DModel(nn.Module):
         block_out_channels: List[int] = [32, 32, 32],  # pyright: ignore
         num_attention_heads: int = 8,
         layers_per_block: int = 1,
-        conditional: int = 19,
-        conditional_len: int = 64,
+        condition: bool = True,
+        conditional: int = 11,
     ):
         super().__init__()
 
@@ -77,11 +77,12 @@ class UNet1DModel(nn.Module):
 
         # Set Conditional conditioning if we have it
 
-        # TODO: implement this combined class for embeddings
         # class CombinedTimestepLabelEmbeddings(nn.Module):
-        self.cond_embeddings = (
-            nn.Embedding(conditional, time_embed_dim) if conditional else None
-        )
+        if condition:
+            self.cond_embeddings = (
+                LabelEmbedding(conditional, time_embed_dim, 0.1)
+            )
+            self.cond_mlp = TimestepEmbedding(time_embed_dim, time_embed_dim)
 
         ######################################################################################
 
@@ -103,7 +104,8 @@ class UNet1DModel(nn.Module):
                 out_channels=output_channel,
                 num_layers=layers_per_block,
                 embed_channels=time_embed_dim, #converts time_embed to channels to broadcast
-                add_downsample=True
+                condition=condition,
+                add_downsample=True,
                 # context_dim=conditional_len,
             )
             self.down_blocks.append(down_block)
@@ -114,6 +116,7 @@ class UNet1DModel(nn.Module):
             in_channels=block_out_channels[-1],
             mid_channels=block_out_channels[-1],
             out_channels=block_out_channels[-1],
+            condition=condition,
             embed_channels=time_embed_dim, #converts time_embed to channels to broadcast
             # context_dim=conditional_len,
         )
@@ -136,6 +139,7 @@ class UNet1DModel(nn.Module):
                 in_channels=prev_output_channel,
                 out_channels=output_channel,
                 embed_channels=time_embed_dim,
+                condition=condition,
                 add_upsample=not is_final_block,
             )
             self.up_blocks.append(up_block)
@@ -145,6 +149,7 @@ class UNet1DModel(nn.Module):
         self,
         sample: torch.Tensor,
         timestep: Union[torch.Tensor, float, int],
+        context: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ):
         r"""
@@ -162,14 +167,21 @@ class UNet1DModel(nn.Module):
                 If `return_dict` is True, an [`~models.unets.unet_1d.UNet1DOutput`] is returned, otherwise a `tuple` is
                 returned where the first element is the sample tensor.
         """
+        # verify we have context or not
+        if hasattr(self, 'cond_embeddings') and context is None:
+            raise ValueError("Context must be provided when using conditional model")
+        elif not hasattr(self, 'cond_embeddings') and context is not None:
+            raise ValueError("Context cannot be provided when using unconditional model")
 
         # 1. time - batch_size timesteps x higher_dim
         timesteps = timestep
         timestep_embed = self.time_proj(timesteps)
-        # make the timesteps learnable in a higher dimension
         timestep_embed = self.time_mlp(timestep_embed.to(sample.dtype))
-
-
+        # set conditonal embeddings - only applied in cross attention layers
+        cond_embeddings = None
+        if self.cond_embeddings:
+            cond_embeddings = self.cond_embeddings(context)
+            cond_embeddings = self.cond_mlp(cond_embeddings.to(sample.dtype))
 
         # 2. down
         # saving residual connections as tuple incase we want to save intermediate results
@@ -179,18 +191,18 @@ class UNet1DModel(nn.Module):
         # after downsample [64,32,32]
         # before first cross attention [64,32,32]
         for downsample_block in self.down_blocks:
-            sample, res_sample = downsample_block(hidden_states=sample, temb=timestep_embed)
+            sample, res_sample = downsample_block(hidden_states=sample, temb=timestep_embed, context=cond_embeddings)
             down_block_res_samples+=res_sample
 
         # 3. mid
         if self.mid_block:
-            sample = self.mid_block(sample, timestep_embed)
+            sample = self.mid_block(hidden_states=sample, temb=timestep_embed, context=cond_embeddings)
 
         # 4. up
         for i, upsample_block in enumerate(self.up_blocks):
             res_samples = down_block_res_samples[-1:]
             down_block_res_samples = down_block_res_samples[:-1]
-            sample = upsample_block(sample, res_hidden_state=res_samples, temb=timestep_embed)
+            sample = upsample_block(sample, res_hidden_state=res_samples, temb=timestep_embed, context=cond_embeddings)
 
         # 5. post-process
         if self.out_block:

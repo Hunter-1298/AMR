@@ -100,10 +100,10 @@ def main(cfg: DictConfig):
     if cfg.train_diffusion:
         # Train Diffusion Model
         model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+        # model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
         # Create checkpoint dir
-        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion")
+        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion_condition")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         # Set up trainer for MoE
