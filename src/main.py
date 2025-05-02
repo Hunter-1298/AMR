@@ -1,4 +1,5 @@
 import hydra
+import sys
 import torch
 from hydra.utils import get_original_cwd
 import wandb
@@ -100,7 +101,7 @@ def main(cfg: DictConfig):
     if cfg.train_diffusion:
         # Train Diffusion Model
         model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-        # model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
         # Create checkpoint dir
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion_condition")
@@ -140,9 +141,22 @@ def main(cfg: DictConfig):
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         diffusion.load_state_dict(checkpoint["state_dict"])
         diffusion.eval()
-        # make the classifier decide if we want to freeze these weights or not
-        # for param in diffusion.parameters():
-        #     param.requires_grad = False
+
+        if cfg.vis_diffusion:
+            for param in diffusion.parameters():
+                param.requires_grad = False
+
+            # Set up trainer for MoE
+            trainer = L.Trainer(
+                max_epochs=cfg.hyperparams.epochs,
+                logger=wandb_logger,
+                callbacks=[
+                    DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True)
+                ],
+            )
+
+            trainer.validate(model=diffusion, dataloaders=val_loader)  # pyright: ignore
+            sys.exit("Diffusion Vis finished")
 
     if cfg.train_classifier:
         print("Training Classifier on Latent Representations...")
@@ -154,6 +168,7 @@ def main(cfg: DictConfig):
             encoder=encoder,
             label_names=label_names
         )
+        # classifier = torch.compile(classifier)
 
         # Create checkpoint dir for classifier
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "classifier")

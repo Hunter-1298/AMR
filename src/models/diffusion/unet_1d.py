@@ -168,10 +168,10 @@ class UNet1DModel(nn.Module):
                 returned where the first element is the sample tensor.
         """
         # verify we have context or not
-        if hasattr(self, 'cond_embeddings') and context is None:
-            raise ValueError("Context must be provided when using conditional model")
-        elif not hasattr(self, 'cond_embeddings') and context is not None:
-            raise ValueError("Context cannot be provided when using unconditional model")
+        # if hasattr(self, 'cond_embeddings') and context is None:
+        #     raise ValueError("Context must be provided when using conditional model")
+        # elif not hasattr(self, 'cond_embeddings') and context is not None:
+        #     raise ValueError("Context cannot be provided when using unconditional model")
 
         # 1. time - batch_size timesteps x higher_dim
         timesteps = timestep

@@ -154,7 +154,7 @@ class LatentDiffusion(L.LightningModule):
         # Add noise to input
         x_noisy, noise = self.q_sample(x_start, t)
 
-        # Predict noise
+        # Predict noise - remove context
         predicted_noise = self.forward(x_noisy, t, context)
 
         # Calculate loss

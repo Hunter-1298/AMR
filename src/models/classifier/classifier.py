@@ -53,7 +53,9 @@ class LatentClassifier(pl.LightningModule):
         z = self.diffusion.encode(x)
 
         # Calculate diffusion loss - currently prediciting noise distribution
-        noise_loss, predicted_noise = self.diffusion.p_losses(z, t, context)
+        classifier_free = torch.full_like(context, 11, device=self.device)
+        noise_loss, predicted_noise = self.diffusion.p_losses(z, t, classifier_free)
+        # noise_loss, predicted_noise = self.diffusion.p_losses(z, t, context)
 
         pred = self(predicted_noise)
         loss = self.criterion(pred,context)
