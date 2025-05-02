@@ -1,12 +1,13 @@
 # Global configurations
-project_name: Diffusion_Vis
-run_name: Unconditioned_Vis:${now:%Y-%m-%d_%H-%M-%S}
+project_name: Diffusion_No_Condition
+run_name: Conditioned_Vis:${now:%Y-%m-%d_%H-%M-%S}
 train_encoder: False
-train_diffusion: False
-vis_diffusion: True
-train_classifier: True
+train_diffusion: True
+conditon: False
+vis_diffusion: False
+train_classifier: False
 encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
-# diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
+diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
 # diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0754.ckpt
 mode: online
 debug: False
@@ -56,7 +57,7 @@ Diffusion:
         mid_block_type: "UNetMidBlock1D"
         block_out_channels: [32, 64, 128]
         layers_per_block: 3
-        condition: False
+        condition: ${conditon}
         conditional: 11 # Class conditioning
 
 Classifier:

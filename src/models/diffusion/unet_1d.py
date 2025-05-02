@@ -78,6 +78,7 @@ class UNet1DModel(nn.Module):
         # Set Conditional conditioning if we have it
 
         # class CombinedTimestepLabelEmbeddings(nn.Module):
+        self.cond_embeddings = None
         if condition:
             self.cond_embeddings = (
                 LabelEmbedding(conditional, time_embed_dim, 0.1)

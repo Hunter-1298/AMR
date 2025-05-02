@@ -4,10 +4,12 @@ import lightning as L
 import wandb
 import numpy as np
 import imageio
+import os
+from sklearn.manifold import TSNE
 
 
-class DiffusionVisualizationCallback(L.Callback):
-    """Callback for visualizing the diffusion process"""
+class DiffusionTSNEVisualizationCallback(L.Callback):
+    """Callback for visualizing how class structure evolves in latent space during diffusion"""
 
     def __init__(self, every_n_epochs=1, create_animation=False):
         super().__init__()
@@ -15,7 +17,7 @@ class DiffusionVisualizationCallback(L.Callback):
         self.create_animation = create_animation
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        """Create visualizations at the end of validation epoch"""
+        """Create t-SNE visualizations at the end of validation epoch"""
         if trainer.current_epoch % self.every_n_epochs != 0:
             return
 
@@ -23,238 +25,94 @@ class DiffusionVisualizationCallback(L.Callback):
         if hasattr(pl_module, "example_batch"):
             batch = pl_module.example_batch
 
-            # 1. Visualize forward and reverse diffusion
-            denoising_fig = self.create_diffusion_visualizations(pl_module, batch)
+            # Visualize latent space with t-SNE
+            tsne_fig = self.create_diffusion_visualizations(pl_module, batch)
 
             logs = {
-                "diffusion/forward": wandb.Image(denoising_fig),
+                "latent/tsne_classes": wandb.Image(tsne_fig),
                 "epoch": trainer.current_epoch,
             }
 
-            # 2. Create diffusion animation only in validation mode
+            # Create diffusion animation if requested
             if self.create_animation:
                 gif_path = self.create_diffusion_animation(pl_module, batch)
-                logs["diffusion/animation"] = wandb.Video(gif_path, fps=5, format="gif")
+                logs["latent/tsne_classes_animation"] = wandb.Video(gif_path, fps=5, format="gif")
 
             # Log to wandb
             trainer.logger.experiment.log(logs)
 
-            plt.close(denoising_fig)
+            plt.close(tsne_fig)
         else:
             print("No example batch found for visualization")
 
     def create_diffusion_visualizations(self, model, batch):
-        """Create diffusion visualizations with log magnitude plots and common y-axis"""
+        """Create t-SNE visualizations of class distribution in latent space during diffusion"""
         x, context, _ = batch
-        x = x[:1].to(model.device)
-        context = context[:1].to(model.device)
+        batch_size = x.shape[0]
 
-        # Encode to latent
+        # Number of timesteps to visualize
+        n_steps = 5
+        timesteps = torch.linspace(0, model.n_steps - 1, n_steps).long().to(model.device)
+
+        # Extract class labels from the context
+        if context.dim() > 1 and context.shape[1] > 1:  # One-hot encoded
+            class_labels = context.argmax(dim=1).cpu().numpy()
+        else:  # Already indices
+            class_labels = context.cpu().numpy()
+
+        # Get label names if available
+        label_names = getattr(model, 'label_names', None)
+        if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
+            label_names = model.encoder.label_names
+
+        # Number of unique classes
+        num_classes = len(np.unique(class_labels))
+
+        # Lists to store latents for each diffusion stage
+        all_latents = []
+        all_stages = []
+        saved_noisy_latents = {}  # Store noisy latents by timestep
+
         with torch.no_grad():
+            # Get encoded latents (original)
             z = model.encode(x)
 
-        # Calculate base reconstruction error in signal domain
-        with torch.no_grad():
-            x_recon = model.decode(z)
-            base_sig_pow = x.pow(2).mean().cpu().item()
-            base_err = (x_recon - x).pow(2).mean().cpu().item()
-            base_snr_db = 10 * np.log10(base_sig_pow / (base_err + 1e-8))
+            # FORWARD DIFFUSION: Process each timestep including t=0 (original)
+            for i, t in enumerate(torch.tensor([0] + timesteps.tolist()).to(model.device)):
+                if t == 0:
+                    # Original latents (no noise)
+                    z_t = z.clone()
+                else:
+                    # Add noise according to timestep
+                    z_t, _ = model.q_sample(z, t.unsqueeze(0).repeat(batch_size))
+                    # Save this noisy state for exactly matching reverse diffusion
+                    saved_noisy_latents[t.item()] = z_t.clone()
 
-        # Timesteps for visualization
-        n_steps = 5
-        timesteps = (
-            torch.linspace(0, model.n_steps - 1, n_steps).long().to(model.device)
-        )
+                # Store latents and stage label
+                all_latents.append(z_t.cpu().numpy().reshape(batch_size, -1))
+                all_stages.append(f"t={t.item()}")
 
-        # Create figure with 4 rows - make it even taller to accommodate row titles
-        fig = plt.figure(figsize=(n_steps * 3, 14))  # Further increased height
+            # REVERSE DIFFUSION: Start from noisiest state and work backwards
+            # First get the noisiest state from saved forward states
+            z_noisy = saved_noisy_latents[timesteps[-1].item()]
 
-        # Create a GridSpec with more space between rows
-        gs = fig.add_gridspec(
-            4, n_steps, height_ratios=[3, 2, 3, 2], hspace=0.6
-        )  # Increased spacing further
+            # Then get all the reverse timesteps we need to process
+            reverse_timesteps = timesteps[:-1].flip(0)  # Exclude the noisiest state (already included) and reverse
 
-        # Create axes for all plots
-        axes_top_time = [fig.add_subplot(gs[0, i]) for i in range(n_steps)]
-        axes_top_freq = [fig.add_subplot(gs[1, i]) for i in range(n_steps)]
-        axes_bottom_time = [fig.add_subplot(gs[2, i]) for i in range(n_steps)]
-        axes_bottom_freq = [fig.add_subplot(gs[3, i]) for i in range(n_steps)]
-
-        forward_snr = [base_snr_db]
-        forward_signal_snr = [base_snr_db]  # New: Track signal domain SNR
-        reverse_snr = []
-        reverse_signal_snr = []  # New: Track signal domain SNR for reverse process
-        noisy_latents = []
-
-        # Get clean signal for reference
-        clean_signal = x_recon[0].cpu().numpy()
-        clean_mag = np.sqrt(clean_signal[0] ** 2 + clean_signal[1] ** 2)
-
-        # Calculate FFT of clean signal for reference
-        clean_fft = np.fft.fft(clean_mag)
-        clean_fft_mag = np.abs(clean_fft)
-        clean_fft_log = 20 * np.log10(clean_fft_mag + 1e-8)  # Log magnitude in dB
-        clean_fft_max = np.max(clean_fft_log)  # For normalization
-
-        # Determine common y-axis limits for time domain
-        all_signals = [clean_mag]  # Start with clean signal
-
-        # First pass to gather all signals for y-axis determination
-        with torch.no_grad():
-            for t in timesteps:
-                # Forward process
-                z_t, _ = model.q_sample(z, t.unsqueeze(0))
-                decoded = model.decode(z_t)[0].cpu().numpy()
-                forward_mag = np.sqrt(decoded[0] ** 2 + decoded[1] ** 2)
-                all_signals.append(forward_mag)
-
-                # One-shot reverse process for y-axis determination
-                eps_pred = model(z_t, t.unsqueeze(0), context)
-                a_bar_tensor = model.alpha_bar[t]
-                z_pred = (z_t - torch.sqrt(1 - a_bar_tensor) * eps_pred) / (
-                    torch.sqrt(a_bar_tensor) + 1e-8
-                )
-                decoded = model.decode(z_pred)[0].cpu().numpy()
-                reverse_mag = np.sqrt(decoded[0] ** 2 + decoded[1] ** 2)
-                all_signals.append(reverse_mag)
-
-        # Calculate common y-axis limits
-        all_signals_array = np.concatenate([s.reshape(-1) for s in all_signals])
-        y_min = np.min(all_signals_array) * 0.9
-        y_max = np.max(all_signals_array) * 1.1
-
-        # Determine common y-axis limits for frequency domain
-        freq_domain_min = -60  # dB
-        freq_domain_max = np.max(clean_fft_log) * 1.1
-
-        # Forward diffusion
-        with torch.no_grad():
-            for i, t in enumerate(timesteps):
-                t_val = t.cpu().item()
-
-                # Add noise
-                z_t, noise = model.q_sample(z, t.unsqueeze(0))
-                noisy_latents.append(z_t.clone())
-
-                # For SNR calculation in latent space
-                a_bar_tensor = model.alpha_bar[t]
-                a_bar_display = a_bar_tensor.cpu().item()
-
-                # Calculate SNR in latent space
-                sig_pow = z.pow(2).mean().cpu().item()
-                noi_pow = (
-                    noise.pow(2).mean().cpu().item()
-                    * (1 - a_bar_display)
-                    / a_bar_display
-                )
-                snr_db = 10 * np.log10(sig_pow / (noi_pow + 1e-8))
-                forward_snr.append(snr_db)
-
-                # Decode and prepare for plotting
-                decoded = model.decode(z_t)
-
-                # NEW: Calculate SNR in signal domain
-                signal_domain_mse = ((decoded - x_recon) ** 2).mean().cpu().item()
-                signal_domain_power = x_recon.pow(2).mean().cpu().item()
-                signal_domain_snr = 10 * np.log10(signal_domain_power / (signal_domain_mse + 1e-8))
-                forward_signal_snr.append(signal_domain_snr)
-
-                decoded_np = decoded[0].cpu().numpy()
-                decoded_mag = np.sqrt(decoded_np[0] ** 2 + decoded_np[1] ** 2)
-
-                # Calculate FFT for frequency domain plot
-                fft_result = np.fft.fft(decoded_mag)
-                fft_mag = np.abs(fft_result)
-                fft_log = 20 * np.log10(fft_mag + 1e-8)  # Log magnitude in dB
-
-                # NEW: Normalize relative to clean signal
-                fft_log_normalized = fft_log - clean_fft_max
-
-                # Time domain plot - magnitude only
-                axes_top_time[i].plot(
-                    clean_mag, "k--", alpha=0.5, label="Clean" if i == 0 else None
-                )
-                axes_top_time[i].plot(
-                    decoded_mag, "b-", label="Noisy" if i == 0 else None
-                )
-                axes_top_time[i].set_title(
-                    f"t={t_val:.0f}\nLatent SNR: {snr_db:.1f} dB\nSignal SNR: {signal_domain_snr:.1f} dB"
-                )
-                axes_top_time[i].set_ylim(y_min, y_max)  # Common y-axis
-                axes_top_time[i].grid(True)
-
-                # Frequency domain plot (log magnitude)
-                freq = np.fft.fftfreq(len(decoded_mag))
-                pos_freq_idx = np.where(freq >= 0)[0]  # Only show positive frequencies
-
-                axes_top_freq[i].plot(
-                    freq[pos_freq_idx],
-                    clean_fft_log[pos_freq_idx],
-                    "k--",
-                    alpha=0.5,
-                    label="Clean" if i == 0 else None,
-                )
-
-                # Plot normalized frequency response
-                axes_top_freq[i].plot(
-                    freq[pos_freq_idx],
-                    fft_log[pos_freq_idx],
-                    "b-",
-                    label="Noisy" if i == 0 else None,
-                )
-
-                # NEW: Add noise floor indicator
-                noise_floor = np.median(fft_log[pos_freq_idx])
-                axes_top_freq[i].axhline(
-                    y=noise_floor,
-                    color='r',
-                    linestyle='--',
-                    alpha=0.7,
-                    label="Noise floor" if i == 0 else None
-                )
-
-                # Calculate and show SNR from frequency domain perspective
-                signal_above_noise = fft_log[pos_freq_idx] - noise_floor
-                signal_above_noise[signal_above_noise < 0] = 0  # Only count signal above noise
-                freq_domain_snr = np.mean(signal_above_noise)
-
-                axes_top_freq[i].set_title(
-                    f"t={t_val:.0f}\nFreq SNR est: {freq_domain_snr:.1f} dB"
-                )
-                axes_top_freq[i].set_ylim(
-                    freq_domain_min, freq_domain_max
-                )  # Common y-axis
-                axes_top_freq[i].grid(True)
-
-            # Add legend to first time plot
-            axes_top_time[0].legend()
-            axes_top_freq[0].legend()
-
-        # Reverse diffusion
-        with torch.no_grad():
-            for i, t in enumerate(timesteps):
-                t_val = t.cpu().item()
-                z_t = noisy_latents[i]
-                current_noisy_snr = forward_snr[i + 1]
-
-                # Denoise
+            for t in reverse_timesteps:
+                # Apply reverse diffusion step
                 if t < 5:
-                    eps_pred = model(z_t, t.unsqueeze(0), context)
+                    eps_pred = model(z_noisy, t.unsqueeze(0).repeat(batch_size), context)
                     a_bar_tensor = model.alpha_bar[t]
-                    z_pred = (z_t - torch.sqrt(1 - a_bar_tensor) * eps_pred) / (
+                    z_pred = (z_noisy - torch.sqrt(1 - a_bar_tensor) * eps_pred) / (
                         torch.sqrt(a_bar_tensor) + 1e-8
                     )
                 else:
-                    steps = (
-                        torch.linspace(t.cpu().item(), 0, 10)
-                        .round()
-                        .long()
-                        .to(model.device)
-                    )
-                    z_pred = z_t.clone()
+                    steps = torch.linspace(timesteps[-1].item(), t.item(), 10).round().long().to(model.device)
+                    z_pred = z_noisy.clone()
                     for j in range(len(steps) - 1):
                         t_cur, t_next = steps[j], steps[j + 1]
-                        eps = model(z_pred, t_cur.unsqueeze(0), context)
+                        eps = model(z_pred, t_cur.unsqueeze(0).repeat(batch_size), context)
                         a_cur_tensor = model.alpha_bar[t_cur]
                         a_next_tensor = (
                             model.alpha_bar[t_next]
@@ -269,408 +127,336 @@ class DiffusionVisualizationCallback(L.Callback):
                             + torch.sqrt(1 - a_next_tensor) * eps
                         )
 
-                # Calculate SNR in latent space
-                mse = ((z_pred - z) ** 2).mean().cpu().item()
-                sig_pow = z.pow(2).mean().cpu().item()
-                denoise_snr = 10 * np.log10(sig_pow / (mse + 1e-8))
-                reverse_snr.append(denoise_snr)
+                # Update for next iteration
+                z_noisy = z_pred.clone()
 
-                # Get noisy signal for reference (from forward process)
-                noisy_decoded = model.decode(z_t)
+                # Store latents and stage label
+                all_latents.append(z_pred.cpu().numpy().reshape(batch_size, -1))
+                all_stages.append(f"t={t.item()} (denoised)")
 
-                # Decode denoised signal
-                decoded = model.decode(z_pred)
+        # Combine all latents for a single t-SNE computation
+        all_latents_array = np.vstack(all_latents)
 
-                # NEW: Calculate SNR in signal domain
-                signal_domain_mse = ((decoded - x_recon) ** 2).mean().cpu().item()
-                signal_domain_power = x_recon.pow(2).mean().cpu().item()
-                signal_domain_snr = 10 * np.log10(signal_domain_power / (signal_domain_mse + 1e-8))
-                reverse_signal_snr.append(signal_domain_snr)
+        # Apply t-SNE to reduce dimensions to 2D
+        print(f"Applying t-SNE to {all_latents_array.shape[0]} points of dimension {all_latents_array.shape[1]}")
+        perplexity = min(30, batch_size-1)
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+        latents_2d = tsne.fit_transform(all_latents_array)
 
-                noisy_decoded_np = noisy_decoded[0].cpu().numpy()
-                noisy_mag = np.sqrt(noisy_decoded_np[0] ** 2 + noisy_decoded_np[1] ** 2)
+        # Split back into separate arrays for each stage
+        latents_by_stage = {}
+        start_idx = 0
+        for stage in all_stages:
+            latents_by_stage[stage] = latents_2d[start_idx:start_idx+batch_size]
+            start_idx += batch_size
 
-                decoded_np = decoded[0].cpu().numpy()
-                decoded_mag = np.sqrt(decoded_np[0] ** 2 + decoded_np[1] ** 2)
+        # Create a 2-row grid with stages properly arranged
+        # First row: Original → Forward diffusion (t=0 to t=max)
+        # Second row: Most noisy → Reverse diffusion (t=max to t=min, excluding t=0)
 
-                # Calculate FFT for frequency domain plot
-                fft_result = np.fft.fft(decoded_mag)
-                fft_mag = np.abs(fft_result)
-                fft_log = 20 * np.log10(fft_mag + 1e-8)  # Log magnitude in dB
+        # Calculate number of columns needed
+        n_cols = n_steps + 1  # Original + forward steps
 
-                # NEW: Normalize relative to clean signal
-                fft_log_normalized = fft_log - clean_fft_max
+        fig, axes = plt.subplots(2, n_cols, figsize=(max(n_cols * 3, 20), 10), dpi=150)
+        fig.suptitle("Class Structure in Latent Space During Diffusion", fontsize=16)
 
-                # Calculate FFT for noisy signal
-                noisy_fft = np.fft.fft(noisy_mag)
-                noisy_fft_mag = np.abs(noisy_fft)
-                noisy_fft_log = 20 * np.log10(noisy_fft_mag + 1e-8)
+        # Create discrete colormap for class labels
+        cmap = plt.cm.get_cmap('tab10', num_classes)
 
-                # NEW: Noise floor for denoised signal
-                denoised_noise_floor = np.median(fft_log[pos_freq_idx])
+        # Row 1: Forward diffusion (including original t=0)
+        forward_stages = all_stages[:n_cols]
+        for i, stage in enumerate(forward_stages):
+            scatter = axes[0, i].scatter(
+                latents_by_stage[stage][:, 0],
+                latents_by_stage[stage][:, 1],
+                c=class_labels,
+                cmap=cmap,
+                s=80,
+                alpha=0.9,
+                vmin=0,
+                vmax=num_classes-1
+            )
+            t_val = int(stage.split('=')[1].split(' ')[0])
+            axes[0, i].set_title(f"Forward t={t_val}")
+            axes[0, i].grid(True)
 
-                # Calculate and show SNR from frequency domain perspective
-                signal_above_noise = fft_log[pos_freq_idx] - denoised_noise_floor
-                signal_above_noise[signal_above_noise < 0] = 0  # Only count signal above noise
-                freq_domain_snr = np.mean(signal_above_noise)
-
-                # Time domain plot - magnitude only
-                axes_bottom_time[i].plot(
-                    clean_mag, "k--", alpha=0.5, label="Clean" if i == 0 else None
-                )
-                axes_bottom_time[i].plot(
-                    noisy_mag, "b-", alpha=0.5, label="Noisy" if i == 0 else None
-                )
-                axes_bottom_time[i].plot(
-                    decoded_mag, "r-", label="Denoised" if i == 0 else None
-                )
-                axes_bottom_time[i].set_title(
-                    f"t={t_val:.0f}\nLatent SNR: {denoise_snr:.1f} dB\nSignal SNR: {signal_domain_snr:.1f} dB"
-                )
-                axes_bottom_time[i].set_ylim(y_min, y_max)  # Common y-axis
-                axes_bottom_time[i].grid(True)
-
-                # Frequency domain plot (log magnitude)
-                freq = np.fft.fftfreq(len(decoded_mag))
-                pos_freq_idx = np.where(freq >= 0)[0]  # Only show positive frequencies
-
-                axes_bottom_freq[i].plot(
-                    freq[pos_freq_idx],
-                    clean_fft_log[pos_freq_idx],
-                    "k--",
-                    alpha=0.5,
-                    label="Clean" if i == 0 else None,
-                )
-                axes_bottom_freq[i].plot(
-                    freq[pos_freq_idx],
-                    noisy_fft_log[pos_freq_idx],
-                    "b-",
-                    alpha=0.5,
-                    label="Noisy" if i == 0 else None,
-                )
-                axes_bottom_freq[i].plot(
-                    freq[pos_freq_idx],
-                    fft_log[pos_freq_idx],
-                    "r-",
-                    label="Denoised" if i == 0 else None,
-                )
-
-                # NEW: Add noise floor indicator
-                axes_bottom_freq[i].axhline(
-                    y=denoised_noise_floor,
-                    color='r',
-                    linestyle='--',
-                    alpha=0.7,
-                    label="Noise floor" if i == 0 else None
-                )
-
-                axes_bottom_freq[i].set_title(
-                    f"t={t_val:.0f}\nFreq SNR est: {freq_domain_snr:.1f} dB"
-                )
-                axes_bottom_freq[i].set_ylim(
-                    freq_domain_min, freq_domain_max
-                )  # Common y-axis
-                axes_bottom_freq[i].grid(True)
-
-            # Add legend to first denoised plot
-            axes_bottom_time[0].legend()
-            axes_bottom_freq[0].legend()
-
-        # Add main title
-        fig.suptitle("Latent Diffusion Process", fontsize=16, y=0.98)
-
-        # First draw to make sure all plot positions are finalized
-        fig.canvas.draw()
-
-        # Calculate row positions - get both top and bottom positions of the plots
-        row1_top = axes_top_time[0].get_position().y1  # Top of first row
-        row1_bottom = axes_top_time[0].get_position().y0  # Bottom of first row
-
-        row2_top = axes_top_freq[0].get_position().y1  # Top of second row
-        row2_bottom = axes_top_freq[0].get_position().y0  # Bottom of second row
-
-        row3_top = axes_bottom_time[0].get_position().y1  # Top of third row
-        row3_bottom = axes_bottom_time[0].get_position().y0  # Bottom of third row
-
-        row4_top = axes_bottom_freq[0].get_position().y1  # Top of fourth row
-        row4_bottom = axes_bottom_freq[0].get_position().y0  # Bottom of fourth row
-
-        # Calculate positions halfway between rows, but closer to the row they describe
-        row1_pos = 0.935  # Keep first row title at the top
-        row2_pos = (row1_bottom + row2_top + 0.012) / 2  # Between row 1 and 2
-        row3_pos = (row2_bottom + row3_top + 0.017) / 2  # Between row 2 and 3
-        row4_pos = (row3_bottom + row4_top + 0.015) / 2  # Between row 3 and 4
-
-        # Add row subtitles with adjusted positions
-        fig.text(
-            0.5,
-            row1_pos,
-            "Forward Diffusion: Time Domain (Adding Noise)",
-            ha="center",
-            fontsize=12,
-            fontweight="bold",
+        # Row 2: Most noisy state → Reverse diffusion
+        # First plot is the most noisy state (already in forward row)
+        most_noisy_stage = forward_stages[-1]
+        axes[1, 0].scatter(
+            latents_by_stage[most_noisy_stage][:, 0],
+            latents_by_stage[most_noisy_stage][:, 1],
+            c=class_labels,
+            cmap=cmap,
+            s=80,
+            alpha=0.9,
+            vmin=0,
+            vmax=num_classes-1
         )
+        t_val = int(most_noisy_stage.split('=')[1].split(' ')[0])
+        axes[1, 0].set_title(f"Noisiest t={t_val}")
+        axes[1, 0].grid(True)
 
-        fig.text(
-            0.5,
-            row2_pos,
-            "Forward Diffusion: Frequency Domain (Log Magnitude)",
-            ha="center",
-            fontsize=12,
-            fontweight="bold",
-        )
+        # Remaining plots are reverse diffusion stages
+        reverse_stages = all_stages[n_cols:]
+        for i, stage in enumerate(reverse_stages):
+            axes[1, i+1].scatter(
+                latents_by_stage[stage][:, 0],
+                latents_by_stage[stage][:, 1],
+                c=class_labels,
+                cmap=cmap,
+                s=80,
+                alpha=0.9,
+                vmin=0,
+                vmax=num_classes-1
+            )
+            t_val = int(stage.split('=')[1].split(' ')[0])
+            axes[1, i+1].set_title(f"Reverse t={t_val}")
+            axes[1, i+1].grid(True)
 
-        fig.text(
-            0.5,
-            row3_pos,
-            "Reverse Diffusion: Time Domain (Denoising)",
-            ha="center",
-            fontsize=12,
-            fontweight="bold",
-        )
+        # Add colorbar with class names
+        cbar = fig.colorbar(scatter, ax=axes.ravel().tolist(), ticks=range(num_classes))
+        if label_names:
+            cbar.ax.set_yticklabels(label_names)
+            cbar.set_label('Signal Class')
+        else:
+            cbar.set_label('Class Label')
 
-        fig.text(
-            0.5,
-            row4_pos,
-            "Reverse Diffusion: Frequency Domain (Log Magnitude)",
-            ha="center",
-            fontsize=12,
-            fontweight="bold",
-        )
+        # Add row labels
+        fig.text(0.02, 0.75, 'Forward Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
+        fig.text(0.02, 0.25, 'Reverse Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
 
+        plt.tight_layout(rect=[0.03, 0, 1, 0.95])
         return fig
 
     def create_diffusion_animation(self, model, batch):
-        """Create an animated GIF showing forward diffusion followed by reverse diffusion with pause at end"""
-        x, context, original_snr = batch
-        x = x[:1].to(model.device)  # Just use first example
-        context = context[:1].to(model.device)  # Just use first example
+        """Create an enhanced animated GIF showing class structure evolution with reference points"""
+        x, context, _ = batch
+        batch_size = x.shape[0]
+
+        # Create directory for frames
+        os.makedirs("media/tsne_animation", exist_ok=True)
+        all_frames = []  # List to store all image frames
 
         # Number of frames for each process
         n_frames = 15
-        timesteps = (
-            torch.linspace(0, model.n_steps - 1, n_frames).long().to(model.device)
-        )
+        timesteps = torch.linspace(0, model.n_steps - 1, n_frames).long().to(model.device)
 
-        # Create directory for frames
-        import os
+        # Extract class labels from the context
+        if context.dim() > 1 and context.shape[1] > 1:  # One-hot encoded
+            class_labels = context.argmax(dim=1).cpu().numpy()
+        else:  # Already indices
+            class_labels = context.cpu().numpy()
 
-        os.makedirs("media/diffusion_animation", exist_ok=True)
+        # Get label names if available
+        label_names = getattr(model, 'label_names', None)
+        if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
+            label_names = model.encoder.label_names
 
-        all_frames = []  # List to store all image frames
+        # Number of unique classes
+        num_classes = len(np.unique(class_labels))
+
+        # Collect latents for all timesteps
+        all_latents = []  # Store all latent representations
+        stage_labels = []  # Store the diffusion stage for each latent set
+        noisy_latents = []  # Store intermediate latents for reverse diffusion
 
         with torch.no_grad():
-            # Get original clean signal
+            # Get encoded latents (original)
             z = model.encode(x)
-            clean_signal = model.decode(z)
-            clean_real = clean_signal[0, 0].cpu().numpy()
-            clean_imag = clean_signal[0, 1].cpu().numpy()
+            all_latents.append(z.clone().cpu().numpy())
+            stage_labels.append("Original")
 
-            # Calculate signal magnitude
-            clean_magnitude = np.sqrt(clean_real**2 + clean_imag**2)
+            # Forward diffusion
+            for i, t in enumerate(timesteps):
+                z_t, _ = model.q_sample(z, t.unsqueeze(0).repeat(batch_size))
+                noisy_latents.append(z_t.clone())
 
-            # Forward diffusion: generate all noisy versions
-            noisy_magnitudes = []
-            noisy_latents = []
+                all_latents.append(z_t.cpu().numpy())
+                stage_labels.append(f"Forward t={t.item():.0f}")
 
-            for t in timesteps:
-                noisy_z, _ = model.q_sample(z, t.unsqueeze(0))
-                noisy_latents.append(noisy_z.clone())
+            # Reverse diffusion starting from most noisy state
+            z_noisy = noisy_latents[-1].clone()
 
-                noisy_signal = model.decode(noisy_z)
-                noisy_real = noisy_signal[0, 0].cpu().numpy()
-                noisy_imag = noisy_signal[0, 1].cpu().numpy()
-
-                noisy_magnitude = np.sqrt(noisy_real**2 + noisy_imag**2)
-                noisy_magnitudes.append(noisy_magnitude)
-
-            # Reverse diffusion: generate all denoised versions
-            denoised_magnitudes = []
-
-            # Start from the most noisy sample (last timestep)
-            current_z = noisy_latents[-1].clone()
-
-            # Use same timesteps but in reverse order
-            for i in range(len(timesteps) - 1, -1, -1):
+            for i in range(len(timesteps)-1, -1, -1):
                 t = timesteps[i]
 
-                # Denoising
+                # Apply reverse diffusion step
                 if t < 5:
-                    t_tensor = t.unsqueeze(0)
-                    predicted_noise = model(current_z, t_tensor, context)
-                    alpha_bar_t = model.alpha_bar[t]
-                    current_z = (
-                        current_z - torch.sqrt(1 - alpha_bar_t) * predicted_noise
-                    ) / torch.sqrt(alpha_bar_t)
+                    eps_pred = model(z_noisy, t.unsqueeze(0).repeat(batch_size), context)
+                    a_bar_tensor = model.alpha_bar[t]
+                    z_pred = (z_noisy - torch.sqrt(1 - a_bar_tensor) * eps_pred) / (
+                        torch.sqrt(a_bar_tensor) + 1e-8
+                    )
                 else:
-                    t_tensor = torch.full((1,), t, device=model.device).long()
-                    predicted_noise = model(current_z, t_tensor, context)
+                    steps = torch.linspace(t.cpu().item(), 0, 10).round().long().to(model.device)
+                    z_pred = z_noisy.clone()
+                    for j in range(len(steps) - 1):
+                        t_cur, t_next = steps[j], steps[j + 1]
+                        eps = model(z_pred, t_cur.unsqueeze(0).repeat(batch_size), context)
+                        a_cur_tensor = model.alpha_bar[t_cur]
+                        a_next_tensor = (
+                            model.alpha_bar[t_next]
+                            if t_next > 0
+                            else torch.tensor(1.0, device=model.device)
+                        )
+                        x0_pred = (z_pred - torch.sqrt(1 - a_cur_tensor) * eps) / (
+                            torch.sqrt(a_cur_tensor) + 1e-8
+                        )
+                        z_pred = (
+                            torch.sqrt(a_next_tensor) * x0_pred
+                            + torch.sqrt(1 - a_next_tensor) * eps
+                        )
 
-                    alpha_bar_t = model.alpha_bar[t]
-                    pred_x0 = (
-                        current_z - torch.sqrt(1 - alpha_bar_t) * predicted_noise
-                    ) / torch.sqrt(alpha_bar_t)
+                z_noisy = z_pred.clone()
+                all_latents.append(z_pred.cpu().numpy())
+                stage_labels.append(f"Reverse t={t.item():.0f}")
 
-                    t_next = (
-                        timesteps[i - 1] if i > 0 else torch.tensor(0).to(model.device)
-                    )
-                    alpha_bar_next = (
-                        model.alpha_bar[t_next]
-                        if t_next > 0
-                        else torch.tensor(1.0).to(model.device)
-                    )
+        # Apply t-SNE to all latents together for consistency
+        all_latents_array = np.vstack([latent.reshape(batch_size, -1) for latent in all_latents])
+        print(f"Applying t-SNE for animation with {all_latents_array.shape[0]} points of dimension {all_latents_array.shape[1]}")
+        perplexity = min(30, batch_size-1)
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+        latents_2d = tsne.fit_transform(all_latents_array)
 
-                    current_z = (
-                        torch.sqrt(alpha_bar_next) * pred_x0
-                        + torch.sqrt(1 - alpha_bar_next) * predicted_noise
-                    )
+        # Split back into frames
+        frame_latents = np.split(latents_2d, len(stage_labels))
 
-                # Decode
-                denoised = model.decode(current_z)
-                denoised_real = denoised[0, 0].cpu().numpy()
-                denoised_imag = denoised[0, 1].cpu().numpy()
+        # Store references to original and most noisy state
+        original_2d = frame_latents[0]
+        most_noisy_2d = frame_latents[n_frames]  # Last forward diffusion step
 
-                denoised_magnitude = np.sqrt(denoised_real**2 + denoised_imag**2)
-                denoised_magnitudes.append(denoised_magnitude)
+        # Get consistent axis limits
+        x_min, x_max = latents_2d[:, 0].min(), latents_2d[:, 0].max()
+        y_min, y_max = latents_2d[:, 1].min(), latents_2d[:, 1].max()
 
-            # Reverse the denoising arrays to match forward timesteps order
-            denoised_magnitudes = denoised_magnitudes[::-1]
+        # Add padding to axis limits
+        x_padding = (x_max - x_min) * 0.1
+        y_padding = (y_max - y_min) * 0.1
+        x_min -= x_padding
+        x_max += x_padding
+        y_min -= y_padding
+        y_max += y_padding
 
-            # PART 1: Create frames for forward diffusion process
-            for i in range(len(timesteps)):
-                fig, ax = plt.subplots(figsize=(10, 6))
+        # Create discrete colormap for class labels
+        cmap = plt.cm.get_cmap('tab10', num_classes)
 
-                # Always show original signal as reference
-                ax.plot(clean_magnitude, "k--", alpha=0.4, label="Original Signal")
+        # Create frames for animation
+        for i, (latents, stage) in enumerate(zip(frame_latents, stage_labels)):
+            fig, ax = plt.subplots(figsize=(10, 8))
 
-                # Show forward diffusion in blue
-                ax.plot(noisy_magnitudes[i], "b-", linewidth=2.5, label="Noisy Signal")
-
-                # Add timestep and phase information
-                t = timesteps[i].item()
-                progress = ((i + 1) / len(timesteps)) * 100
-
-                ax.set_title(
-                    f"Forward Diffusion Process - Adding Noise\n"
-                    f"Timestep {t} ({progress:.0f}% complete)"
+            # Show original latents as reference points (small, transparent)
+            if i > 0:  # Skip for the original frame itself
+                ax.scatter(
+                    original_2d[:, 0],
+                    original_2d[:, 1],
+                    c=class_labels,
+                    cmap=cmap,
+                    s=30,
+                    alpha=0.2,
+                    vmin=0,
+                    vmax=num_classes-1,
+                    marker='o',
+                    label="Original"
                 )
 
-                ax.legend()
-                ax.grid(True)
-                ax.set_xlabel("Sample Index")
-                ax.set_ylabel("Signal Magnitude")
-
-                # Set fixed y-limits from -5 to 5
-                ax.set_ylim(0, 5)
-
-                plt.tight_layout()
-                frame_path = f"media/diffusion_animation/frame_{i:03d}.png"
-                plt.savefig(frame_path)
-                plt.close(fig)
-
-                # Read the saved image
-                frame = imageio.imread(frame_path)
-
-                # Add the same frame multiple times to slow down the animation
-                for _ in range(5):  # Add each frame 5 times
-                    all_frames.append(frame)
-
-            # PART 2: Create frames for reverse diffusion process
-            # Start from the most noisy state
-            for i in range(len(timesteps)):
-                fig, ax = plt.subplots(figsize=(10, 6))
-
-                # Always show original signal as reference
-                ax.plot(clean_magnitude, "k--", alpha=0.4, label="Original Signal")
-
-                # Show the most noisy signal (final forward state) in blue
-                ax.plot(
-                    noisy_magnitudes[-1], "b-", alpha=0.5, label="Most Noisy Signal"
+            # Show most noisy latents as reference points (if we're in reverse diffusion)
+            if "Reverse" in stage:
+                ax.scatter(
+                    most_noisy_2d[:, 0],
+                    most_noisy_2d[:, 1],
+                    c=class_labels,
+                    cmap=cmap,
+                    s=30,
+                    alpha=0.2,
+                    vmin=0,
+                    vmax=num_classes-1,
+                    marker='s',  # Square marker to differentiate
+                    label="Most Noisy"
                 )
 
-                # Show the denoising progress in red
-                reverse_idx = len(timesteps) - 1 - i  # Start from end and work backward
-                ax.plot(
-                    denoised_magnitudes[reverse_idx],
-                    "r-",
-                    linewidth=2.5,
-                    label="Denoised Signal",
-                )
-
-                # Add timestep and phase information
-                t = timesteps[reverse_idx].item()
-                progress = ((i + 1) / len(timesteps)) * 100
-
-                ax.set_title(
-                    f"Reverse Diffusion Process - Removing Noise\n"
-                    f"Timestep {t} ({progress:.0f}% complete)"
-                )
-
-                ax.legend()
-                ax.grid(True)
-                ax.set_xlabel("Sample Index")
-                ax.set_ylabel("Signal Magnitude")
-
-                # Set fixed y-limits from -5 to 5
-                ax.set_ylim(0, 5)
-
-                plt.tight_layout()
-                frame_path = (
-                    f"media/diffusion_animation/frame_{i + len(timesteps):03d}.png"
-                )
-                plt.savefig(frame_path)
-                plt.close(fig)
-
-                # Read the saved image
-                frame = imageio.imread(frame_path)
-
-                # Add the same frame multiple times to slow down the animation
-                for _ in range(5):  # Add each frame 5 times
-                    all_frames.append(frame)
-
-            # PART 3: Create a final comparison frame with long pause
-            fig, ax = plt.subplots(figsize=(10, 6))
-
-            # Show original signal as reference
-            ax.plot(clean_magnitude, "k--", alpha=0.4, label="Original Signal")
-
-            # Show the denoised signal (final result)
-            ax.plot(
-                denoised_magnitudes[0],
-                "r-",
-                linewidth=2.5,
-                label="Final Denoised Signal",
+            # Create main scatter plot colored by class
+            scatter = ax.scatter(
+                latents[:, 0],
+                latents[:, 1],
+                c=class_labels,
+                cmap=cmap,
+                s=100,
+                alpha=0.9,
+                vmin=0,
+                vmax=num_classes-1,
+                label=stage
             )
 
-            # Add comparison info
-            ax.set_title(
-                "Diffusion Process Complete\nComparing Original vs Denoised Signal"
-            )
+            # Add title
+            if "Forward" in stage:
+                title = f"Class Structure in Latent Space\n{stage} - Adding Noise"
+            elif "Reverse" in stage:
+                title = f"Class Structure in Latent Space\n{stage} - Removing Noise"
+            else:
+                title = f"Class Structure in Latent Space\n{stage}"
 
-            ax.legend()
+            ax.set_title(title, fontsize=14)
+
+            # Set consistent axis limits
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
             ax.grid(True)
-            ax.set_xlabel("Sample Index")
-            ax.set_ylabel("Signal Magnitude")
-            ax.set_ylim(0, 5)
 
+            # Add legend
+            if i > 0:
+                ax.legend(loc='upper right')
+
+            # Add colorbar
+            cbar = plt.colorbar(scatter, ticks=range(num_classes))
+            if label_names:
+                cbar.ax.set_yticklabels(label_names)
+                cbar.set_label('Signal Class')
+            else:
+                cbar.set_label('Class Label')
+
+            # Add descriptive text about what's happening
+            if "Forward" in stage:
+                progress = int(((i-1) / (n_frames-1)) * 100) if i > 0 else 0
+                ax.text(0.5, -0.1,
+                    f"Forward Diffusion: {progress}% Complete\nClasses gradually mix as noise increases",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            elif "Reverse" in stage:
+                reverse_idx = i - (n_frames + 1)  # Index in reverse process
+                progress = int(((reverse_idx+1) / n_frames) * 100)
+                ax.text(0.5, -0.1,
+                    f"Reverse Diffusion: {progress}% Complete\nClasses gradually separate as noise is removed",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=12)
+
+            # Save the frame
             plt.tight_layout()
-            final_frame_path = f"media/diffusion_animation/frame_final.png"
-            plt.savefig(final_frame_path)
+            frame_path = f"media/tsne_animation/class_frame_{i:03d}.png"
+            plt.savefig(frame_path, dpi=100)
             plt.close(fig)
 
-            final_frame = imageio.imread(final_frame_path)
+            # Read the saved image
+            frame = imageio.imread(frame_path)
 
-            # Add many copies of the final frame to create a long pause
-            for _ in range(30):  # 30 copies for a very long pause
-                all_frames.append(final_frame)
+            # Add the same frame multiple times to control animation speed
+            if i == 0:  # Original state - longer pause
+                repeats = 10
+            elif i == n_frames:  # Most noisy state - extended pause
+                repeats = 20  # Long pause at most noisy state
+            elif i == len(stage_labels)-1:  # Final denoised state - longer pause
+                repeats = 15
+            else:
+                repeats = 3
 
-            # Create the GIF
-            gif_path = "media/diffusion_animation/diffusion_process.gif"
-            imageio.mimsave(
-                gif_path,
-                all_frames,
-                duration=0.1,  # Shorter duration since we're duplicating frames
-                loop=0,  # Loop indefinitely
-            )
+            for _ in range(repeats):
+                all_frames.append(frame)
 
-            return gif_path
+        # Create the GIF
+        gif_path = "media/tsne_animation/class_structure_evolution.gif"
+        imageio.mimsave(
+            gif_path,
+            all_frames,
+            duration=0.15,
+            loop=0
+        )
+
+        return gif_path

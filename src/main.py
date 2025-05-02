@@ -8,7 +8,7 @@ import lightning.pytorch as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
 from data.rfml_dataset_2016 import get_dataloaders
-from callbacks import DiffusionVisualizationCallback
+from callbacks import DiffusionVisualizationCallback, DiffusionTSNEVisualizationCallback
 from utils.latent_scaling import calculate_latent_scaling_factor
 import os
 
@@ -151,7 +151,8 @@ def main(cfg: DictConfig):
                 max_epochs=cfg.hyperparams.epochs,
                 logger=wandb_logger,
                 callbacks=[
-                    DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True)
+                    DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True),
+                    DiffusionTSNEVisualizationCallback(every_n_epochs=1, create_animation=True)
                 ],
             )
 
