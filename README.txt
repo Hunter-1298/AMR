@@ -34,7 +34,7 @@ AMR/
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/yourusername/AMR.git
+git clone https://github.com/Hunter-1298/AMR.git
 cd AMR
 python -m venv venv
 source venv/bin/activate
