@@ -11,10 +11,11 @@ from sklearn.manifold import TSNE
 class DiffusionTSNEVisualizationCallback(L.Callback):
     """Callback for visualizing how class structure evolves in latent space during diffusion"""
 
-    def __init__(self, every_n_epochs=1, create_animation=False):
+    def __init__(self, every_n_epochs=1, create_animation=False, label_names=None):
         super().__init__()
         self.every_n_epochs = every_n_epochs
         self.create_animation = create_animation
+        self.label_names = label_names
 
     def on_validation_epoch_end(self, trainer, pl_module):
         """Create t-SNE visualizations at the end of validation epoch"""
@@ -66,9 +67,11 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             class_labels = context.cpu().numpy()
 
         # Get label names if available
-        label_names = getattr(model, 'label_names', None)
-        if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
-            label_names = model.encoder.label_names
+        label_names = self.label_names
+        if not label_names:
+            label_names = getattr(model, 'label_names', None)
+            if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
+                label_names = model.encoder.label_names
 
         # Number of unique classes
         num_classes = len(np.unique(class_labels))
@@ -160,7 +163,7 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
         fig.suptitle("Class Structure in Latent Space During Diffusion", fontsize=16)
 
         # Create discrete colormap for class labels
-        cmap = plt.cm.get_cmap('tab10', num_classes)
+        cmap = plt.cm.get_cmap('tab20', num_classes)
 
         # Row 1: Forward diffusion steps (excluding t=0)
         forward_stages = all_stages[1:n_steps+1]  # Skip t=0, take next 5 stages
@@ -197,19 +200,29 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             axes[1, i].grid(True)
 
         # Add colorbar with class names
-        # cbar = fig.colorbar(scatter, ax=axes.ravel().tolist(), ticks=range(num_classes),
-        #                 location='right', shrink=0.8)  # Moved to right side, made slightly smaller
+        # cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
+        # cbar = fig.colorbar(scatter, cax=cbar_ax, ticks=np.arange(num_classes))
+
         # if label_names:
-        #     cbar.ax.set_yticklabels(label_names)
-        #     cbar.set_label('Signal Class')
+        #     if isinstance(label_names, dict):
+        #         tick_labels = [label_names.get(i, f"Class {i}") for i in range(num_classes)]
+        #     else:
+        #         tick_labels = [str(label_names[i]) if i < len(label_names) else f"Class {i}"
+        #                      for i in range(num_classes)]
+
+        #     cbar.ax.set_yticklabels(tick_labels)
+        #     cbar.set_label('Signal Class', fontsize=12)
         # else:
-        #     cbar.set_label('Class Label')
+        #     cbar.set_label('Class Label', fontsize=12)
+
+        # Adjust the layout to make room for the colorbar
+        plt.tight_layout(rect=[0.03, 0, 0.9, 0.95])
 
         # Add row labels
         fig.text(0.02, 0.75, 'Forward Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
         fig.text(0.02, 0.25, 'Reverse Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
 
-        plt.tight_layout(rect=[0.03, 0, 1, 0.95])
+        plt.tight_layout(rect=(0.03, 0, 1, 0.95))
         return fig
 
     def create_diffusion_animation(self, model, batch):
@@ -232,9 +245,11 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             class_labels = context.cpu().numpy()
 
         # Get label names if available
-        label_names = getattr(model, 'label_names', None)
-        if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
-            label_names = model.encoder.label_names
+        label_names = self.label_names
+        if not label_names:
+            label_names = getattr(model, 'label_names', None)
+            if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
+                label_names = model.encoder.label_names
 
         # Number of unique classes
         num_classes = len(np.unique(class_labels))
@@ -322,7 +337,7 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
         y_max += y_padding
 
         # Create discrete colormap for class labels
-        cmap = plt.cm.get_cmap('tab10', num_classes)
+        cmap = plt.cm.get_cmap('tab20', num_classes)
 
         # Create frames for animation
         for i, (latents, stage) in enumerate(zip(frame_latents, stage_labels)):
@@ -390,10 +405,16 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             if i > 0:
                 ax.legend(loc='upper right')
 
-            # Add colorbar
+            # Add colorbar with class names
             cbar = plt.colorbar(scatter, ticks=range(num_classes))
             if label_names:
-                cbar.ax.set_yticklabels(label_names)
+                # Create tick labels based on the structure of label_names
+                if isinstance(label_names, dict):
+                    tick_labels = [label_names.get(i, f"Class {i}") for i in range(num_classes)]
+                else:
+                    tick_labels = [str(label_names[i]) if i < len(label_names) else f"Class {i}"
+                                for i in range(num_classes)]
+                cbar.ax.set_yticklabels(tick_labels)
                 cbar.set_label('Signal Class')
             else:
                 cbar.set_label('Class Label')
@@ -460,9 +481,11 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             class_labels = context.cpu().numpy()
 
         # Get label names if available
-        label_names = getattr(model, 'label_names', None)
-        if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
-            label_names = model.encoder.label_names
+        label_names = self.label_names
+        if not label_names:
+            label_names = getattr(model, 'label_names', None)
+            if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
+                label_names = model.encoder.label_names
 
         # Number of unique classes
         num_classes = len(np.unique(class_labels))
@@ -550,7 +573,7 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
         fig.suptitle("UNet Bottleneck Space During Diffusion", fontsize=16)
 
         # Create discrete colormap for class labels
-        cmap = plt.cm.get_cmap('tab10', num_classes)
+        cmap = plt.cm.get_cmap('tab20', num_classes)
 
         # Row 1: Forward diffusion steps (excluding t=0)
         forward_stages = all_stages[1:n_steps+1]  # Skip t=0, take next 5 stages
@@ -586,9 +609,24 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             axes[1, i].set_title(f"Reverse t={t_val}")
             axes[1, i].grid(True)
 
+        # Add colorbar with class names
+        # cbar = fig.colorbar(scatter, ax=axes.ravel().tolist(), ticks=range(num_classes),
+        #                 location='right', shrink=0.8, pad=0.02)
+        # if label_names:
+        #     # Create tick labels based on the structure of label_names
+        #     if isinstance(label_names, dict):
+        #         tick_labels = [label_names.get(i, f"Class {i}") for i in range(num_classes)]
+        #     else:
+        #         tick_labels = [str(label_names[i]) if i < len(label_names) else f"Class {i}"
+        #                     for i in range(num_classes)]
+        #     cbar.ax.set_yticklabels(tick_labels)
+        #     cbar.set_label('Signal Class', fontsize=12)
+        # else:
+        #     cbar.set_label('Class Label', fontsize=12)
+
         # Add row labels
         fig.text(0.02, 0.75, 'Forward Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
         fig.text(0.02, 0.25, 'Reverse Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
 
-        plt.tight_layout(rect=[0.03, 0, 1, 0.95])
+        plt.tight_layout(rect=(0.03, 0, 1, 0.95))
         return fig

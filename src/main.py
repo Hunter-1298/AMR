@@ -151,8 +151,8 @@ def main(cfg: DictConfig):
                 max_epochs=cfg.hyperparams.epochs,
                 logger=wandb_logger,
                 callbacks=[
-                    DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True),
-                    DiffusionTSNEVisualizationCallback(every_n_epochs=1, create_animation=True)
+                    DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True, label_names=label_names),
+                    DiffusionTSNEVisualizationCallback(every_n_epochs=1, create_animation=True,label_names=label_names)
                 ],
             )
 

@@ -9,7 +9,7 @@ import imageio
 class DiffusionVisualizationCallback(L.Callback):
     """Callback for visualizing the diffusion process"""
 
-    def __init__(self, every_n_epochs=1, create_animation=False):
+    def __init__(self, every_n_epochs=1, create_animation=False, label_names=None):
         super().__init__()
         self.every_n_epochs = every_n_epochs
         self.create_animation = create_animation
