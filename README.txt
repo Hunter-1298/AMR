@@ -70,41 +70,29 @@ hyperparams:
 🧠 Model Overview
 Encoder (VAE)
 ResNet-style 1D CNN encoder/decoder
-
 Adaptive pooling & residual blocks
 
 Diffusion Model
 1D UNet with attention
-
 Timestep embeddings (Fourier)
-
 Conditional/noise-aware generation
 
 Classifier
 Latent-space CNN classifier
-
 Uses encoder or sampled latents
 
 📊 Dataset
 Uses RadioML 2016.10a
-
 11 modulation types
-
 SNR range: -20 dB to +18 dB
-
 220,000 examples total
-
 Shape: (1024, complex) → real-valued representation
-
 Download via DeepSig Datasets
 
 📈 Visualizations
 ✅ Diffusion Sampling Steps
-
 ✅ t-SNE of Latent Space
-
 ✅ UNet Bottleneck Projections
-
 ✅ Modulation-wise Latent Clustering
 
 All visuals can be optionally logged to Weights & Biases (W&B).
