@@ -54,11 +54,23 @@ class LatentClassifier(pl.LightningModule):
 
         # Calculate diffusion loss - currently prediciting noise distribution
         classifier_free = torch.full_like(context, 11, device=self.device)
-        noise_loss, predicted_noise = self.diffusion.p_losses(z, t, classifier_free)
-        # noise_loss, predicted_noise = self.diffusion.p_losses(z, t, context)
 
-        pred = self(predicted_noise)
-        loss = self.criterion(pred,context)
+        # Add noise to the latent representation
+        noisy_z, noise = self.diffusion.q_sample(z, t)
+
+        # Get predicted noise
+        predicted_noise = self.diffusion(noisy_z, t, context)
+
+        # Calculate denoised signal using the predicted noise
+        # x_0 = (x_t - √(1-ᾱ_t) * predicted_noise) / √ᾱ_t
+        sqrt_alpha_bar_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1)
+        sqrt_one_minus_alpha_bar_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+
+        denoised_z = (noisy_z - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
+
+        # Classify the denoised signal
+        pred = self(denoised_z)
+        loss = self.criterion(pred, context)
         train_acc = self.accuracy(pred, context)
 
         # Log loss
@@ -88,10 +100,23 @@ class LatentClassifier(pl.LightningModule):
         z = self.diffusion.encode(x)
 
         # Calculate diffusion loss - currently prediciting noise distribution
-        noise_loss, predicted_noise = self.diffusion.p_losses(z, t, context)
+        classifier_free = torch.full_like(context, 11, device=self.device)
 
-        pred = self(predicted_noise)
-        val_loss = self.criterion(pred,context)
+        # Add noise to the latent representation
+        noisy_z, noise = self.diffusion.q_sample(z, t)
+
+        # Get predicted noise
+        predicted_noise = self.diffusion(noisy_z, t, context)
+
+        # Calculate denoised signal
+        sqrt_alpha_bar_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1)
+        sqrt_one_minus_alpha_bar_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+
+        denoised_z = (noisy_z - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
+
+        # Classify the denoised signal
+        pred = self(denoised_z)
+        val_loss = self.criterion(pred, context)
         val_acc = self.accuracy(pred, context, snr)
 
         # Log loss

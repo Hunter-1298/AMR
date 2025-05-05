@@ -1,14 +1,14 @@
 # Global configurations
-project_name: Diffusion_No_Condition
-run_name: Conditioned_Vis:${now:%Y-%m-%d_%H-%M-%S}
+project_name: Diffusion_Vis
+run_name: Conditioned_Vis #:${now:%Y-%m-%d_%H-%M-%S}
 train_encoder: False
-train_diffusion: True
-conditon: False
-vis_diffusion: False
+train_diffusion: False
+conditon: True
+vis_diffusion: True
 train_classifier: False
 encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
 diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
-# diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0754.ckpt
+# diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0702.ckpt
 mode: online
 debug: False
 log_model: True
@@ -18,8 +18,8 @@ seed: 42
 hyperparams:
     # Training
     epochs: 200
-    classifier_epochs: 50
-    learning_rate: .0001
+    classifier_epochs: 10
+    learning_rate: .001
     batch_size: 256
     dropout: 0.25
     hidden_dim: 32
@@ -62,8 +62,8 @@ Diffusion:
 
 Classifier:
     _target_: models.classifier.classifier.LatentClassifier
-    learning_rate: 0.001
-    fine_tune_diffusion: True
+    learning_rate: 0.0001
+    fine_tune_diffusion: False
     num_classes: ${hyperparams.num_classes}
     classifier_head:
         _target_: models.classifier.conv_classifier.Conv1DHead

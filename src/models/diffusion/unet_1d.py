@@ -63,6 +63,9 @@ class UNet1DModel(nn.Module):
         # size of the input token dimensions
         self.sample_size = sample_size
 
+        # Store output of bottleneck -- to visually see how we learn
+        self.bottleneck_activations = None
+
         ############################### TIME EMBEDDINGS ######################################
 
         # initalize to a size that is large enough to hold semantically meaningful information
@@ -198,6 +201,7 @@ class UNet1DModel(nn.Module):
         # 3. mid
         if self.mid_block:
             sample = self.mid_block(hidden_states=sample, temb=timestep_embed, context=cond_embeddings)
+            self.bottleneck_activations = sample.clone().detach()
 
         # 4. up
         for i, upsample_block in enumerate(self.up_blocks):

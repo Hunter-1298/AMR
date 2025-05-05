@@ -28,8 +28,12 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             # Visualize latent space with t-SNE
             tsne_fig = self.create_diffusion_visualizations(pl_module, batch)
 
+            # Visualize bottleneck space with t-SNE
+            bottleneck_fig = self.create_bottleneck_visualizations(pl_module, batch)
+
             logs = {
                 "latent/tsne_classes": wandb.Image(tsne_fig),
+                "bottleneck/tsne_classes": wandb.Image(bottleneck_fig),
                 "epoch": trainer.current_epoch,
             }
 
@@ -42,6 +46,7 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             trainer.logger.experiment.log(logs)
 
             plt.close(tsne_fig)
+            plt.close(bottleneck_fig)
         else:
             print("No example batch found for visualization")
 
@@ -150,21 +155,15 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             latents_by_stage[stage] = latents_2d[start_idx:start_idx+batch_size]
             start_idx += batch_size
 
-        # Create a 2-row grid with stages properly arranged
-        # First row: Original → Forward diffusion (t=0 to t=max)
-        # Second row: Most noisy → Reverse diffusion (t=max to t=min, excluding t=0)
-
-        # Calculate number of columns needed
-        n_cols = n_steps + 1  # Original + forward steps
-
-        fig, axes = plt.subplots(2, n_cols, figsize=(max(n_cols * 3, 20), 10), dpi=150)
+        # Create figure with 2 rows and n_steps columns
+        fig, axes = plt.subplots(2, n_steps, figsize=(max(n_steps * 3, 20), 10), dpi=150)
         fig.suptitle("Class Structure in Latent Space During Diffusion", fontsize=16)
 
         # Create discrete colormap for class labels
         cmap = plt.cm.get_cmap('tab10', num_classes)
 
-        # Row 1: Forward diffusion (including original t=0)
-        forward_stages = all_stages[:n_cols]
+        # Row 1: Forward diffusion steps (excluding t=0)
+        forward_stages = all_stages[1:n_steps+1]  # Skip t=0, take next 5 stages
         for i, stage in enumerate(forward_stages):
             scatter = axes[0, i].scatter(
                 latents_by_stage[stage][:, 0],
@@ -180,27 +179,10 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
             axes[0, i].set_title(f"Forward t={t_val}")
             axes[0, i].grid(True)
 
-        # Row 2: Most noisy state → Reverse diffusion
-        # First plot is the most noisy state (already in forward row)
-        most_noisy_stage = forward_stages[-1]
-        axes[1, 0].scatter(
-            latents_by_stage[most_noisy_stage][:, 0],
-            latents_by_stage[most_noisy_stage][:, 1],
-            c=class_labels,
-            cmap=cmap,
-            s=80,
-            alpha=0.9,
-            vmin=0,
-            vmax=num_classes-1
-        )
-        t_val = int(most_noisy_stage.split('=')[1].split(' ')[0])
-        axes[1, 0].set_title(f"Noisiest t={t_val}")
-        axes[1, 0].grid(True)
-
-        # Remaining plots are reverse diffusion stages
-        reverse_stages = all_stages[n_cols:]
+        # Row 2: Reverse diffusion steps
+        reverse_stages = all_stages[-n_steps:]  # Take last 5 stages
         for i, stage in enumerate(reverse_stages):
-            axes[1, i+1].scatter(
+            axes[1, i].scatter(
                 latents_by_stage[stage][:, 0],
                 latents_by_stage[stage][:, 1],
                 c=class_labels,
@@ -211,16 +193,17 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
                 vmax=num_classes-1
             )
             t_val = int(stage.split('=')[1].split(' ')[0])
-            axes[1, i+1].set_title(f"Reverse t={t_val}")
-            axes[1, i+1].grid(True)
+            axes[1, i].set_title(f"Reverse t={t_val}")
+            axes[1, i].grid(True)
 
         # Add colorbar with class names
-        cbar = fig.colorbar(scatter, ax=axes.ravel().tolist(), ticks=range(num_classes))
-        if label_names:
-            cbar.ax.set_yticklabels(label_names)
-            cbar.set_label('Signal Class')
-        else:
-            cbar.set_label('Class Label')
+        # cbar = fig.colorbar(scatter, ax=axes.ravel().tolist(), ticks=range(num_classes),
+        #                 location='right', shrink=0.8)  # Moved to right side, made slightly smaller
+        # if label_names:
+        #     cbar.ax.set_yticklabels(label_names)
+        #     cbar.set_label('Signal Class')
+        # else:
+        #     cbar.set_label('Class Label')
 
         # Add row labels
         fig.text(0.02, 0.75, 'Forward Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
@@ -460,3 +443,152 @@ class DiffusionTSNEVisualizationCallback(L.Callback):
         )
 
         return gif_path
+
+    def create_bottleneck_visualizations(self, model, batch):
+        """Create t-SNE visualizations of the UNet bottleneck during diffusion"""
+        x, context, _ = batch
+        batch_size = x.shape[0]
+
+        # Number of timesteps to visualize
+        n_steps = 5
+        timesteps = torch.linspace(0, model.n_steps - 1, n_steps).long().to(model.device)
+
+        # Extract class labels from the context
+        if context.dim() > 1 and context.shape[1] > 1:  # One-hot encoded
+            class_labels = context.argmax(dim=1).cpu().numpy()
+        else:  # Already indices
+            class_labels = context.cpu().numpy()
+
+        # Get label names if available
+        label_names = getattr(model, 'label_names', None)
+        if not label_names and hasattr(model, 'encoder') and hasattr(model.encoder, 'label_names'):
+            label_names = model.encoder.label_names
+
+        # Number of unique classes
+        num_classes = len(np.unique(class_labels))
+
+        # Lists to store bottleneck activations for each diffusion stage
+        all_bottlenecks = []
+        all_stages = []
+        saved_noisy_latents = {}  # Store noisy latents by timestep
+
+        with torch.no_grad():
+            # Get encoded latents (original)
+            z = model.encode(x)
+
+            # FORWARD DIFFUSION: Process each timestep including t=0 (original)
+            for i, t in enumerate(torch.tensor([0] + timesteps.tolist()).to(model.device)):
+                if t == 0:
+                    # Original latents (no noise)
+                    z_t = z.clone()
+                else:
+                    # Add noise according to timestep
+                    z_t, _ = model.q_sample(z, t.unsqueeze(0).repeat(batch_size))
+                    # Save this noisy state for exactly matching reverse diffusion
+                    saved_noisy_latents[t.item()] = z_t.clone()
+
+                # Run the model to get bottleneck activation
+                # This will populate model.unet.bottleneck_activations
+                _ = model(z_t, t.unsqueeze(0).repeat(batch_size), context)
+                bottleneck = model.unet.bottleneck_activations
+
+                if bottleneck is not None:
+                    # Reshape to [batch_size, -1] - flatten all except batch dim
+                    bottleneck_flat = bottleneck.reshape(batch_size, -1)
+                    reshaped = bottleneck_flat.cpu().numpy()
+                    all_bottlenecks.append(reshaped)
+                    all_stages.append(f"t={t.item()}")
+                    print(f"Collected bottleneck at t={t.item()}, shape: {bottleneck.shape}")
+                else:
+                    print(f"WARNING: No bottleneck activation for t={t.item()}")
+
+            # REVERSE DIFFUSION: Start from noisiest state and work backwards
+            # First get the noisiest state from saved forward states
+            z_noisy = saved_noisy_latents[timesteps[-1].item()]
+
+            # Then get all the reverse timesteps we need to process
+            reverse_timesteps = timesteps[:-1].flip(0)  # Exclude noisiest state (already included) and reverse
+
+            for t in reverse_timesteps:
+                # Run the model to get bottleneck activation
+                _ = model(z_noisy, t.unsqueeze(0).repeat(batch_size), context)
+                bottleneck = model.unet.bottleneck_activations
+
+                if bottleneck is not None:
+                    bottleneck_flat = bottleneck.reshape(batch_size, -1)
+                    reshaped = bottleneck_flat.cpu().numpy()
+                    all_bottlenecks.append(reshaped)
+                    all_stages.append(f"t={t.item()} (denoised)")
+                    print(f"Collected bottleneck at t={t.item()} (denoised), shape: {bottleneck.shape}")
+                else:
+                    print(f"WARNING: No bottleneck activation for t={t.item()} (denoised)")
+
+                # Apply reverse diffusion step to move to next timestep
+                eps_pred = model(z_noisy, t.unsqueeze(0).repeat(batch_size), context)
+                a_bar_tensor = model.alpha_bar[t]
+                z_pred = (z_noisy - torch.sqrt(1 - a_bar_tensor) * eps_pred) / (
+                    torch.sqrt(a_bar_tensor) + 1e-8
+                )
+                z_noisy = z_pred.clone()
+
+        # Combine all bottlenecks for t-SNE
+        all_bottlenecks_array = np.vstack(all_bottlenecks)
+        print(f"Applying t-SNE to {all_bottlenecks_array.shape[0]} bottleneck activations of dimension {all_bottlenecks_array.shape[1]}")
+        perplexity = min(30, batch_size-1)
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+        bottlenecks_2d = tsne.fit_transform(all_bottlenecks_array)
+
+        # Split back into separate arrays for each stage
+        bottlenecks_by_stage = {}
+        start_idx = 0
+        for stage in all_stages:
+            bottlenecks_by_stage[stage] = bottlenecks_2d[start_idx:start_idx+batch_size]
+            start_idx += batch_size
+
+        # Create figure with 2 rows and n_steps columns
+        fig, axes = plt.subplots(2, n_steps, figsize=(max(n_steps * 3, 20), 10), dpi=150)
+        fig.suptitle("UNet Bottleneck Space During Diffusion", fontsize=16)
+
+        # Create discrete colormap for class labels
+        cmap = plt.cm.get_cmap('tab10', num_classes)
+
+        # Row 1: Forward diffusion steps (excluding t=0)
+        forward_stages = all_stages[1:n_steps+1]  # Skip t=0, take next 5 stages
+        for i, stage in enumerate(forward_stages):
+            scatter = axes[0, i].scatter(
+                bottlenecks_by_stage[stage][:, 0],
+                bottlenecks_by_stage[stage][:, 1],
+                c=class_labels,
+                cmap=cmap,
+                s=80,
+                alpha=0.9,
+                vmin=0,
+                vmax=num_classes-1
+            )
+            t_val = int(stage.split('=')[1].split(' ')[0])
+            axes[0, i].set_title(f"Forward t={t_val}")
+            axes[0, i].grid(True)
+
+        # Row 2: Reverse diffusion steps
+        reverse_stages = all_stages[-n_steps:]  # Take last 5 stages
+        for i, stage in enumerate(reverse_stages):
+            axes[1, i].scatter(
+                bottlenecks_by_stage[stage][:, 0],
+                bottlenecks_by_stage[stage][:, 1],
+                c=class_labels,
+                cmap=cmap,
+                s=80,
+                alpha=0.9,
+                vmin=0,
+                vmax=num_classes-1
+            )
+            t_val = int(stage.split('=')[1].split(' ')[0])
+            axes[1, i].set_title(f"Reverse t={t_val}")
+            axes[1, i].grid(True)
+
+        # Add row labels
+        fig.text(0.02, 0.75, 'Forward Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
+        fig.text(0.02, 0.25, 'Reverse Diffusion', ha='left', va='center', rotation='vertical', fontsize=14)
+
+        plt.tight_layout(rect=[0.03, 0, 1, 0.95])
+        return fig
