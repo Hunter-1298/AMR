@@ -7,7 +7,7 @@ from matplotlib import pyplot as plt
 import wandb
 
 
-class LatentEncoder(L.LightningModule):
+class LatentEncoderReconstrction(L.LightningModule):
     def __init__(self, label_names, encoder, decoder, learning_rate=1e-3):
         super().__init__()
         self.learning_rate = learning_rate

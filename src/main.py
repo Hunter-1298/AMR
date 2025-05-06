@@ -45,13 +45,12 @@ def main(cfg: DictConfig):
     # If we need to train the encoder
     if cfg.train_encoder:
         print("Training VAE Encoder...")
-
         # Create and train VAE model
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
         encoder = torch.compile(encoder)
 
         # Create checkpoint dir
-        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "encoder")
+        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "contrastive_encoder")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         # Set up trainer for MoE
