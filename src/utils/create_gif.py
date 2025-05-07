@@ -29,17 +29,19 @@ def create_gif(directory=".", duration=200, loop=0):
     filenames = [fn.split() for fn in os.listdir(directory) if fn.endswith(".png")]
     files = [filenames[i][0] for i in range(len(filenames))]
     files = sorted(files, key=lambda x: int(x.split("_")[2]))
-    for filename in files[:20]:
-        filepath = os.path.join(directory, filename)
-        try:
-            img = Image.open(filepath)
-            images.append(img)
-        except FileNotFoundError:
-            print(f"Error: Image file not found: {filepath}")
-            return
-        except Exception as e:
-            print(f"Error opening image {filename}: {e}")
-            return
+
+    for filename in files:
+        if "tsne" in filename:
+            filepath = os.path.join(directory, filename)
+            try:
+                img = Image.open(filepath)
+                images.append(img)
+            except FileNotFoundError:
+                print(f"Error: Image file not found: {filepath}")
+                return
+            except Exception as e:
+                print(f"Error opening image {filename}: {e}")
+                return
 
     if images:
         output_file = os.path.join(directory, "animation.gif")
@@ -73,11 +75,11 @@ def download_images(run, download_dir="images"):
 
 # --- Main ---
 if __name__ == "__main__":
-    RUN_PATH = "hhayden-mit/Denoiser/6vkdj7jg"  # @param {type:"string"}
+    RUN_PATH = "hunter98-mit/Contrastive_Encoder/srgj0rvp"  # @param {type:"string"}
     NUM_IMAGES_PER_GIF = 80  # @param {type:"integer"} # Unused variable
     DURATION = 1000  # @param {type:"integer"}
     DOWNLOAD_DIR = "images"  # @param {type:"string"}
-    OUTPUT_DIR = "images/media/images/train"  # @param {type:"string"}
+    OUTPUT_DIR = "images/media/images"  # @param {type:"string"}
 
     api = wandb.Api()
     try:

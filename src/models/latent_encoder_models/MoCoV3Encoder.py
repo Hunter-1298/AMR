@@ -10,7 +10,7 @@ import copy
 
 
 class MoCoV3Encoder(L.LightningModule):
-    def __init__(self, label_names, encoder, projection_dim=256, hidden_dim=256, learning_rate=1e-3, temperature=0.2, momentum=0.996):
+    def __init__(self, label_names, encoder, projection_dim=128, hidden_dim=128, learning_rate=1e-3, temperature=0.2, momentum=0.996):
         # https://arxiv.org/pdf/2104.02057 - MoCoV3
         # MoCoV3 paper uses hidden_dim=4096
         # using large batch size ~ 4096 in order to ignore queue from MoCoV2
@@ -302,7 +302,7 @@ class MoCoV3Encoder(L.LightningModule):
             optimizer,
             mode='min',
             factor=0.5,  # halve the learning rate
-            patience=5,  # wait 5 epochs for improvement
+            patience=2,  # wait 5 epochs for improvement
             verbose=True
         )
 

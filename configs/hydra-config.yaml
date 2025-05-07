@@ -1,13 +1,15 @@
 # Global configurations
-project_name: Contrastive_Encoder
-run_name: MoCoV3:${now:%Y-%m-%d_%H-%M-%S}
-train_encoder: True
+project_name: Contrastive_Diffusion
+run_name: Contrastive_Decoder_NoCondition #:${now:%Y-%m-%d_%H-%M-%S}
+train_encoder: False
 contrastive_encoder: True
-train_diffusion: False
+train_diffusion: True
 conditon: False
 vis_diffusion: False
 train_classifier: False
-encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
+encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
+# checkpoint for reconstruction vae
+# encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
 # diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
 diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0702.ckpt
 mode: online
@@ -18,10 +20,10 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 100
+    epochs: 200
     classifier_epochs: 10
-    learning_rate: .0001
-    batch_size: 256
+    learning_rate: .001
+    batch_size: 1024
     contrastive_batch_size: 4096 # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
@@ -53,7 +55,7 @@ Diffusion:
     linear_start: 0.0001 # starting noise value for beta schedule
     linear_end: 0.01 # ending value for the beta schedule
     weight_decay: 1e-2
-    latent_scaling: 2.98697 # 2.93873 # False - set to false if we want to recalcualte
+    latent_scaling: 1.1981 # contrastive scaling # 2.98697 - reconstruction encoder # False - set to false if we want to recalcualte
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
         sample_size: 64
@@ -81,6 +83,6 @@ dataset:
     iq: true #true
     batch_size: ${hyperparams.batch_size}
     contrastive_batch_size: ${hyperparams.contrastive_batch_size}
-    num_workers: 8
+    num_workers: 12
     train_val_split: [0.8, 0.2]
     random_seed: ${seed}

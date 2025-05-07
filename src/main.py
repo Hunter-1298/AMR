@@ -73,7 +73,7 @@ def main(cfg: DictConfig):
             callbacks=[
                 ModelCheckpoint(
                     monitor="val_loss",
-                    filename="vae_phase{epoch:02d}_{val_loss:.7f}",
+                    filename="{dir}{epoch:02d}_{val_loss:.7f}",
                     dirpath=checkpoint_dir,
                     save_top_k=3,
                     mode="min",
@@ -97,7 +97,7 @@ def main(cfg: DictConfig):
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
         checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
         checkpoint_name = cfg.encoder_checkpoint_name
-        checkpoint = torch.load(checkpoint_dir + checkpoint_name)
+        checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         encoder.load_state_dict(checkpoint["state_dict"])
         encoder.eval()
         for param in encoder.parameters():
@@ -138,7 +138,8 @@ def main(cfg: DictConfig):
                     mode="min",
                 ),
                 LearningRateMonitor(logging_interval="step"),
-                DiffusionVisualizationCallback(every_n_epochs=5),
+                # DiffusionVisualizationCallback(every_n_epochs=5),
+                DiffusionTSNEVisualizationCallback(every_n_epochs=20, create_animation=True,label_names=label_names)
             ],
         )
 
@@ -163,7 +164,7 @@ def main(cfg: DictConfig):
                 max_epochs=cfg.hyperparams.epochs,
                 logger=wandb_logger,
                 callbacks=[
-                    DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True, label_names=label_names),
+                    # DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True, label_names=label_names),
                     DiffusionTSNEVisualizationCallback(every_n_epochs=1, create_animation=True,label_names=label_names)
                 ],
             )
