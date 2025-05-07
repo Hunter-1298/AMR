@@ -5,9 +5,9 @@ from hydra.utils import get_original_cwd
 import wandb
 from omegaconf import DictConfig, OmegaConf
 import lightning.pytorch as L
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
-from data.rfml_dataset_2016 import get_dataloaders
+from data.rfml_dataset_2016 import get_dataloaders, get_moco_dataloaders
 from callbacks import DiffusionVisualizationCallback, DiffusionTSNEVisualizationCallback
 from utils.latent_scaling import calculate_latent_scaling_factor
 import os
@@ -45,12 +45,19 @@ def main(cfg: DictConfig):
     # If we need to train the encoder
     if cfg.train_encoder:
         print("Training VAE Encoder...")
-        # Create and train VAE model
+        # Check to see if we need different train and test dataloaders
+        if cfg.contrastive_encoder:
+            encoder_train_loader, encoder_val_loader, label_names = get_moco_dataloaders(train_loader, val_loader, cfg.dataset)
+        else:
+            encoder_train_loader, encoder_val_loader = train_loader, val_loader
+
+        # Create and train encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
-        encoder = torch.compile(encoder)
+        # encoder = torch.compile(encoder)
 
         # Create checkpoint dir
-        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "contrastive_encoder")
+        dir = 'contrastive_encoder' if cfg.contrastive_encoder else 'encoder'
+        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", dir)
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         # Set up trainer for MoE
@@ -72,11 +79,17 @@ def main(cfg: DictConfig):
                     mode="min",
                 ),
                 LearningRateMonitor(logging_interval="step"),
+                EarlyStopping(
+                    monitor="val_loss",
+                    patience=20,  # Stop after 20 epochs without improvement
+                    mode="min",
+                    verbose=True
+                ),
             ],
         )
 
         # Train Encoder
-        encoder_trainer.fit(encoder, train_loader, val_loader)
+        encoder_trainer.fit(encoder, encoder_train_loader, encoder_val_loader)
         print("Encoder finished training")
 
     else:

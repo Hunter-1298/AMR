@@ -1,7 +1,8 @@
 # Global configurations
 project_name: Contrastive_Encoder
-run_name: Contrastive_Encoder:${now:%Y-%m-%d_%H-%M-%S}
+run_name: MoCoV3:${now:%Y-%m-%d_%H-%M-%S}
 train_encoder: True
+contrastive_encoder: True
 train_diffusion: False
 conditon: False
 vis_diffusion: False
@@ -17,7 +18,7 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 50
+    epochs: 500
     classifier_epochs: 10
     learning_rate: .0001
     batch_size: 256
@@ -39,8 +40,8 @@ data_dir: data/
 #         _target_: models.latent_encoder_models.decoder.Decoder1D
 
 Encoder:
-    _target_: models.latent_encoder_models.latent_contrastive_encoder.LatentContrastiveEncoder
-    learning_rate: .005
+    _target_: models.latent_encoder_models.MoCoV3Encoder.MoCoV3Encoder
+    learning_rate: .01
     encoder:
         _target_: models.latent_encoder_models.resnet_encoder.ResNet1D
 

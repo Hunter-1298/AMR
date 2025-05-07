@@ -1,4 +1,5 @@
 import torch
+import random
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from torch.utils.data import random_split
@@ -213,3 +214,64 @@ def get_tokenized_dataloaders(cfg, vqvae, train_loader, val_loader):
     )
 
     return tokenized_train_loader, tokenized_val_loader
+
+
+class MoCoRFMLDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+        # Create index mapping for efficient retrieval
+        self.mod_snr_indices = defaultdict(list)
+        for idx in range(len(dataset)):
+            _, label, snr = dataset[idx]
+            self.mod_snr_indices[(label, snr)].append(idx)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        x1, label, snr = self.dataset[idx]
+
+        # Get positive pair (same modulation, different SNR)
+        same_mod_indices = [
+            i for s in range(-20, 19, 2)  # SNR range
+            for i in self.mod_snr_indices.get((label, s), [])
+            if s != snr  # Different SNR
+        ]
+        pos_idx = random.choice(same_mod_indices)
+        x2, _, _ = self.dataset[pos_idx]
+
+        return (x1, x2), label, snr
+
+def get_moco_dataloaders(train_loader, val_loader, config):
+    """
+    Creates MoCo dataloaders from existing train/val splits
+
+    Args:
+        train_loader: Original training dataloader
+        val_loader: Original validation dataloader
+        config: Configuration object
+    """
+    # Create MoCo datasets from existing splits
+    moco_train_dataset = MoCoRFMLDataset(train_loader.dataset)
+    moco_val_dataset = MoCoRFMLDataset(val_loader.dataset)
+
+    # Create new dataloaders with MoCo datasets
+    moco_train_loader = DataLoader(
+        moco_train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers
+    )
+
+    moco_val_loader = DataLoader(
+        moco_val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers
+    )
+
+    # Get label names from original dataset
+    label_names = train_loader.dataset.dataset.get_decoded_labels()
+
+    return moco_train_loader, moco_val_loader, label_names
