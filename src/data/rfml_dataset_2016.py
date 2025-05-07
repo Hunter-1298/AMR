@@ -266,7 +266,7 @@ def get_moco_dataloaders(train_loader, val_loader, config):
 
     moco_val_loader = DataLoader(
         moco_val_dataset,
-        batch_size=config.batch_size,
+        batch_size=config.contrastive_batch_size,
         shuffle=False,
         num_workers=config.num_workers
     )

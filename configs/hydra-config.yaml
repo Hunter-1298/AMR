@@ -22,7 +22,7 @@ hyperparams:
     classifier_epochs: 10
     learning_rate: .0001
     batch_size: 256
-    contrastive_batch_size: 2048 # make this high so we can use all negatives in batch without increase batch for diffusion model
+    contrastive_batch_size: 4096 # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
     feature_dim: 16
@@ -42,7 +42,7 @@ data_dir: data/
 
 Encoder:
     _target_: models.latent_encoder_models.MoCoV3Encoder.MoCoV3Encoder
-    learning_rate: .001
+    learning_rate: .0001
     encoder:
         _target_: models.latent_encoder_models.resnet_encoder.ResNet1D
 
