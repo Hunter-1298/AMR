@@ -18,10 +18,11 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 500
+    epochs: 100
     classifier_epochs: 10
     learning_rate: .0001
     batch_size: 256
+    contrastive_batch_size: 2048 # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
     feature_dim: 16
@@ -41,7 +42,7 @@ data_dir: data/
 
 Encoder:
     _target_: models.latent_encoder_models.MoCoV3Encoder.MoCoV3Encoder
-    learning_rate: .01
+    learning_rate: .001
     encoder:
         _target_: models.latent_encoder_models.resnet_encoder.ResNet1D
 
@@ -79,6 +80,7 @@ Classifier:
 dataset:
     iq: true #true
     batch_size: ${hyperparams.batch_size}
-    num_workers: 4
-    train_val_split: [0.7, 0.3]
+    contrastive_batch_size: ${hyperparams.contrastive_batch_size}
+    num_workers: 8
+    train_val_split: [0.8, 0.2]
     random_seed: ${seed}

@@ -10,7 +10,10 @@ import copy
 
 
 class MoCoV3Encoder(L.LightningModule):
-    def __init__(self, label_names, encoder, projection_dim=256, prediction_dim=256, learning_rate=1e-3, temperature=0.2, momentum=0.996):
+    def __init__(self, label_names, encoder, projection_dim=256, hidden_dim=256, learning_rate=1e-3, temperature=0.2, momentum=0.996):
+        # https://arxiv.org/pdf/2104.02057 - MoCoV3
+        # MoCoV3 paper uses hidden_dim=4096
+        # using large batch size ~ 4096 in order to ignore queue from MoCoV2
         super().__init__()
         self.save_hyperparameters(ignore=['encoder'])
         self.learning_rate = learning_rate
@@ -31,13 +34,13 @@ class MoCoV3Encoder(L.LightningModule):
 
         # Projection head (same for both networks)
         self.online_projector = nn.Sequential(
-            nn.Linear(latent_dim, projection_dim),
-            nn.BatchNorm1d(projection_dim),
+            nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(projection_dim, projection_dim),
-            nn.BatchNorm1d(projection_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(projection_dim, projection_dim)
+            nn.Linear(hidden_dim, projection_dim)
         )
 
         self.target_projector = copy.deepcopy(self.online_projector)
@@ -46,10 +49,10 @@ class MoCoV3Encoder(L.LightningModule):
 
         # Prediction head (only for online network)
         self.predictor = nn.Sequential(
-            nn.Linear(projection_dim, prediction_dim),
-            nn.BatchNorm1d(prediction_dim),
+            nn.Linear(projection_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(prediction_dim, projection_dim)
+            nn.Linear(hidden_dim, projection_dim)
         )
 
     def encode(self, x):
