@@ -1,10 +1,39 @@
 import torch
+import torch.nn as nn
 import wandb
 import torch.nn.functional as F
 import lightning.pytorch as pl
+import matplotlib.pyplot as plt
+import io
+
+
+class TimestepPredictor(nn.Module):
+    def __init__(self, in_channels=32, hidden_dim=1024, n_steps=500):
+        super().__init__()
+        self.n_steps = n_steps
+        self.features = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim//4, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim//4),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(hidden_dim//4, hidden_dim//2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim//2),
+            nn.LeakyReLU(0.2),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten()
+        )
+        self.final = nn.Sequential(
+            nn.Linear(hidden_dim//2, hidden_dim//2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim//2, n_steps)
+        )
+
+    def forward(self, x):
+        features = self.features(x)
+        logits = self.final(features)    # [B, n_steps]
+        return logits
 
 class LatentClassifier(pl.LightningModule):
-    def __init__(self, diffusion, encoder, classifier_head, learning_rate,num_classes,label_names, fine_tune_diffusion=False):
+    def __init__(self, diffusion, encoder, classifier_head, learning_rate, num_classes, label_names, fine_tune_diffusion=False):
         super().__init__()
         self.save_hyperparameters(ignore=['diffusion', 'encoder', 'classifier_head'])
 
@@ -16,16 +45,19 @@ class LatentClassifier(pl.LightningModule):
         self.criterion = torch.nn.CrossEntropyLoss()
         self.num_classes = num_classes
         self.label_names = label_names
+        # self.timestep_predictor = TimestepPredictor(in_channels=32, n_steps=diffusion.n_steps)
+
+        # Add scheduling parameters (fixed typo here)
+        self.schedule_factor = 0.2  # Weight for mixture distribution
+        self.n_steps = diffusion.n_steps
 
         # Freeze diffusion by default
         if not fine_tune_diffusion:
             for param in self.diffusion.parameters():
                 param.requires_grad = False
 
-
-        # going to store [correct/total]
+        # Accuracy tracking
         self.snr_accuracy = [(0,0) for _ in range(20)]
-        # going to store [correct/total]
         self.mod_accuracy = [(0,0) for _ in range(self.num_classes)]
 
     def forward(self, x):
@@ -33,97 +65,103 @@ class LatentClassifier(pl.LightningModule):
         return self.classifier_head(x)
 
     def training_step(self, batch, batch_idx):
-        """
-        Lightning training step
-
-        Args:
-            batch: Batch of data containing (x, context, _)
-            batch_idx: Batch index
-
-        Returns:
-            Loss tensor
-        """
-        # Unpack batch
         x, context, snr = batch
+        z = self.diffusion.encode(x).float()
+        B = z.shape[0]
 
-        # Sample random timesteps
-        t = torch.randint(0, self.diffusion.n_steps, (x.shape[0],), device=self.device).long()
+        # Map SNR to timesteps - convert SNR to float first
+        snr = snr.float()  # Convert to float to avoid dtype issues
+        min_snr, max_snr = -20.0, 20.0  # Typical SNR range in dB
+        normalized_snr = (snr - min_snr) / (max_snr - min_snr)
+        normalized_snr = torch.clamp(normalized_snr, 0.0, 1.0)
 
-        # Encode input to latent space
-        z = self.diffusion.encode(x)
+        # Inverse mapping: high SNR → low timestep, low SNR → high timestep
+        t = ((1.0 - normalized_snr) * (self.n_steps - 1)).long()
+        t = t.view(B)
 
-        # Calculate diffusion loss - currently prediciting noise distribution
-        classifier_free = torch.full_like(context, 11, device=self.device)
+        # Add small random jitter during training for exploration
+        if self.training:
+            # Add random offset of up to ±5% of total steps
+            jitter = torch.randint(-self.n_steps//20, self.n_steps//20, (B,), device=t.device)
+            t = (t + jitter).clamp(0, self.n_steps - 1)
 
-        # Add noise to the latent representation
-        noisy_z, noise = self.diffusion.q_sample(z, t)
+        # Diffusion & classification
+        pred_noise = self.diffusion(z, t, context)
+        a = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
+        am1 = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
+        denoised = (z - am1*pred_noise)/a
+        logits_cls = self.classifier_head(denoised)
 
-        # Get predicted noise
-        predicted_noise = self.diffusion(noisy_z, t, context)
+        # Classification loss
+        cls_loss = self.criterion(logits_cls, context)
 
-        # Calculate denoised signal using the predicted noise
-        # x_0 = (x_t - √(1-ᾱ_t) * predicted_noise) / √ᾱ_t
-        sqrt_alpha_bar_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1)
-        sqrt_one_minus_alpha_bar_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+        # Logging - use float everywhere
+        self.log_dict({
+            "train/loss": cls_loss,
+            "train/avg_t": t.float().mean(),
+            "train/t_std": t.float().std(),
+            "train/avg_snr": snr.float().mean(),
+            "train/acc": self.accuracy(logits_cls, context)
+        }, prog_bar=True)
 
-        denoised_z = (noisy_z - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
+        return cls_loss
 
-        # Classify the denoised signal
-        pred = self(denoised_z)
-        loss = self.criterion(pred, context)
-        train_acc = self.accuracy(pred, context)
-
-        # Log loss
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("train_acc", train_acc)
-
-        return loss
 
     def validation_step(self, batch, batch_idx):
-        """
-        Lightning training step
-
-        Args:
-            batch: Batch of data containing (x, context, _)
-            batch_idx: Batch index
-
-        Returns:
-            Loss tensor
-        """
-        # Unpack batch
         x, context, snr = batch
+        context = context.long()
+        assert torch.all(context < self.num_classes), f"Invalid context values: {context.max()}"
 
-        # Sample random timesteps
-        t = torch.randint(0, self.diffusion.n_steps, (x.shape[0],), device=self.device).long()
+        # 1) Encode
+        z = self.diffusion.encode(x).float()
+        B = z.shape[0]
 
-        # Encode input to latent space
-        z = self.diffusion.encode(x)
+        # 2) Map SNR to timesteps - convert SNR to float first
+        snr = snr.float()  # Convert to float to avoid dtype issues
+        min_snr, max_snr = -20.0, 20.0  # Typical SNR range in dB
+        normalized_snr = (snr - min_snr) / (max_snr - min_snr)
+        normalized_snr = torch.clamp(normalized_snr, 0.0, 1.0)
 
-        # Calculate diffusion loss - currently prediciting noise distribution
-        classifier_free = torch.full_like(context, 11, device=self.device)
+        # Inverse mapping: high SNR → low timestep, low SNR → high timestep
+        t = ((1.0 - normalized_snr) * (self.n_steps - 1)).long()
+        t = t.view(B)
 
-        # Add noise to the latent representation
-        noisy_z, noise = self.diffusion.q_sample(z, t)
+        # 3) Log metrics - use float for all calculations
+        self.log("val/avg_snr", snr.float().mean())
+        self.log("val/avg_t", t.float().mean())
+        self.log("val/t_std", t.float().std())
 
-        # Get predicted noise
-        predicted_noise = self.diffusion(noisy_z, t, context)
+        # 4) Denoising with SNR-based timestep
+        predicted_noise = self.diffusion(z, t, context)
+        a_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
+        am1_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
+        denoised_z = (z - am1_t * predicted_noise) / a_t
 
-        # Calculate denoised signal
-        sqrt_alpha_bar_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1)
-        sqrt_one_minus_alpha_bar_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
+        # 5) Classify
+        logits_cls = self.classifier_head(denoised_z)
+        pred_probs = F.softmax(logits_cls, dim=-1)
+        assert logits_cls.shape[1] == self.num_classes, f"Wrong pred shape: {logits_cls.shape}"
 
-        denoised_z = (noisy_z - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
-
-        # Classify the denoised signal
-        pred = self(denoised_z)
-        val_loss = self.criterion(pred, context)
-        val_acc = self.accuracy(pred, context, snr)
-
-        # Log loss
+        # 6) Loss & metrics
+        val_loss = self.criterion(logits_cls, context)
+        val_acc = self.accuracy(logits_cls, context, snr)
         self.log("val_loss", val_loss, prog_bar=True)
-        self.log("val_acc", val_acc)
+        self.log("val_acc", val_acc, prog_bar=True)
+
+        # 7) Cache example batch and associated computed values
+        if batch_idx == 0:
+            self.example_batch = {
+                'x': x.detach().cpu(),
+                'z': z.detach().cpu(),
+                'context': context.detach().cpu(),
+                'snr': snr.detach().cpu(),
+                't': t.detach().cpu(),
+                'denoised_z': denoised_z.detach().cpu(),
+                'pred': logits_cls.detach().cpu()
+            }
 
         return val_loss
+
 
     def configure_optimizers(self):  # pyright: ignore
         optimizer = torch.optim.AdamW(
@@ -146,35 +184,38 @@ class LatentClassifier(pl.LightningModule):
         }
 
     def accuracy(self, pred, y, snr=None):
-        # Get predicted class by taking argmax along class dimension
+        # Ensure inputs are properly formatted
+        y = y.long()  # Ensure labels are long type
         predicted_classes = torch.argmax(pred, dim=1)
-        # Compare predictions with ground truth and calculate accuracy
-        correct = (predicted_classes == y).sum().item()
-        acc = correct / y.size(0)
 
-        # Get binary mask of correct predictions
-        correct_mask = (predicted_classes == y).long()
+        # Verify shapes
+        assert predicted_classes.shape == y.shape, f"Shape mismatch: pred={predicted_classes.shape}, y={y.shape}"
 
-        # Called only on validation steps
+        # Ensure values are within valid range
+        assert torch.all(y < self.num_classes), f"Labels must be < {self.num_classes}"
+
+        correct = (predicted_classes == y).float()  # Use float for mean calculation
+        acc = correct.mean().item()
+
         if snr is not None:
             # Convert SNR values to indices (from -20:20:2 to 0:20)
-            snr_indices = ((snr + 20) / 2).long()
+            snr_indices = ((snr + 20) / 2).long().clamp(0, 19)  # Add clamp to ensure valid indices
 
             # For each SNR index, update total and correct counts
             for idx in range(20):
                 mask = (snr_indices == idx)
                 total = mask.sum().item()
-                correct = (mask & correct_mask.bool()).sum().item()
+                correct_count = (mask & (predicted_classes == y)).sum().item()
                 curr_correct, curr_total = self.snr_accuracy[idx]
-                self.snr_accuracy[idx] = (curr_correct + correct, curr_total + total)
+                self.snr_accuracy[idx] = (curr_correct + correct_count, curr_total + total)
 
             # Track modulation-based accuracy
             for mod_idx in range(self.num_classes):
                 mask = (y == mod_idx)
                 total = mask.sum().item()
-                correct = (mask & correct_mask.bool()).sum().item()
+                correct_count = (mask & (predicted_classes == y)).sum().item()
                 curr_correct, curr_total = self.mod_accuracy[mod_idx]
-                self.mod_accuracy[mod_idx] = (curr_correct + correct, curr_total + total)
+                self.mod_accuracy[mod_idx] = (curr_correct + correct_count, curr_total + total)
 
         return acc
 
@@ -215,3 +256,52 @@ class LatentClassifier(pl.LightningModule):
         self.epoch_batch_count = 0
         self.snr_accuracy = [(0,0) for _ in range(20)]
         self.mod_accuracy = [(0,0) for _ in range(self.num_classes)]
+
+    def on_validation_epoch_end(self):
+        """
+        Called at the end of validation epoch.
+        Creates basic visualizations of validation metrics only for first and last epoch.
+        """
+        try:
+            # Only log for first and last epoch
+            current_epoch = self.current_epoch
+            max_epochs = self.trainer.max_epochs
+
+            if current_epoch == 0 or current_epoch == max_epochs - 1:
+                if hasattr(self, 'example_batch'):
+                    example_batch = self.example_batch
+
+                    # Create basic scatter plot of timesteps vs SNR
+                    data = []
+                    snr = example_batch['snr']
+                    t = example_batch['t']
+                    context = example_batch['context']
+
+                    for s, time_step, c in zip(snr, t, context):
+                        data.append([
+                            s.item(),
+                            time_step.item(),
+                            self.label_names[c.item()]
+                        ])
+
+                    # Create and log wandb table
+                    table = wandb.Table(
+                        columns=["SNR", "Timestep", "Modulation"],
+                        data=data
+                    )
+
+                    # Log simple scatter plot with epoch information in title
+                    epoch_label = "First" if current_epoch == 0 else "Final"
+                    wandb.log({
+                        f"Timestep vs SNR ({epoch_label} Epoch)": wandb.plot.scatter(
+                            table,
+                            "SNR",
+                            "Timestep",
+                            title=f"Timestep Selection vs SNR - {epoch_label} Epoch"
+                        )
+                    })
+
+        except Exception as e:
+            print(f"Error in validation epoch end: {str(e)}")
+            import traceback
+            traceback.print_exc()

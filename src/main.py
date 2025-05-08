@@ -8,7 +8,7 @@ import lightning.pytorch as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
 from data.rfml_dataset_2016 import get_dataloaders, get_moco_dataloaders
-from callbacks import DiffusionVisualizationCallback, DiffusionTSNEVisualizationCallback
+from callbacks import DiffusionVisualizationCallback, DiffusionTSNEVisualizationCallback, DecisionBoundaryVisualizationCallback
 from utils.latent_scaling import calculate_latent_scaling_factor
 import os
 
@@ -154,6 +154,7 @@ def main(cfg: DictConfig):
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         diffusion.load_state_dict(checkpoint["state_dict"])
         diffusion.eval()
+        diffusion = torch.compile(diffusion)
 
         if cfg.vis_diffusion:
             for param in diffusion.parameters():
@@ -182,7 +183,7 @@ def main(cfg: DictConfig):
             encoder=encoder,
             label_names=label_names
         )
-        # classifier = torch.compile(classifier)
+        classifier = torch.compile(classifier)
 
         # Create checkpoint dir for classifier
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "classifier")
@@ -207,6 +208,7 @@ def main(cfg: DictConfig):
                     mode="max",
                 ),
                 LearningRateMonitor(logging_interval="step"),
+                DecisionBoundaryVisualizationCallback(every_n_epochs=1, create_animation=True,label_names=label_names),
             ],
         )
 
