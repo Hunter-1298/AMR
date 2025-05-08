@@ -33,7 +33,7 @@ class TimestepPredictor(nn.Module):
         return logits
 
 class LatentClassifier(pl.LightningModule):
-    def __init__(self, diffusion, encoder, classifier_head, learning_rate, num_classes, label_names, fine_tune_diffusion=False):
+    def __init__(self, diffusion, encoder, classifier_head, learning_rate, num_classes, label_names, fine_tune_diffusion=False, classifier_free=False):
         super().__init__()
         self.save_hyperparameters(ignore=['diffusion', 'encoder', 'classifier_head'])
 
@@ -45,6 +45,7 @@ class LatentClassifier(pl.LightningModule):
         self.criterion = torch.nn.CrossEntropyLoss()
         self.num_classes = num_classes
         self.label_names = label_names
+        self.classifier_fre = classifier_free
         # self.timestep_predictor = TimestepPredictor(in_channels=32, n_steps=diffusion.n_steps)
 
         # Add scheduling parameters (fixed typo here)
@@ -86,7 +87,11 @@ class LatentClassifier(pl.LightningModule):
             t = (t + jitter).clamp(0, self.n_steps - 1)
 
         # Diffusion & classification
-        pred_noise = self.diffusion(z, t, context)
+        if self.classifier_free:
+            classifier_free = torch.full_like(context, 11, device=self.device)
+            pred_noise = self.diffusion(z, t, classifier_free)
+        else:
+            pred_noise = self.diffusion(z, t, context)
         a = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
         am1 = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
         denoised = (z - am1*pred_noise)/a
@@ -126,16 +131,15 @@ class LatentClassifier(pl.LightningModule):
         t = ((1.0 - normalized_snr) * (self.n_steps - 1)).long()
         t = t.view(B)
 
-        # 3) Log metrics - use float for all calculations
-        self.log("val/avg_snr", snr.float().mean())
-        self.log("val/avg_t", t.float().mean())
-        self.log("val/t_std", t.float().std())
-
-        # 4) Denoising with SNR-based timestep
-        predicted_noise = self.diffusion(z, t, context)
+        # Diffusion & classification
+        if self.classifier_free:
+            classifier_free = torch.full_like(context, 11, device=self.device)
+            pred_noise = self.diffusion(z, t, classifier_free)
+        else:
+            pred_noise = self.diffusion(z, t, context)
         a_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
         am1_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
-        denoised_z = (z - am1_t * predicted_noise) / a_t
+        denoised_z = (z - am1_t * pred_noise) / a_t
 
         # 5) Classify
         logits_cls = self.classifier_head(denoised_z)
