@@ -1,26 +1,14 @@
 program: src/main.py
-method: bayes
+method: grid
 metric:
-  name: val_acc
-  goal: maximize
+    name: val_acc
+    goal: maximize
 parameters:
-  hyperparams.learning_rate:
-    distribution: uniform
-    min: 0.00005
-    max: 0.001
-  hyperparams.batch_size:
-    values: [32, 64, 128]
-  Transformer.dropout:
-    distribution: uniform
-    min: 0.1
-    max: 0.5
-  Transformer.num_heads:
-    values: [2, 4, 8]
-  Transformer.num_layers:
-    values: [2, 4, 6, 8]
+    Classifier.beta:
+        values: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
 
 command:
-  - ${env}
-  - python
-  - ${program}
-  - --multirun # allows hydra to accept multiple runs for sweeps
+    - ${env}
+    - python
+    - ${program}
+    - --multirun # allows hydra to accept multiple runs for sweeps

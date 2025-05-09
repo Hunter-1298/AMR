@@ -1,0 +1,235 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: null
+    params: null
+  help:
+    app_name: ${hydra.job.name}
+    header: '${hydra.help.app_name} is powered by Hydra.
+
+      '
+    footer: 'Powered by Hydra (https://hydra.cc)
+
+      Use --hydra-help to view Hydra specific help
+
+      '
+    template: '${hydra.help.header}
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (group=option)
+
+
+      $APP_CONFIG_GROUPS
+
+
+      == Config ==
+
+      Override anything in the config (foo.bar=value)
+
+
+      $CONFIG
+
+
+      ${hydra.help.footer}
+
+      '
+  hydra_help:
+    template: 'Hydra (${hydra.runtime.version})
+
+      See https://hydra.cc for more info.
+
+
+      == Flags ==
+
+      $FLAGS_HELP
+
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (For example, append hydra/job_logging=disabled
+      to command line)
+
+
+      $HYDRA_CONFIG_GROUPS
+
+
+      Use ''--cfg hydra'' to Show the Hydra config.
+
+      '
+    hydra_help: ???
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][HYDRA] %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+    loggers:
+      logging_example:
+        level: DEBUG
+    disable_existing_loggers: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+    root:
+      level: INFO
+      handlers:
+      - console
+      - file
+    disable_existing_loggers: false
+  env: {}
+  mode: MULTIRUN
+  searchpath: []
+  callbacks: {}
+  output_subdir: .hydra
+  overrides:
+    hydra:
+    - hydra.mode=MULTIRUN
+    task: []
+  job:
+    name: main
+    chdir: null
+    override_dirname: ''
+    id: ???
+    num: ???
+    config_name: hydra-config
+    env_set: {}
+    env_copy: []
+    config:
+      override_dirname:
+        kv_sep: '='
+        item_sep: ','
+        exclude_keys: []
+  runtime:
+    version: 1.3.2
+    version_base: '1.1'
+    cwd: /home/hshayde/Projects/MIT/AMR
+    config_sources:
+    - path: hydra.conf
+      schema: pkg
+      provider: hydra
+    - path: /home/hshayde/Projects/MIT/AMR/configs
+      schema: file
+      provider: main
+    - path: ''
+      schema: structured
+      provider: schema
+    output_dir: ???
+    choices:
+      hydra/env: default
+      hydra/callbacks: null
+      hydra/job_logging: default
+      hydra/hydra_logging: default
+      hydra/hydra_help: default
+      hydra/help: default
+      hydra/sweeper: basic
+      hydra/launcher: basic
+      hydra/output: default
+  verbose: false
+project_name: Classifier_Condition_vs_nonCondition
+run_name: Contrastive_Classifier_Condition_LinearProbe_sigmoidSNR
+train_encoder: false
+contrastive_encoder: true
+train_diffusion: false
+conditon: true
+vis_diffusion: false
+train_classifier: true
+classifier_free: false
+fine_tune_diffusion: false
+encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
+diffusion_checkpoint_name: contrastive_diffusion_condition_val_loss=0.2765.ckpt
+mode: online
+debug: false
+log_model: true
+seed: 42
+hyperparams:
+  epochs: 200
+  classifier_epochs: 50
+  learning_rate: 0.001
+  batch_size: 1024
+  contrastive_batch_size: 4096
+  dropout: 0.25
+  hidden_dim: 32
+  feature_dim: 16
+  num_classes: 11
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+Encoder:
+  _target_: models.latent_encoder_models.MoCoV3Encoder.MoCoV3Encoder
+  learning_rate: 0.0001
+  encoder:
+    _target_: models.latent_encoder_models.resnet_encoder.ResNet1D
+Diffusion:
+  _target_: models.diffusion.latent_diffusion.LatentDiffusion
+  learning_rate: ${hyperparams.learning_rate}
+  n_steps: 500
+  linear_start: 0.0001
+  linear_end: 0.01
+  weight_decay: 0.01
+  latent_scaling: 1.1981
+  unet:
+    _target_: models.diffusion.unet_1d.UNet1DModel
+    sample_size: 64
+    in_channels: 32
+    out_channels: 32
+    down_block_types:
+    - DownResnetBlock1D
+    - AttnDownBlock1D
+    - AttnDownBlock1D
+    up_block_types:
+    - AttnUpBlock1D
+    - AttnUpBlock1D
+    - UpResnetBlock1D
+    mid_block_type: UNetMidBlock1D
+    block_out_channels:
+    - 32
+    - 64
+    - 128
+    layers_per_block: 3
+    condition: ${conditon}
+    conditional: 11
+Classifier:
+  _target_: models.classifier.classifier.LatentClassifier
+  learning_rate: 0.001
+  beta: 0.25
+  fine_tune_diffusion: ${fine_tune_diffusion}
+  num_classes: ${hyperparams.num_classes}
+  classifier_free: ${classifier_free}
+  classifier_head:
+    _target_: models.classifier.conv_classifier.Conv1DHead
+    num_classes: ${hyperparams.num_classes}
+dataset:
+  iq: true
+  batch_size: ${hyperparams.batch_size}
+  contrastive_batch_size: ${hyperparams.contrastive_batch_size}
+  num_workers: 12
+  train_val_split:
+  - 0.8
+  - 0.2
+  random_seed: ${seed}

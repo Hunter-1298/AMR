@@ -1,0 +1,81 @@
+project_name: Classifier_Condition_vs_nonCondition
+run_name: Contrastive_Classifier_Condition_LinearProbe_sigmoidSNR
+train_encoder: false
+contrastive_encoder: true
+train_diffusion: false
+conditon: true
+vis_diffusion: false
+train_classifier: true
+classifier_free: false
+fine_tune_diffusion: false
+encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
+diffusion_checkpoint_name: contrastive_diffusion_condition_val_loss=0.2765.ckpt
+mode: online
+debug: false
+log_model: true
+seed: 42
+hyperparams:
+  epochs: 200
+  classifier_epochs: 50
+  learning_rate: 0.001
+  batch_size: 1024
+  contrastive_batch_size: 4096
+  dropout: 0.25
+  hidden_dim: 32
+  feature_dim: 16
+  num_classes: 11
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+Encoder:
+  _target_: models.latent_encoder_models.MoCoV3Encoder.MoCoV3Encoder
+  learning_rate: 0.0001
+  encoder:
+    _target_: models.latent_encoder_models.resnet_encoder.ResNet1D
+Diffusion:
+  _target_: models.diffusion.latent_diffusion.LatentDiffusion
+  learning_rate: ${hyperparams.learning_rate}
+  n_steps: 500
+  linear_start: 0.0001
+  linear_end: 0.01
+  weight_decay: 0.01
+  latent_scaling: 1.1981
+  unet:
+    _target_: models.diffusion.unet_1d.UNet1DModel
+    sample_size: 64
+    in_channels: 32
+    out_channels: 32
+    down_block_types:
+    - DownResnetBlock1D
+    - AttnDownBlock1D
+    - AttnDownBlock1D
+    up_block_types:
+    - AttnUpBlock1D
+    - AttnUpBlock1D
+    - UpResnetBlock1D
+    mid_block_type: UNetMidBlock1D
+    block_out_channels:
+    - 32
+    - 64
+    - 128
+    layers_per_block: 3
+    condition: ${conditon}
+    conditional: 11
+Classifier:
+  _target_: models.classifier.classifier.LatentClassifier
+  learning_rate: 0.001
+  beta: 0.25
+  fine_tune_diffusion: ${fine_tune_diffusion}
+  num_classes: ${hyperparams.num_classes}
+  classifier_free: ${classifier_free}
+  classifier_head:
+    _target_: models.classifier.conv_classifier.Conv1DHead
+    num_classes: ${hyperparams.num_classes}
+dataset:
+  iq: true
+  batch_size: ${hyperparams.batch_size}
+  contrastive_batch_size: ${hyperparams.contrastive_batch_size}
+  num_workers: 12
+  train_val_split:
+  - 0.8
+  - 0.2
+  random_seed: ${seed}

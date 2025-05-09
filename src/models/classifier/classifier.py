@@ -1,10 +1,12 @@
 import torch
+import numpy as np
 import torch.nn as nn
 import wandb
 import torch.nn.functional as F
 import lightning.pytorch as pl
 import matplotlib.pyplot as plt
 import io
+from PIL import Image
 
 
 class TimestepPredictor(nn.Module):
@@ -33,7 +35,7 @@ class TimestepPredictor(nn.Module):
         return logits
 
 class LatentClassifier(pl.LightningModule):
-    def __init__(self, diffusion, encoder, classifier_head, learning_rate, num_classes, label_names, fine_tune_diffusion=False, classifier_free=False):
+    def __init__(self, diffusion, encoder, classifier_head, learning_rate, num_classes, label_names,beta=0.25, fine_tune_diffusion=False, classifier_free=False):
         super().__init__()
         self.save_hyperparameters(ignore=['diffusion', 'encoder', 'classifier_head'])
 
@@ -45,7 +47,8 @@ class LatentClassifier(pl.LightningModule):
         self.criterion = torch.nn.CrossEntropyLoss()
         self.num_classes = num_classes
         self.label_names = label_names
-        self.classifier_fre = classifier_free
+        self.classifier_free = classifier_free
+        self.beta = beta
         # self.timestep_predictor = TimestepPredictor(in_channels=32, n_steps=diffusion.n_steps)
 
         # Add scheduling parameters (fixed typo here)
@@ -72,12 +75,12 @@ class LatentClassifier(pl.LightningModule):
 
         # Map SNR to timesteps - convert SNR to float first
         snr = snr.float()  # Convert to float to avoid dtype issues
-        min_snr, max_snr = -20.0, 20.0  # Typical SNR range in dB
+        min_snr, max_snr = -20.0, 20.0  # SNR Range
         normalized_snr = (snr - min_snr) / (max_snr - min_snr)
         normalized_snr = torch.clamp(normalized_snr, 0.0, 1.0)
-
-        # Inverse mapping: high SNR → low timestep, low SNR → high timestep
-        t = ((1.0 - normalized_snr) * (self.n_steps - 1)).long()
+        x = normalized_snr * 2 - 1  # Map to [-1, 1]
+        transformed = 1.0 / (1.0 + torch.exp(x / self.beta))  #
+        t = (transformed * (self.n_steps - 1)).long()
         t = t.view(B)
 
         # Add small random jitter during training for exploration
@@ -125,10 +128,9 @@ class LatentClassifier(pl.LightningModule):
         snr = snr.float()  # Convert to float to avoid dtype issues
         min_snr, max_snr = -20.0, 20.0  # Typical SNR range in dB
         normalized_snr = (snr - min_snr) / (max_snr - min_snr)
-        normalized_snr = torch.clamp(normalized_snr, 0.0, 1.0)
-
-        # Inverse mapping: high SNR → low timestep, low SNR → high timestep
-        t = ((1.0 - normalized_snr) * (self.n_steps - 1)).long()
+        x = normalized_snr * 2 - 1  # Map to [-1, 1]
+        transformed = 1.0 / (1.0 + torch.exp(x / self.beta))  #beta = Temperature, controls tails and steepness
+        t = (transformed * (self.n_steps - 1)).long()
         t = t.view(B)
 
         # Diffusion & classification
@@ -264,45 +266,105 @@ class LatentClassifier(pl.LightningModule):
     def on_validation_epoch_end(self):
         """
         Called at the end of validation epoch.
-        Creates basic visualizations of validation metrics only for first and last epoch.
+        Creates clear visualization of SNR to timestep mapping with current beta value.
         """
         try:
-            # Only log for first and last epoch
+            # Only log for certain epochs to avoid too many plots
             current_epoch = self.current_epoch
             max_epochs = self.trainer.max_epochs
 
-            if current_epoch == 0 or current_epoch == max_epochs - 1:
+            if current_epoch == 0 or current_epoch == max_epochs - 1 or current_epoch % 10 == 0:
                 if hasattr(self, 'example_batch'):
                     example_batch = self.example_batch
 
-                    # Create basic scatter plot of timesteps vs SNR
-                    data = []
+                    # Get SNR and timestep data
                     snr = example_batch['snr']
                     t = example_batch['t']
-                    context = example_batch['context']
 
-                    for s, time_step, c in zip(snr, t, context):
-                        data.append([
-                            s.item(),
-                            time_step.item(),
-                            self.label_names[c.item()]
-                        ])
+                    # Create a clean, focused plot
+                    fig = plt.figure(figsize=(10, 6))
 
-                    # Create and log wandb table
-                    table = wandb.Table(
-                        columns=["SNR", "Timestep", "Modulation"],
-                        data=data
+                    # Plot the actual data points
+                    plt.scatter(
+                        snr.numpy(),
+                        t.numpy(),
+                        color='blue',
+                        alpha=0.7,
+                        s=40,
+                        label='Data points'
                     )
 
-                    # Log simple scatter plot with epoch information in title
-                    epoch_label = "First" if current_epoch == 0 else "Final"
+                    # Generate and plot the sigmoid mapping function
+                    test_snr = np.linspace(-20, 20, 100)
+                    norm_snr = (test_snr + 20) / 40
+                    x = norm_snr * 2 - 1
+                    sigmoid = 1.0 / (1.0 + np.exp(x / self.beta))
+                    test_t = sigmoid * (self.n_steps - 1)
+                    plt.plot(test_snr, test_t, 'r-', linewidth=2, alpha=0.8,
+                            label=f'Sigmoid (β={self.beta:.3f})')
+
+                    # Add linear mapping for comparison
+                    linear_t = (1 - norm_snr) * (self.n_steps - 1)
+                    plt.plot(test_snr, linear_t, 'g--', linewidth=1.5, alpha=0.6,
+                            label='Linear mapping')
+
+                    # Style the plot
+                    plt.xlabel('SNR (dB)', fontsize=12)
+                    plt.ylabel('Timestep', fontsize=12)
+                    plt.title(f'SNR to Timestep Mapping (β={self.beta:.3f}, Epoch {current_epoch})',
+                            fontsize=14)
+                    plt.grid(True, alpha=0.3)
+                    plt.legend(frameon=True, fontsize=10)
+
+                    # Add shaded regions to indicate SNR quality
+                    plt.axvspan(-20, -10, alpha=0.1, color='red', label='_nolegend_')
+                    plt.axvspan(-10, 0, alpha=0.1, color='orange', label='_nolegend_')
+                    plt.axvspan(0, 10, alpha=0.1, color='yellow', label='_nolegend_')
+                    plt.axvspan(10, 20, alpha=0.1, color='green', label='_nolegend_')
+
+                    # Add annotations for SNR regions
+                    plt.text(-18, self.n_steps * 0.1, "Very low SNR", rotation=90,
+                            fontsize=8, alpha=0.7)
+                    plt.text(-8, self.n_steps * 0.1, "Low SNR", rotation=90,
+                            fontsize=8, alpha=0.7)
+                    plt.text(2, self.n_steps * 0.1, "Medium SNR", rotation=90,
+                            fontsize=8, alpha=0.7)
+                    plt.text(12, self.n_steps * 0.1, "High SNR", rotation=90,
+                            fontsize=8, alpha=0.7)
+
+                    # Adjust y-axis to show full timestep range
+                    plt.ylim(0, self.n_steps)
+
+                    # Save the figure to buffer
+                    buf = io.BytesIO()
+                    plt.savefig(buf, format='png', dpi=150)
+                    buf.seek(0)
+
+                    # Create wandb Image
+                    img = wandb.Image(Image.open(buf))
+                    plt.close()
+
+                    # Log the image with consistent key for run coloring
+                    self.logger.experiment.log({
+                        # Use a consistent key across runs for color differentiation
+                        "snr_timestep_mapping": img,
+                        "beta_value": self.beta,
+                        "epoch": current_epoch
+                    }, step=self.global_step)
+
+                    # Also create a simple scatter plot for WandB's interactive features
+                    data = [[s.item(), t.item()] for s, t in zip(snr, t)]
+                    table = wandb.Table(columns=["SNR", "Timestep"], data=data)
+
                     wandb.log({
-                        f"Timestep vs SNR ({epoch_label} Epoch)": wandb.plot.scatter(
+                        "snr_timestep_interactive": wandb.plot.scatter(
                             table,
                             "SNR",
                             "Timestep",
-                            title=f"Timestep Selection vs SNR - {epoch_label} Epoch"
-                        )
+                            title=f"SNR to Timestep (β={self.beta:.3f})"
+                        ),
+                        "beta_value": self.beta,
+                        "epoch": current_epoch
                     })
 
         except Exception as e:
