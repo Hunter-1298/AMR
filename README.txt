@@ -10,6 +10,7 @@ A research framework for applying **latent diffusion models** to **radio signal 
 - 🔁 **Variational Autoencoder (VAE)** for signal compression  
 - 🧠 **Latent Classifier** for modulation recognition  
 - 🎨 **Visualizations**: t-SNE plots, diffusion sampling, bottleneck features  
+- 🎨 **Contrastivly learned encoder and LDM
 - 🧪 Designed for **research**, extensibility, and experiment tracking  
 
 ---
