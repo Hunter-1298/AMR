@@ -94,8 +94,10 @@ class LatentClassifier(pl.LightningModule):
             classifier_free = torch.full_like(context, 11, device=self.device)
             pred_noise = self.diffusion(z, t, classifier_free)
         else:
-            shifted_context = (context + 1) % self.num_classes
-            pred_noise = self.diffusion(z, t, context)
+            # Randomly shuffle the context for each sample in the batch
+            random_indices = torch.randperm(B, device=context.device)
+            shuffled_context = context[random_indices]
+            pred_noise = self.diffusion(z, t, shuffled_context)
 
         a = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
         am1 = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
@@ -140,8 +142,9 @@ class LatentClassifier(pl.LightningModule):
             classifier_free = torch.full_like(context, 11, device=self.device)
             pred_noise = self.diffusion(z, t, classifier_free)
         else:
-            shifted_context = (context + 1) % self.num_classes
-            pred_noise = self.diffusion(z, t, context)
+            random_indices = torch.randperm(B, device=context.device)
+            shuffled_context = context[random_indices]
+            pred_noise = self.diffusion(z, t, shuffled_context)
         a_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
         am1_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
         denoised_z = (z - am1_t * pred_noise) / a_t

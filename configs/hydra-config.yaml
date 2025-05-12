@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Classifier_Condition_vs_nonCondition
-run_name: Contrastive_Classifier_Condition_LinearProbe
+run_name: Contrastive_Classifier_Condition_LinearProbe_100epochs_ShuffledClass
 train_encoder: False
 contrastive_encoder: True
 train_diffusion: False
@@ -25,7 +25,7 @@ seed: 42
 hyperparams:
     # Training
     epochs: 200
-    classifier_epochs: 50
+    classifier_epochs: 100
     learning_rate: .001
     batch_size: 1024
     contrastive_batch_size: 4096 # make this high so we can use all negatives in batch without increase batch for diffusion model
