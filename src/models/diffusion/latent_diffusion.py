@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import lightning as L
 from typing import Optional, Dict, Any, Tuple
 from .unet_1d import UNet1DModel
@@ -18,6 +19,7 @@ class LatentDiffusion(L.LightningModule):
         latent_scaling: float = 0.18215,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-2,
+        contrastive_bottleneck: bool = True,
     ):
         super().__init__()
         # save hyperparms to lightning and wandb
@@ -26,10 +28,16 @@ class LatentDiffusion(L.LightningModule):
         self.learning_rate = learning_rate
         self.n_steps = n_steps
         self.latent_scaling = latent_scaling
+        self.contrastive_bottleneck = contrastive_bottleneck
 
         # Initialize UNet for latent space diffusion and the encoder for sampling
         self.unet = unet
         self.encoder = encoder
+        self.contrastive_projector = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64)
+        )
 
         # Create noise schedule
         beta = (
@@ -162,12 +170,40 @@ class LatentDiffusion(L.LightningModule):
 
         return loss, predicted_noise
 
+    def info_nce_loss(self, z1, z2, temperature=0.07):
+        """
+        Computes InfoNCE loss between two batches of embeddings.
+        z1: (N, D) or (N, T, D)
+        z2: (N, D) or (N, T, D)
+        """
+        # If input is 3D, apply global average pooling over time dimension
+        if z1.dim() == 3:
+            z1 = F.adaptive_avg_pool1d(z1, 1).squeeze(-1)
+        if z2.dim() == 3:
+            z2 = F.adaptive_avg_pool1d(z2, 1).squeeze(-1)
+
+        # Normalize to unit vectors
+        z1 = F.normalize(z1, dim=1)
+        z2 = F.normalize(z2, dim=1)
+
+        N = z1.shape[0]
+
+        # Compute cosine similarity matrix: (N, N)
+        logits = torch.matmul(z1, z2.T) / temperature  # shape: [N, N]
+
+        # Labels: diagonal entries are positives
+        labels = torch.arange(N, device=z1.device)
+
+        # Cross-entropy loss
+        loss = F.cross_entropy(logits, labels)
+        return loss
+
     def training_step(self, batch, batch_idx) -> torch.Tensor:
         """
         Lightning training step
 
         Args:
-            batch: Batch of data containing (x, context, _)
+            batch: Batch of data containing (x, context, snr)
             batch_idx: Batch index
 
         Returns:
@@ -177,18 +213,39 @@ class LatentDiffusion(L.LightningModule):
         x, context, snr = batch
 
         # Sample random timesteps
-        t = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+        t1 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+        # Generate t2 and ensure it's different from t1
+        t2 = torch.randint(0, self.n_steps - 1, (x.shape[0],), device=self.device).long()
+        # For each element where t2 == t1, increment t2 to make it different
+        t2 = t2 + (t2 >= t1).long()
 
         # Encode input to latent space
         z = self.encode(x)
 
-        # Calculate diffusion loss
-        noise_loss, predicted_noise = self.p_losses(z, t, context)
+        # ===== First forward pass =====
+        noise_loss, predicted_noise = self.p_losses(z, t1, context)
+        z1_bottleneck = self.unet.bottleneck_activations.detach()  # shape: (B, bottleneck_dim)
 
-        # Log loss
-        self.log("train_loss", noise_loss, prog_bar=True)
+        # ===== Second forward pass (new timestep) =====
+        _, _ = self.p_losses(z, t2, context)
+        z2_bottleneck = self.unet.bottleneck_activations.detach()
 
-        return noise_loss
+        # ===== Contrastive projection head =====
+        z1_proj = self.contrastive_projector(z1_bottleneck)
+        z2_proj = self.contrastive_projector(z2_bottleneck)
+
+        # ===== Compute InfoNCE loss =====
+        contrastive_loss = self.info_nce_loss(z1_proj, z2_proj)
+
+        # ===== Total loss =====
+        total_loss = noise_loss + 0.05 * contrastive_loss
+
+        # Log losses
+        self.log("train/noise_loss", noise_loss, prog_bar=True)
+        self.log("train/contrastive_loss", contrastive_loss, prog_bar=True)
+        self.log("train/total_loss", total_loss, prog_bar=True)
+
+        return total_loss
 
     def validation_step(self, batch, batch_idx) -> torch.Tensor:
         """
@@ -205,22 +262,39 @@ class LatentDiffusion(L.LightningModule):
         x, context, snr = batch
 
         # Sample random timesteps
-        t = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+        t1 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+        # Generate t2 and ensure it's different from t1
+        t2 = torch.randint(0, self.n_steps - 1, (x.shape[0],), device=self.device).long()
+        # For each element where t2 == t1, increment t2 to make it different
+        t2 = t2 + (t2 >= t1).long()
 
         # Encode input to latent space
         z = self.encode(x)
 
-        # Calculate diffusion loss
-        noise_loss, predicted_noise = self.p_losses(z, t, context)
+        # ===== First forward pass =====
+        noise_loss, predicted_noise = self.p_losses(z, t1, context)
+        z1_bottleneck = self.unet.bottleneck_activations.detach()  # shape: (B, bottleneck_dim)
 
-        # Log loss
-        self.log("val_loss", noise_loss, prog_bar=True)
+        # ===== Second forward pass (new timestep) =====
+        _, _ = self.p_losses(z, t2, context)
+        z2_bottleneck = self.unet.bottleneck_activations.detach()
 
-        # save first batch of visualizations
-        if batch_idx == 0:
-            self.example_batch = batch
+        # ===== Contrastive projection head =====
+        z1_proj = self.contrastive_projector(z1_bottleneck)
+        z2_proj = self.contrastive_projector(z2_bottleneck)
 
-        return noise_loss
+        # ===== Compute InfoNCE loss =====
+        contrastive_loss = self.info_nce_loss(z1_proj, z2_proj)
+
+        # ===== Total loss =====
+        total_loss = noise_loss + 0.05 * contrastive_loss
+
+        # Log losses
+        self.log("val/noise_loss", noise_loss, prog_bar=True)
+        self.log("val/contrastive_loss", contrastive_loss, prog_bar=True)
+        self.log("val_loss", total_loss, prog_bar=True)
+
+        return total_loss
 
     def configure_optimizers(self):  # pyright: ignore
         optimizer = torch.optim.AdamW(

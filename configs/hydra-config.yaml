@@ -1,14 +1,18 @@
 # Global configurations
-project_name: Classifier_Condition_vs_nonCondition
-run_name: Contrastive_Classifier_Condition_LinearProbe_100epochs_ShuffledClass
+project_name: Contrastvie_Bottleneck
+run_name: Bottleneck_EncoderFrozen_0.05Contastive_Scale
 train_encoder: False
+# Latent Diffusion Settings #
 contrastive_encoder: True
-train_diffusion: False
+train_diffusion: True
 conditon: True
+contrastive_bottleneck: True
 vis_diffusion: False
-train_classifier: True
+# Classifier Settings #
+train_classifier: False
 classifier_free: False
 fine_tune_diffusion: False
+# Checkpoints to load #
 encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
 # checkpoint for reconstruction vae
 # encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
@@ -60,6 +64,7 @@ Diffusion:
     linear_end: 0.01 # ending value for the beta schedule
     weight_decay: 1e-2
     latent_scaling: 1.1981 # contrastive scaling # 2.98697 - reconstruction encoder # False - set to false if we want to recalcualte
+    contrastive_bottleneck: ${contrastive_bottleneck}
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
         sample_size: 64
