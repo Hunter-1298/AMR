@@ -19,7 +19,7 @@ class LatentDiffusion(L.LightningModule):
         latent_scaling: float = 0.18215,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-2,
-        contrastive_bottleneck: bool = True,
+        diffusion_contrastive: str = "bottleneck",
     ):
         super().__init__()
         # save hyperparms to lightning and wandb
@@ -28,15 +28,13 @@ class LatentDiffusion(L.LightningModule):
         self.learning_rate = learning_rate
         self.n_steps = n_steps
         self.latent_scaling = latent_scaling
-        self.contrastive_bottleneck = contrastive_bottleneck
+        self.diffusion_contrastive = diffusion_contrastive
 
         # Initialize UNet for latent space diffusion and the encoder for sampling
         self.unet = unet
         self.encoder = encoder
         self.contrastive_projector = nn.Sequential(
-            nn.Linear(16, 32),
-            nn.ReLU(),
-            nn.Linear(32, 64)
+            nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 128)
         )
 
         # Create noise schedule
@@ -212,32 +210,48 @@ class LatentDiffusion(L.LightningModule):
         # Unpack batch
         x, context, snr = batch
 
-        # Sample random timesteps
-        t1 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
-        # Generate t2 and ensure it's different from t1
-        t2 = torch.randint(0, self.n_steps - 1, (x.shape[0],), device=self.device).long()
-        # For each element where t2 == t1, increment t2 to make it different
-        t2 = t2 + (t2 >= t1).long()
-
         # Encode input to latent space
         z = self.encode(x)
 
-        # ===== First forward pass =====
-        noise_loss, predicted_noise = self.p_losses(z, t1, context)
-        z1_bottleneck = self.unet.bottleneck_activations.detach()  # shape: (B, bottleneck_dim)
+        # Sample random timesteps
+        t1 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+        t2 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
 
-        # ===== Second forward pass (new timestep) =====
-        _, _ = self.p_losses(z, t2, context)
-        z2_bottleneck = self.unet.bottleneck_activations.detach()
+        # Add noise to input at different timesteps
+        z_noisy1, noise1 = self.q_sample(z, t1)
+        z_noisy2, noise2 = self.q_sample(z, t2)
 
-        # ===== Contrastive projection head =====
-        z1_proj = self.contrastive_projector(z1_bottleneck)
-        z2_proj = self.contrastive_projector(z2_bottleneck)
+        # Predict noise
+        predicted_noise1 = self.forward(z_noisy1, t1, context)
+        predicted_noise2 = self.forward(z_noisy2, t2, context)
 
-        # ===== Compute InfoNCE loss =====
+        # Calculate noise prediction loss
+        noise_loss1 = F.mse_loss(noise1, predicted_noise1)
+        noise_loss2 = F.mse_loss(noise2, predicted_noise2)
+        noise_loss = (noise_loss1 + noise_loss2) / 2
+
+        # Get denoised representations from each prediction
+        # Using the predicted noise to reconstruct the clean signal
+        sqrt_alpha_bar_t1 = self.sqrt_alpha_bar[t1].view(-1, 1, 1)
+        sqrt_one_minus_alpha_bar_t1 = self.sqrt_one_minus_alpha_bar[t1].view(-1, 1, 1)
+        z_denoised1 = (z_noisy1 - sqrt_one_minus_alpha_bar_t1 * predicted_noise1) / sqrt_alpha_bar_t1
+
+        sqrt_alpha_bar_t2 = self.sqrt_alpha_bar[t2].view(-1, 1, 1)
+        sqrt_one_minus_alpha_bar_t2 = self.sqrt_one_minus_alpha_bar[t2].view(-1, 1, 1)
+        z_denoised2 = (z_noisy2 - sqrt_one_minus_alpha_bar_t2 * predicted_noise2) / sqrt_alpha_bar_t2
+
+        # Apply global pooling to get vector representations
+        z1_pooled = F.adaptive_avg_pool1d(z_denoised1, 1).squeeze(-1)
+        z2_pooled = F.adaptive_avg_pool1d(z_denoised2, 1).squeeze(-1)
+
+        # Project to contrastive space
+        z1_proj = self.contrastive_projector(z1_pooled)
+        z2_proj = self.contrastive_projector(z2_pooled)
+
+        # Compute InfoNCE loss
         contrastive_loss = self.info_nce_loss(z1_proj, z2_proj)
 
-        # ===== Total loss =====
+        # Total loss
         total_loss = noise_loss + 0.05 * contrastive_loss
 
         # Log losses
@@ -249,10 +263,10 @@ class LatentDiffusion(L.LightningModule):
 
     def validation_step(self, batch, batch_idx) -> torch.Tensor:
         """
-        Lightning validation step
+        Lightning validation step using denoised representations for contrastive learning
 
         Args:
-            batch: Batch of data containing (x, context, _)
+            batch: Batch of data containing (x, context, snr)
             batch_idx: Batch index
 
         Returns:
@@ -261,38 +275,58 @@ class LatentDiffusion(L.LightningModule):
         # Unpack batch
         x, context, snr = batch
 
-        # Sample random timesteps
-        t1 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
-        # Generate t2 and ensure it's different from t1
-        t2 = torch.randint(0, self.n_steps - 1, (x.shape[0],), device=self.device).long()
-        # For each element where t2 == t1, increment t2 to make it different
-        t2 = t2 + (t2 >= t1).long()
-
         # Encode input to latent space
         z = self.encode(x)
 
-        # ===== First forward pass =====
-        noise_loss, predicted_noise = self.p_losses(z, t1, context)
-        z1_bottleneck = self.unet.bottleneck_activations.detach()  # shape: (B, bottleneck_dim)
+        # Sample random timesteps
+        t1 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+        t2 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
 
-        # ===== Second forward pass (new timestep) =====
-        _, _ = self.p_losses(z, t2, context)
-        z2_bottleneck = self.unet.bottleneck_activations.detach()
+        # Add noise to input at different timesteps
+        z_noisy1, noise1 = self.q_sample(z, t1)
+        z_noisy2, noise2 = self.q_sample(z, t2)
 
-        # ===== Contrastive projection head =====
-        z1_proj = self.contrastive_projector(z1_bottleneck)
-        z2_proj = self.contrastive_projector(z2_bottleneck)
+        # Predict noise
+        predicted_noise1 = self.forward(z_noisy1, t1, context)
+        predicted_noise2 = self.forward(z_noisy2, t2, context)
 
-        # ===== Compute InfoNCE loss =====
+        # Calculate noise prediction loss
+        noise_loss1 = F.mse_loss(noise1, predicted_noise1)
+        noise_loss2 = F.mse_loss(noise2, predicted_noise2)
+        noise_loss = (noise_loss1 + noise_loss2) / 2
+
+        # Get denoised representations from each prediction
+        # Using the predicted noise to reconstruct the clean signal
+        sqrt_alpha_bar_t1 = self.sqrt_alpha_bar[t1].view(-1, 1, 1)
+        sqrt_one_minus_alpha_bar_t1 = self.sqrt_one_minus_alpha_bar[t1].view(-1, 1, 1)
+        z_denoised1 = (z_noisy1 - sqrt_one_minus_alpha_bar_t1 * predicted_noise1) / sqrt_alpha_bar_t1
+
+        sqrt_alpha_bar_t2 = self.sqrt_alpha_bar[t2].view(-1, 1, 1)
+        sqrt_one_minus_alpha_bar_t2 = self.sqrt_one_minus_alpha_bar[t2].view(-1, 1, 1)
+        z_denoised2 = (z_noisy2 - sqrt_one_minus_alpha_bar_t2 * predicted_noise2) / sqrt_alpha_bar_t2
+
+        # Apply global pooling to get vector representations
+        z1_pooled = F.adaptive_avg_pool1d(z_denoised1, 1).squeeze(-1)
+        z2_pooled = F.adaptive_avg_pool1d(z_denoised2, 1).squeeze(-1)
+
+        # Project to contrastive space
+        z1_proj = self.contrastive_projector(z1_pooled)
+        z2_proj = self.contrastive_projector(z2_pooled)
+
+        # Compute InfoNCE loss
         contrastive_loss = self.info_nce_loss(z1_proj, z2_proj)
 
-        # ===== Total loss =====
+        # Total loss
         total_loss = noise_loss + 0.05 * contrastive_loss
 
         # Log losses
         self.log("val/noise_loss", noise_loss, prog_bar=True)
         self.log("val/contrastive_loss", contrastive_loss, prog_bar=True)
         self.log("val_loss", total_loss, prog_bar=True)
+
+        # Save example batch for visualization
+        if batch_idx == 0:
+            self.example_batch = batch
 
         return total_loss
 

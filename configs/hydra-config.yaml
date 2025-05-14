@@ -1,15 +1,15 @@
 # Global configurations
 project_name: Contrastvie_Bottleneck
-run_name: Bottleneck_EncoderFrozen_0.05Contastive_Scale
+run_name: DenoisedOutput_EncoderFrozen_0.01Contastive_Scale
 train_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
-train_diffusion: True
+train_diffusion: False
 conditon: True
-contrastive_bottleneck: True
+diffusion_contrastive: "bottleneck" #"output"
 vis_diffusion: False
 # Classifier Settings #
-train_classifier: False
+train_classifier: True
 classifier_free: False
 fine_tune_diffusion: False
 # Checkpoints to load #
@@ -17,7 +17,9 @@ encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
 # checkpoint for reconstruction vae
 # encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_no_condition_val_loss=0.2796.ckpt
-diffusion_checkpoint_name: contrastive_diffusion_condition_val_loss=0.2765.ckpt
+# diffusion_checkpoint_name: contrastive_diffusion_bottleneck_contrastive_condition_val_loss=0.3436.ckpt
+diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_condition_val_loss=0.3279.ckpt
+# diffusion_checkpoint_name: contrastive_diffusion_condition_val_loss=0.2765.ckpt
 # diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
 # diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0702.ckpt
 mode: online
@@ -64,7 +66,7 @@ Diffusion:
     linear_end: 0.01 # ending value for the beta schedule
     weight_decay: 1e-2
     latent_scaling: 1.1981 # contrastive scaling # 2.98697 - reconstruction encoder # False - set to false if we want to recalcualte
-    contrastive_bottleneck: ${contrastive_bottleneck}
+    diffusion_contrastive: ${diffusion_contrastive}
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
         sample_size: 64
@@ -81,7 +83,7 @@ Diffusion:
 
 Classifier:
     _target_: models.classifier.classifier.LatentClassifier
-    learning_rate: 0.001
+    learning_rate: 0.0001
     beta: 0.25 # temperature for sigmoid of snr -> timestep
     fine_tune_diffusion: ${fine_tune_diffusion}
     num_classes: ${hyperparams.num_classes}
