@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Contrastvie_Bottleneck
-run_name: DenoisedOutput_EncoderFrozen_0.01Contastive_Scale
+run_name: CleanVsDenoised_Contrastive
 train_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
@@ -18,7 +18,7 @@ encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
 # encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_no_condition_val_loss=0.2796.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_bottleneck_contrastive_condition_val_loss=0.3436.ckpt
-diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_condition_val_loss=0.3279.ckpt
+diffusion_checkpoint_name: denoised_vs_clean.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_condition_val_loss=0.2765.ckpt
 # diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
 # diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0702.ckpt
