@@ -176,6 +176,11 @@ class LatentDiffusion(L.LightningModule):
         # Unpack batch
         x, context, snr = batch
 
+        # we have to assign context in our modle to a value of 0-19 for snr ranges
+        snr_context = {x:idx for idx,x in enumerate(range(-20,20,2))}
+        context_cpu = snr.cpu().tolist()
+        context = torch.tensor([snr_context[x] for x in context_cpu], device=self.device)
+
         # Sample random timesteps
         t = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
 
@@ -203,6 +208,10 @@ class LatentDiffusion(L.LightningModule):
         """
         # Unpack batch
         x, context, snr = batch
+
+        snr_context = {x:idx for idx,x in enumerate(range(-20,20,2))}
+        context_cpu = snr.cpu().tolist()
+        context = torch.tensor([snr_context[x] for x in context_cpu], device=self.device)
 
         # Sample random timesteps
         t = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()

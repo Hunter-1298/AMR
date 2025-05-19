@@ -1,6 +1,6 @@
 # Global configurations
-project_name: Classifier_Condition_vs_nonCondition
-run_name: Contrastive_Classifier_Condition_LinearProbe
+project_name: SNR_Conditoned
+run_name: SNR_Conditoned_Clasiffier_Finetuned
 train_encoder: False
 contrastive_encoder: True
 train_diffusion: False
@@ -8,12 +8,13 @@ conditon: True
 vis_diffusion: False
 train_classifier: True
 classifier_free: False
-fine_tune_diffusion: False
+fine_tune_diffusion: True
 encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
 # checkpoint for reconstruction vae
 # encoder_checkpoint_name: vae_phaseepoch=96_val_loss=0.0005596.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_no_condition_val_loss=0.2796.ckpt
-diffusion_checkpoint_name: contrastive_diffusion_condition_val_loss=0.2765.ckpt
+# diffusion_checkpoint_name: contrastive_diffusion_condition_val_loss=0.2765.ckpt
+diffusion_checkpoint_name: snr_conditioned_val_loss=0.2794.ckpt
 # diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
 # diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0702.ckpt
 mode: online
@@ -72,7 +73,7 @@ Diffusion:
         block_out_channels: [32, 64, 128]
         layers_per_block: 3
         condition: ${conditon}
-        conditional: 11 # Class conditioning
+        conditional: 20 # 11# Class conditioning
 
 Classifier:
     _target_: models.classifier.classifier.LatentClassifier

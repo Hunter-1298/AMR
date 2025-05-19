@@ -95,7 +95,10 @@ class LatentClassifier(pl.LightningModule):
             pred_noise = self.diffusion(z, t, classifier_free)
         else:
             shifted_context = (context + 1) % self.num_classes
-            pred_noise = self.diffusion(z, t, context)
+            snr_context = {x:idx for idx,x in enumerate(range(-20,20,2))}
+            context_cpu = snr.cpu().tolist()
+            context_snr = torch.tensor([snr_context[x] for x in context_cpu], device=self.device)
+            pred_noise = self.diffusion(z, t, context_snr)
 
         a = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
         am1 = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
@@ -141,7 +144,10 @@ class LatentClassifier(pl.LightningModule):
             pred_noise = self.diffusion(z, t, classifier_free)
         else:
             shifted_context = (context + 1) % self.num_classes
-            pred_noise = self.diffusion(z, t, context)
+            snr_context = {x:idx for idx,x in enumerate(range(-20,20,2))}
+            context_cpu = snr.cpu().tolist()
+            context_snr = torch.tensor([snr_context[x] for x in context_cpu], device=self.device)
+            pred_noise = self.diffusion(z, t, context_snr)
         a_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
         am1_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
         denoised_z = (z - am1_t * pred_noise) / a_t
