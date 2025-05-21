@@ -112,7 +112,7 @@ def main(cfg: DictConfig):
 
     if cfg.train_diffusion:
         # Train Diffusion Model
-        model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
+        model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder, label_names=label_names)
         # model = torch.compile(model)
 
         # Create checkpoint dir
@@ -147,7 +147,7 @@ def main(cfg: DictConfig):
 
     else:
         # Load and freeze the diffusion model
-        diffusion = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
+        diffusion = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder, label_names=label_names)
         checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
         checkpoint_name = cfg.diffusion_checkpoint_name
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)

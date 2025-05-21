@@ -1,16 +1,16 @@
 # Global configurations
-project_name: Contrastvie_Bottleneck
-run_name: Different_Timestep_timestep_predictor_Classifier_Free
+project_name: Prototype_Embedding
+run_name: Contrastive_Denoised_Timesteps_Prototype_Condtion
 train_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
-train_diffusion: False
+train_diffusion: True
 conditon: True
 diffusion_contrastive: "bottleneck" #"output"
 vis_diffusion: False
 # Classifier Settings #
-train_classifier: True
-classifier_free: True
+train_classifier: False
+classifier_free: False
 fine_tune_diffusion: False
 # Checkpoints to load #
 encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
@@ -69,6 +69,7 @@ Diffusion:
     weight_decay: 1e-2
     latent_scaling: 1.1981 # contrastive scaling # 2.98697 - reconstruction encoder # False - set to false if we want to recalcualte
     diffusion_contrastive: ${diffusion_contrastive}
+    num_classes: ${hyperparams.num_classes}
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
         sample_size: 64

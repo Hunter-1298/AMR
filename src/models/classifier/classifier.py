@@ -71,6 +71,8 @@ class LatentClassifier(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, context, snr = batch
         z = self.diffusion.encode(x).float()
+        pred_class, class_logits = self.diffusion.embedding_conditioner(z)
+
         B = z.shape[0]
 
         # Map SNR to timesteps - convert SNR to float first
@@ -105,13 +107,13 @@ class LatentClassifier(pl.LightningModule):
         cls_loss = self.criterion(logits_cls, context)
 
         #timestep predictor
-        t_logits = self.timestep_predictor(denoised)
-        t_target = t
-        timestep_loss = F.cross_entropy(t_logits, t_target)
-        t_pred = torch.argmax(t_logits, dim=1)
-        t_acc = (t_pred == t_target).float().mean()
-        self.log("train/timestep_loss", timestep_loss)
-        self.log("train/timestep_acc", t_acc)
+        # t_logits = self.timestep_predictor(denoised)
+        # t_target = t
+        # timestep_loss = F.cross_entropy(t_logits, t_target)
+        # t_pred = torch.argmax(t_logits, dim=1)
+        # t_acc = (t_pred == t_target).float().mean()
+        # self.log("train/timestep_loss", timestep_loss)
+        # self.log("train/timestep_acc", t_acc)
 
 
         # Logging - use float everywhere
@@ -160,13 +162,13 @@ class LatentClassifier(pl.LightningModule):
         assert logits_cls.shape[1] == self.num_classes, f"Wrong pred shape: {logits_cls.shape}"
 
         #timestep predictor
-        t_logits = self.timestep_predictor(denoised_z)
-        t_target = t
-        timestep_loss = F.cross_entropy(t_logits, t_target)
-        t_pred = torch.argmax(t_logits, dim=1)
-        t_acc = (t_pred == t_target).float().mean()
-        self.log("val/timestep_loss", timestep_loss)
-        self.log("val/timestep_acc", t_acc)
+        # t_logits = self.timestep_predictor(denoised_z)
+        # t_target = t
+        # timestep_loss = F.cross_entropy(t_logits, t_target)
+        # t_pred = torch.argmax(t_logits, dim=1)
+        # t_acc = (t_pred == t_target).float().mean()
+        # self.log("val/timestep_loss", timestep_loss)
+        # self.log("val/timestep_acc", t_acc)
 
         # 6) Loss & metrics
         val_loss = self.criterion(logits_cls, context)
