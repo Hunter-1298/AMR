@@ -113,7 +113,7 @@ def main(cfg: DictConfig):
     if cfg.train_diffusion:
         # Train Diffusion Model
         model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder)
-        model = torch.compile(model)
+        # model = torch.compile(model)
 
         # Create checkpoint dir
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion_condition")

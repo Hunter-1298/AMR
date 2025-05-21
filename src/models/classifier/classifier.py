@@ -49,7 +49,7 @@ class LatentClassifier(pl.LightningModule):
         self.label_names = label_names
         self.classifier_free = classifier_free
         self.beta = beta
-        # self.timestep_predictor = TimestepPredictor(in_channels=32, n_steps=diffusion.n_steps)
+        self.timestep_predictor = TimestepPredictor(in_channels=32, n_steps=diffusion.n_steps)
 
         # Add scheduling parameters (fixed typo here)
         self.schedule_factor = 0.2  # Weight for mixture distribution
@@ -104,6 +104,16 @@ class LatentClassifier(pl.LightningModule):
         # Classification loss
         cls_loss = self.criterion(logits_cls, context)
 
+        #timestep predictor
+        t_logits = self.timestep_predictor(denoised)
+        t_target = t
+        timestep_loss = F.cross_entropy(t_logits, t_target)
+        t_pred = torch.argmax(t_logits, dim=1)
+        t_acc = (t_pred == t_target).float().mean()
+        self.log("train/timestep_loss", timestep_loss)
+        self.log("train/timestep_acc", t_acc)
+
+
         # Logging - use float everywhere
         self.log_dict({
             "train/loss": cls_loss,
@@ -148,6 +158,15 @@ class LatentClassifier(pl.LightningModule):
         logits_cls = self.classifier_head(denoised_z)
         pred_probs = F.softmax(logits_cls, dim=-1)
         assert logits_cls.shape[1] == self.num_classes, f"Wrong pred shape: {logits_cls.shape}"
+
+        #timestep predictor
+        t_logits = self.timestep_predictor(denoised_z)
+        t_target = t
+        timestep_loss = F.cross_entropy(t_logits, t_target)
+        t_pred = torch.argmax(t_logits, dim=1)
+        t_acc = (t_pred == t_target).float().mean()
+        self.log("val/timestep_loss", timestep_loss)
+        self.log("val/timestep_acc", t_acc)
 
         # 6) Loss & metrics
         val_loss = self.criterion(logits_cls, context)
