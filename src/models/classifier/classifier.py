@@ -96,7 +96,7 @@ class LatentClassifier(pl.LightningModule):
             classifier_free = torch.full_like(context, 11, device=self.device)
             pred_noise = self.diffusion(z, t, classifier_free)
         else:
-            pred_noise = self.diffusion(z, t, context)
+            pred_noise = self.diffusion(z, t, pred_class)
 
         a = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
         am1 = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
@@ -135,6 +135,7 @@ class LatentClassifier(pl.LightningModule):
 
         # 1) Encode
         z = self.diffusion.encode(x).float()
+        pred_class, class_logits = self.diffusion.embedding_conditioner(z)
         B = z.shape[0]
 
         # 2) Map SNR to timesteps - convert SNR to float first
@@ -151,7 +152,7 @@ class LatentClassifier(pl.LightningModule):
             classifier_free = torch.full_like(context, 11, device=self.device)
             pred_noise = self.diffusion(z, t, classifier_free)
         else:
-            pred_noise = self.diffusion(z, t, context)
+            pred_noise = self.diffusion(z, t, pred_class)
         a_t = self.diffusion.sqrt_alpha_bar[t].view(-1, 1, 1).float()
         am1_t = self.diffusion.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1).float()
         denoised_z = (z - am1_t * pred_noise) / a_t

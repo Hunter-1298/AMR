@@ -4,13 +4,13 @@ run_name: Contrastive_Denoised_Timesteps_Prototype_Condtion
 train_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
-train_diffusion: True
+train_diffusion: False
 conditon: True
 diffusion_contrastive: "bottleneck" #"output"
 vis_diffusion: False
 # Classifier Settings #
-train_classifier: False
-classifier_free: False
+train_classifier: True
+classifier_free: True
 fine_tune_diffusion: False
 # Checkpoints to load #
 encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
@@ -22,7 +22,8 @@ encoder_checkpoint_name: moco_encoder_val_loss=7.82.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_condition_val_loss=0.2765.ckpt
 # diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
 # diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0702.ckpt
-diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_condition_val_loss=0.3279.ckpt
+# diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_condition_val_loss=0.3279.ckpt
+diffusion_checkpoint_name: prototype.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_noncondition_val_loss=0.3309.ckpt
 mode: online
 debug: False

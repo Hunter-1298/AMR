@@ -13,6 +13,7 @@ import io
 from PIL import Image
 import wandb
 
+
 class EmbeddingConditioner(nn.Module):
     def __init__(self, num_classes, latent_dim=32, hidden_dim=64):
         super().__init__()
@@ -43,6 +44,7 @@ class EmbeddingConditioner(nn.Module):
         pred_class = torch.argmax(class_logits, dim=1)
 
         return pred_class, class_logits
+
 
 class LatentDiffusion(L.LightningModule):
     def __init__(
@@ -82,7 +84,7 @@ class LatentDiffusion(L.LightningModule):
         self.embedding_conditioner = EmbeddingConditioner(
             num_classes=num_classes,
             latent_dim=32,  # Adjust based on your encoder's output channels
-            hidden_dim=64
+            hidden_dim=64,
         )
 
         # Create noise schedule
@@ -277,8 +279,12 @@ class LatentDiffusion(L.LightningModule):
         # Let the class predictor learn for the first 10 epochs by itself first
         if self.current_epoch > 10:
             # Sample random timesteps
-            t1 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
-            t2 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+            t1 = torch.randint(
+                0, self.n_steps, (x.shape[0],), device=self.device
+            ).long()
+            t2 = torch.randint(
+                0, self.n_steps, (x.shape[0],), device=self.device
+            ).long()
 
             # Add noise to input at different timesteps
             z_noisy1, noise1 = self.q_sample(z, t1)
@@ -295,12 +301,20 @@ class LatentDiffusion(L.LightningModule):
 
             # Get denoised representations
             sqrt_alpha_bar_t1 = self.sqrt_alpha_bar[t1].view(-1, 1, 1)
-            sqrt_one_minus_alpha_bar_t1 = self.sqrt_one_minus_alpha_bar[t1].view(-1, 1, 1)
-            z_denoised1 = (z_noisy1 - sqrt_one_minus_alpha_bar_t1 * predicted_noise1) / sqrt_alpha_bar_t1
+            sqrt_one_minus_alpha_bar_t1 = self.sqrt_one_minus_alpha_bar[t1].view(
+                -1, 1, 1
+            )
+            z_denoised1 = (
+                z_noisy1 - sqrt_one_minus_alpha_bar_t1 * predicted_noise1
+            ) / sqrt_alpha_bar_t1
 
             sqrt_alpha_bar_t2 = self.sqrt_alpha_bar[t2].view(-1, 1, 1)
-            sqrt_one_minus_alpha_bar_t2 = self.sqrt_one_minus_alpha_bar[t2].view(-1, 1, 1)
-            z_denoised2 = (z_noisy2 - sqrt_one_minus_alpha_bar_t2 * predicted_noise2) / sqrt_alpha_bar_t2
+            sqrt_one_minus_alpha_bar_t2 = self.sqrt_one_minus_alpha_bar[t2].view(
+                -1, 1, 1
+            )
+            z_denoised2 = (
+                z_noisy2 - sqrt_one_minus_alpha_bar_t2 * predicted_noise2
+            ) / sqrt_alpha_bar_t2
 
             # Apply global pooling to get vector representations
             z1_pooled = F.adaptive_avg_pool1d(z_denoised1, 1).squeeze(-1)
@@ -324,11 +338,10 @@ class LatentDiffusion(L.LightningModule):
             # Update learning rate schedulers
             diff_sch.step()
 
-        # Log metrics
+            # Log metrics
             self.log("train/noise_loss", noise_loss, prog_bar=True)
             self.log("train/contrastive_loss", contrastive_loss, prog_bar=True)
             self.log("train/total_loss", diffusion_loss + cls_loss, prog_bar=True)
-
 
         return cls_loss  # Return value not used with manual optimization
 
@@ -353,7 +366,7 @@ class LatentDiffusion(L.LightningModule):
         pred_class, class_logits = self.embedding_conditioner(z)
 
         # Store predictions for confusion matrix
-        if not hasattr(self, 'val_preds'):
+        if not hasattr(self, "val_preds"):
             self.val_preds = []
             self.val_labels = []
 
@@ -372,8 +385,12 @@ class LatentDiffusion(L.LightningModule):
         # Only compute diffusion and contrastive losses after the first 10 epochs
         if self.current_epoch > 10:
             # Sample random timesteps
-            t1 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
-            t2 = torch.randint(0, self.n_steps, (x.shape[0],), device=self.device).long()
+            t1 = torch.randint(
+                0, self.n_steps, (x.shape[0],), device=self.device
+            ).long()
+            t2 = torch.randint(
+                0, self.n_steps, (x.shape[0],), device=self.device
+            ).long()
 
             # Add noise to input at different timesteps
             z_noisy1, noise1 = self.q_sample(z, t1)
@@ -391,12 +408,20 @@ class LatentDiffusion(L.LightningModule):
             # Get denoised representations from each prediction
             # Using the predicted noise to reconstruct the clean signal
             sqrt_alpha_bar_t1 = self.sqrt_alpha_bar[t1].view(-1, 1, 1)
-            sqrt_one_minus_alpha_bar_t1 = self.sqrt_one_minus_alpha_bar[t1].view(-1, 1, 1)
-            z_denoised1 = (z_noisy1 - sqrt_one_minus_alpha_bar_t1 * predicted_noise1) / sqrt_alpha_bar_t1
+            sqrt_one_minus_alpha_bar_t1 = self.sqrt_one_minus_alpha_bar[t1].view(
+                -1, 1, 1
+            )
+            z_denoised1 = (
+                z_noisy1 - sqrt_one_minus_alpha_bar_t1 * predicted_noise1
+            ) / sqrt_alpha_bar_t1
 
             sqrt_alpha_bar_t2 = self.sqrt_alpha_bar[t2].view(-1, 1, 1)
-            sqrt_one_minus_alpha_bar_t2 = self.sqrt_one_minus_alpha_bar[t2].view(-1, 1, 1)
-            z_denoised2 = (z_noisy2 - sqrt_one_minus_alpha_bar_t2 * predicted_noise2) / sqrt_alpha_bar_t2
+            sqrt_one_minus_alpha_bar_t2 = self.sqrt_one_minus_alpha_bar[t2].view(
+                -1, 1, 1
+            )
+            z_denoised2 = (
+                z_noisy2 - sqrt_one_minus_alpha_bar_t2 * predicted_noise2
+            ) / sqrt_alpha_bar_t2
 
             # Apply global pooling to get vector representations
             z1_pooled = F.adaptive_avg_pool1d(z_denoised1, 1).squeeze(-1)
@@ -419,6 +444,9 @@ class LatentDiffusion(L.LightningModule):
         else:
             # During the first 10 epochs, only use classification loss
             total_loss = cls_loss
+            self.log("val/cls_embed_loss", cls_loss, prog_bar=True)
+            # place a dummy loss so we can use total loss as a checkpoint
+            total_loss = 10
             self.log("val_loss", total_loss, prog_bar=True)
 
         # Save example batch for visualization
@@ -429,11 +457,17 @@ class LatentDiffusion(L.LightningModule):
 
     def configure_optimizers(self):
         # Separate optimizers for each component
-        diff_params = [p for n, p in self.named_parameters() if "embedding_conditioner" not in n]
+        diff_params = [
+            p for n, p in self.named_parameters() if "embedding_conditioner" not in n
+        ]
         cls_params = list(self.embedding_conditioner.parameters())
 
-        diff_optimizer = torch.optim.AdamW(diff_params, lr=self.learning_rate, weight_decay=1e-4)
-        cls_optimizer = torch.optim.AdamW(cls_params, lr=self.learning_rate, weight_decay=1e-4)
+        diff_optimizer = torch.optim.AdamW(
+            diff_params, lr=self.learning_rate, weight_decay=1e-4
+        )
+        cls_optimizer = torch.optim.AdamW(
+            cls_params, lr=self.learning_rate, weight_decay=1e-4
+        )
 
         diff_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             diff_optimizer,
@@ -455,11 +489,11 @@ class LatentDiffusion(L.LightningModule):
 
         return [diff_optimizer, cls_optimizer], [
             {"scheduler": diff_scheduler, "interval": "step"},
-            {"scheduler": cls_scheduler, "interval": "step"}
+            {"scheduler": cls_scheduler, "interval": "step"},
         ]
 
     def on_validation_epoch_end(self):
-        if hasattr(self, 'val_preds') and len(self.val_preds) > 0:
+        if hasattr(self, "val_preds") and len(self.val_preds) > 0:
             # Concatenate predictions and labels
             all_preds = torch.cat(self.val_preds).cpu().numpy()
             all_labels = torch.cat(self.val_labels).cpu().numpy()
@@ -470,31 +504,33 @@ class LatentDiffusion(L.LightningModule):
 
             # Normalize by row (true labels)
             row_sums = cm.sum(axis=1, keepdims=True)
-            cm_norm = np.divide(cm, row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0)
+            cm_norm = np.divide(
+                cm, row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0
+            )
 
             # Plot confusion matrix
             fig, ax = plt.subplots(figsize=(12, 10))
             sns.heatmap(
                 cm_norm,
                 annot=True,
-                fmt='.2f',
-                cmap='Blues',
+                fmt=".2f",
+                cmap="Blues",
                 xticklabels=label_names,
                 yticklabels=label_names,
-                ax=ax
+                ax=ax,
             )
 
-            plt.xticks(rotation=45, ha='right')
+            plt.xticks(rotation=45, ha="right")
             plt.yticks(rotation=0)
-            plt.xlabel('Predicted Label', fontsize=12)
-            plt.ylabel('True Label', fontsize=12)
-            plt.title('Confusion Matrix (Normalized by Row)', fontsize=14)
+            plt.xlabel("Predicted Label", fontsize=12)
+            plt.ylabel("True Label", fontsize=12)
+            plt.title("Confusion Matrix (Normalized by Row)", fontsize=14)
             plt.tight_layout()
 
             # Log to Weights & Biases
             if self.logger:
                 buf = io.BytesIO()
-                plt.savefig(buf, format='png', dpi=150)
+                plt.savefig(buf, format="png", dpi=150)
                 buf.seek(0)
                 img = Image.open(buf)
                 self.logger.experiment.log({"confusion_matrix": wandb.Image(img)})

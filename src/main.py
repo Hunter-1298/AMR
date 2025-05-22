@@ -5,10 +5,18 @@ from hydra.utils import get_original_cwd
 import wandb
 from omegaconf import DictConfig, OmegaConf
 import lightning.pytorch as L
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from lightning.pytorch.callbacks import (
+    ModelCheckpoint,
+    LearningRateMonitor,
+    EarlyStopping,
+)
 from lightning.pytorch.loggers import WandbLogger
 from data.rfml_dataset_2016 import get_dataloaders, get_moco_dataloaders
-from callbacks import DiffusionVisualizationCallback, DiffusionTSNEVisualizationCallback, DecisionBoundaryVisualizationCallback
+from callbacks import (
+    DiffusionVisualizationCallback,
+    DiffusionTSNEVisualizationCallback,
+    DecisionBoundaryVisualizationCallback,
+)
 from utils.latent_scaling import calculate_latent_scaling_factor
 import os
 
@@ -47,16 +55,18 @@ def main(cfg: DictConfig):
         print("Training VAE Encoder...")
         # Check to see if we need different train and test dataloaders
         if cfg.contrastive_encoder:
-            encoder_train_loader, encoder_val_loader, label_names = get_moco_dataloaders(train_loader, val_loader, cfg.dataset)
+            encoder_train_loader, encoder_val_loader, label_names = (
+                get_moco_dataloaders(train_loader, val_loader, cfg.dataset)
+            )
         else:
             encoder_train_loader, encoder_val_loader = train_loader, val_loader
 
         # Create and train encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
-        encoder = torch.compile(encoder)
+        # encoder = torch.compile(encoder)
 
         # Create checkpoint dir
-        dir = 'contrastive_encoder' if cfg.contrastive_encoder else 'encoder'
+        dir = "contrastive_encoder" if cfg.contrastive_encoder else "encoder"
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", dir)
         os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -83,7 +93,7 @@ def main(cfg: DictConfig):
                     monitor="val_loss",
                     patience=20,  # Stop after 20 epochs without improvement
                     mode="min",
-                    verbose=True
+                    verbose=True,
                 ),
             ],
         )
@@ -100,6 +110,7 @@ def main(cfg: DictConfig):
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         encoder.load_state_dict(checkpoint["state_dict"])
         encoder.eval()
+        # encoder = torch.compile(encoder)
         for param in encoder.parameters():
             param.requires_grad = False
 
@@ -112,11 +123,15 @@ def main(cfg: DictConfig):
 
     if cfg.train_diffusion:
         # Train Diffusion Model
-        model = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder, label_names=label_names)
+        model = hydra.utils.instantiate(
+            cfg.Diffusion, encoder=encoder, label_names=label_names
+        )
         # model = torch.compile(model)
 
         # Create checkpoint dir
-        checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "diffusion_condition")
+        checkpoint_dir = os.path.join(
+            get_original_cwd(), "checkpoints", "diffusion_condition"
+        )
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         # Set up trainer for MoE
@@ -137,7 +152,7 @@ def main(cfg: DictConfig):
                     save_top_k=3,
                     mode="min",
                 ),
-                LearningRateMonitor(logging_interval="step")
+                LearningRateMonitor(logging_interval="step"),
                 # DiffusionVisualizationCallback(every_n_epochs=5),
             ],
         )
@@ -147,7 +162,9 @@ def main(cfg: DictConfig):
 
     else:
         # Load and freeze the diffusion model
-        diffusion = hydra.utils.instantiate(cfg.Diffusion, encoder=encoder, label_names=label_names)
+        diffusion = hydra.utils.instantiate(
+            cfg.Diffusion, encoder=encoder, label_names=label_names
+        )
         checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
         checkpoint_name = cfg.diffusion_checkpoint_name
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
@@ -165,7 +182,9 @@ def main(cfg: DictConfig):
                 logger=wandb_logger,
                 callbacks=[
                     # DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True, label_names=label_names),
-                    DiffusionTSNEVisualizationCallback(every_n_epochs=1, create_animation=True,label_names=label_names)
+                    DiffusionTSNEVisualizationCallback(
+                        every_n_epochs=1, create_animation=True, label_names=label_names
+                    )
                 ],
             )
 
@@ -178,9 +197,9 @@ def main(cfg: DictConfig):
         # Create the classifier
         classifier = hydra.utils.instantiate(
             cfg.Classifier,
-            diffusion=diffusion, #pyright: ignore -- need to change model to diffusion in training
+            diffusion=diffusion,  # pyright: ignore -- need to change model to diffusion in training
             encoder=encoder,
-            label_names=label_names
+            label_names=label_names,
         )
         classifier = torch.compile(classifier)
 
@@ -207,7 +226,9 @@ def main(cfg: DictConfig):
                     mode="max",
                 ),
                 LearningRateMonitor(logging_interval="step"),
-                DecisionBoundaryVisualizationCallback(every_n_epochs=1, create_animation=True,label_names=label_names),
+                DecisionBoundaryVisualizationCallback(
+                    every_n_epochs=1, create_animation=True, label_names=label_names
+                ),
             ],
         )
 
