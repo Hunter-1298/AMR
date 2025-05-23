@@ -77,7 +77,10 @@ class RFMLDataset(Dataset):
             std = data.std(dim=2, keepdim=True)    # shape: [batch_size, 2, 1]
 
         # Apply normalization to each signal independently
-        return (data - mean) / (std + 1e-8)  # Add small epsilon to avoid division by zero
+        normalized = (data - mean) / (std + 1e-8)  # Add small epsilon to avoid division by zero
+
+        # Ensure values are between -1 and 1
+        return torch.clamp(normalized, -1.0, 1.0)
 
     def _process_signals(self, signals):
         i_data = signals[:,0,:]
