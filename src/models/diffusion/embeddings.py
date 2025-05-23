@@ -192,6 +192,17 @@ class LabelEmbedding(nn.Module):
         self.num_classes = num_classes
         self.dropout_prob = dropout_prob
 
+        # Initialize the null token (last embedding) to zeros and freeze it
+        if use_cfg_embedding:
+            with torch.no_grad():
+                self.embedding_table.weight[num_classes] = torch.zeros(hidden_size)
+            # Register a hook to ensure the null embedding stays at zero during training
+            def hook(grad):
+                if grad is not None:
+                    grad[num_classes] = torch.zeros_like(grad[num_classes])
+                return grad
+            self.embedding_table.weight.register_hook(hook)
+
     def token_drop(self, labels, force_drop_ids=None):
         """
         Drops labels to enable classifier-free guidance.
