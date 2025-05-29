@@ -111,8 +111,8 @@ def main(cfg: DictConfig):
         encoder.load_state_dict(checkpoint["state_dict"])
         encoder.eval()
         # encoder = torch.compile(encoder)
-        for param in encoder.parameters():
-            param.requires_grad = False
+        # for param in encoder.parameters():
+        #     param.requires_grad = False
 
     # Calculate scaling factor
     if not cfg.Diffusion.latent_scaling:
