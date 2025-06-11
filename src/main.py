@@ -153,7 +153,8 @@ def main(cfg: DictConfig):
                     mode="min",
                 ),
                 LearningRateMonitor(logging_interval="step"),
-                # DiffusionVisualizationCallback(every_n_epochs=5),
+                DiffusionTSNEVisualizationCallback(
+                    every_n_epochs=10, create_animation=True, label_names=label_names)
             ],
         )
 
