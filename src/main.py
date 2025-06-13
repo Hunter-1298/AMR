@@ -55,15 +55,16 @@ def main(cfg: DictConfig):
         print("Training VAE Encoder...")
         # Check to see if we need different train and test dataloaders
         if cfg.contrastive_encoder:
-            encoder_train_loader, encoder_val_loader, label_names = (
-                get_moco_dataloaders(train_loader, val_loader, cfg.dataset)
-            )
+            # encoder_train_loader, encoder_val_loader, label_names = (
+            #     get_moco_dataloaders(train_loader, val_loader, cfg.dataset)
+            # )
+            encoder_train_loader, encoder_val_loader = train_loader, val_loader
         else:
             encoder_train_loader, encoder_val_loader = train_loader, val_loader
 
         # Create and train encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
-        # encoder = torch.compile(encoder)
+        encoder = torch.compile(encoder)
 
         # Create checkpoint dir
         dir = "contrastive_encoder" if cfg.contrastive_encoder else "encoder"
@@ -82,11 +83,10 @@ def main(cfg: DictConfig):
             precision="16-mixed",
             callbacks=[
                 ModelCheckpoint(
-                    monitor="val_loss",
                     filename="{dir}{epoch:02d}_{val_loss:.7f}",
                     dirpath=checkpoint_dir,
-                    save_top_k=3,
-                    mode="min",
+                    save_last=True,
+                    every_n_epochs=1,
                 ),
                 LearningRateMonitor(logging_interval="step"),
                 EarlyStopping(
@@ -110,9 +110,39 @@ def main(cfg: DictConfig):
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         encoder.load_state_dict(checkpoint["state_dict"])
         encoder.eval()
+
         # encoder = torch.compile(encoder)
         # for param in encoder.parameters():
         #     param.requires_grad = False
+    if cfg.linear_probe_encoder:
+        print("Testing encoder with linear probe...")
+
+        # Create linear probe
+        linear_probe = hydra.utils.instantiate(cfg.ArcFaceLinearProbe, label_names=label_names, encoder=encoder)
+        # Create checkpoint dir
+        probe_trainer = L.Trainer(
+            max_epochs=50,  # Fewer epochs needed for linear probe
+            logger=wandb_logger,
+            default_root_dir=".",
+            log_every_n_steps=10,
+            accelerator="gpu",
+            devices=1,
+            strategy="auto",
+            precision="16-mixed",
+            callbacks=[
+                LearningRateMonitor(logging_interval="step"),
+                EarlyStopping(
+                    monitor="val_acc",
+                    patience=10,
+                    mode="max",
+                    verbose=True,
+                ),
+            ],
+        )
+
+        # Train linear probe
+        probe_trainer.fit(linear_probe, train_loader, val_loader)
+        print("Linear probe training complete")
 
     # Calculate scaling factor
     if not cfg.Diffusion.latent_scaling:

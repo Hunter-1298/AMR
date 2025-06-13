@@ -65,18 +65,36 @@ class RFMLDataset(Dataset):
         # invert the encoding
         self.decoded_hash = {value:key for key,value in self.encoded_hash.items()}
 
+    # def _normalize_data(self, data):
+    #     # data shape: [batch_size, 2, 128] or [2, 128]
+    #     # if len(data.shape) == 2:
+    #     #     power = torch.sqrt(torch.sum(data**2, dim=1, keepdim=True))
+    #     # else:  # batch mode
+    #     #     power = torch.sqrt(torch.sum(data**2, dim=2, keepdim=True))
+    #     # return data / (power + 1e-8)  # Add small epsilon to avoid division by zero
+    #     dims = (0, 2) if data.dim() == 3 else (1,)
+    #     mean = data.mean(dim=dims, keepdim=True)
+    #     std  = data.std(dim=dims, keepdim=True)
+    #     return (data - mean) / (std + 1e-8)
     def _normalize_data(self, data):
         # data shape: [batch_size, 2, 128] or [2, 128]
-        # if len(data.shape) == 2:
-        #     power = torch.sqrt(torch.sum(data**2, dim=1, keepdim=True))
-        # else:  # batch mode
-        #     power = torch.sqrt(torch.sum(data**2, dim=2, keepdim=True))
-        # return data / (power + 1e-8)  # Add small epsilon to avoid division by zero
-        dims = (0, 2) if data.dim() == 3 else (1,)
-        mean = data.mean(dim=dims, keepdim=True)
-        std  = data.std(dim=dims, keepdim=True)
-        return (data - mean) / (std + 1e-8)
 
+        if data.dim() == 3:  # batch mode [batch_size, 2, 128]
+            # Normalize each sample independently
+            normalized = torch.zeros_like(data)
+            for i in range(data.shape[0]):
+                sample = data[i]  # [2, 128]
+                sample_min = sample.min()
+                sample_max = sample.max()
+                sample_range = sample_max - sample_min
+                normalized[i] = 2 * (sample - sample_min) / (sample_range + 1e-8) - 1
+            return normalized
+
+        else:  # single sample [2, 128]
+            data_min = data.min()
+            data_max = data.max()
+            data_range = data_max - data_min
+            return 2 * (data - data_min) / (data_range + 1e-8) - 1
     def _process_signals(self, signals):
         i_data = signals[:,0,:]
         q_data = signals[:,1,:]
