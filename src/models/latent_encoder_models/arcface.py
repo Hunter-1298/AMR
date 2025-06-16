@@ -140,7 +140,7 @@ class EnhancedPhaseFrequencyAwareDecoder(nn.Module):
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Conv1d(32, 2, kernel_size=3, padding=1),  # Final I/Q channels
-            nn.Tanh(),
+            # nn.Tanh(),
         )
 
         # Enhanced constellation-aware refinement
@@ -206,7 +206,7 @@ class EnhancedPhaseFrequencyAwareDecoder(nn.Module):
             nn.BatchNorm1d(16),
             nn.ReLU(),
             nn.Conv1d(16, 2, kernel_size=3, padding=1),  # Output I/Q for this component
-            activation,
+            # activation,
         )
 
     def forward(self, latent):
@@ -381,7 +381,7 @@ class EnhancedConstellationRefiner(nn.Module):
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Conv1d(32, 2, kernel_size=3, padding=1),
-            nn.Tanh(),
+            # nn.Tanh(),
         )
 
     def forward(self, signal):
@@ -420,7 +420,7 @@ class PhaseConsistencyNetwork(nn.Module):
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Conv1d(32, 2, kernel_size=3, padding=1),
-            nn.Tanh(),
+            # nn.Tanh(),
         )
 
         # Learnable phase correction weight
@@ -477,7 +477,7 @@ class PhaseFrequencyAwareDecoder(nn.Module):
             nn.BatchNorm1d(16),
             nn.ReLU(),
             nn.Conv1d(16, 2, kernel_size=3, padding=1),  # Final I/Q channels
-            nn.Tanh(),
+            # nn.Tanh(),
         )
 
         # Constellation-aware refinement
@@ -509,7 +509,7 @@ class PhaseFrequencyAwareDecoder(nn.Module):
             nn.BatchNorm1d(16),
             nn.ReLU(),
             nn.Conv1d(16, 2, kernel_size=3, padding=1),  # Output I/Q for this component
-            activation,
+            # activation,
         )
 
     def forward(self, latent):
@@ -605,7 +605,7 @@ class ConstellationRefiner(nn.Module):
             nn.Conv1d(32, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv1d(32, 2, kernel_size=3, padding=1),
-            nn.Tanh(),
+            # nn.Tanh(),
         )
 
     def forward(self, signal):
@@ -651,177 +651,110 @@ class ComplexConv1d(nn.Module):
         return torch.cat([real_part, imag_part], dim=1)
 
 
-class MultiComponentLoss(nn.Module):
-    """Loss function that preserves phase and frequency information with proper component targets"""
-
-    def __init__(self, signal_length=128):
+class EnhancedReconstructionLoss(nn.Module):
+    def __init__(self, signal_length=128, normalize_fft=True):
         super().__init__()
         self.signal_length = signal_length
-        self.mse_loss = nn.MSELoss()
-        self.l1_loss = nn.L1Loss()
+        self.normalize_fft = normalize_fft
 
-    def constellation_loss(self, pred_signal, target_signal, labels):
-        """Compute constellation diagram loss"""
-        batch_size = pred_signal.shape[0]
+    def complex_mse_loss(self, pred_signal, target_signal):
+        """Complex MSE Loss: L_ComplexMSE = (1/N) * Σ|s_t - ŝ_t|²"""
+        pred_i, pred_q = pred_signal[:, 0], pred_signal[:, 1]
+        target_i, target_q = target_signal[:, 0], target_signal[:, 1]
 
-        # Convert to float32 for complex operations
-        pred_i = pred_signal[:, 0].float()
-        pred_q = pred_signal[:, 1].float()
-        target_i = target_signal[:, 0].float()
-        target_q = target_signal[:, 1].float()
+        pred_complex = torch.complex(pred_i.float(), pred_q.float())
+        target_complex = torch.complex(target_i.float(), target_q.float())
 
-        # Convert to complex representation
-        pred_complex = torch.complex(pred_i, pred_q)
-        target_complex = torch.complex(target_i, target_q)
+        complex_diff = pred_complex - target_complex
+        complex_mse = torch.mean(torch.abs(complex_diff) ** 2)
+        return complex_mse
 
-        # Compute constellation points (downsample for efficiency)
-        downsample_factor = 8
-        pred_constellation = pred_complex[:, ::downsample_factor]
-        target_constellation = target_complex[:, ::downsample_factor]
+    def phase_loss(self, pred_signal, target_signal):
+        """
+        Time-Domain Phase Loss: L_Phase = MSE(phase(pred), phase(target))
+        Handles phase wrapping properly
+        """
+        pred_i, pred_q = pred_signal[:, 0], pred_signal[:, 1]
+        target_i, target_q = target_signal[:, 0], target_signal[:, 1]
 
-        # Magnitude preservation
-        pred_mag = torch.abs(pred_constellation)
-        target_mag = torch.abs(target_constellation)
-        magnitude_loss = self.mse_loss(pred_mag, target_mag)
+        pred_complex = torch.complex(pred_i.float(), pred_q.float())
+        target_complex = torch.complex(target_i.float(), target_q.float())
 
-        # Phase preservation (handle wrapping)
-        pred_phase = torch.angle(pred_constellation)
-        target_phase = torch.angle(target_constellation)
+        # Compute phases
+        pred_phase = torch.angle(pred_complex)      # [-π, π]
+        target_phase = torch.angle(target_complex)  # [-π, π]
+
+        # Handle phase wrapping: compute shortest angular distance
         phase_diff = pred_phase - target_phase
+
+        # Wrap to [-π, π]
         phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
-        phase_loss = torch.mean(phase_diff**2)
 
-        return magnitude_loss + phase_loss
+        # MSE of phase differences
+        phase_mse = torch.mean(phase_diff ** 2)
 
-    def frequency_domain_loss(self, pred_signal, target_signal):
-        """Preserve frequency domain characteristics"""
-        # Convert to float32 for FFT operations
-        pred_i = pred_signal[:, 0].float()
-        pred_q = pred_signal[:, 1].float()
-        target_i = target_signal[:, 0].float()
-        target_q = target_signal[:, 1].float()
+        return phase_mse
 
-        # Convert to complex and take FFT
-        pred_complex = torch.complex(pred_i, pred_q)
-        target_complex = torch.complex(target_i, target_q)
+    def spectral_fft_loss(self, pred_signal, target_signal):
+        """Spectral FFT Loss: L_FFT = ||FFT(s)| - |FFT(ŝ)||²₂"""
+        pred_i, pred_q = pred_signal[:, 0], pred_signal[:, 1]
+        target_i, target_q = target_signal[:, 0], target_signal[:, 1]
 
+        pred_complex = torch.complex(pred_i.float(), pred_q.float())
+        target_complex = torch.complex(target_i.float(), target_q.float())
+
+        # Compute FFT magnitudes
         pred_fft = torch.fft.fft(pred_complex, dim=-1)
         target_fft = torch.fft.fft(target_complex, dim=-1)
 
-        # Magnitude spectrum loss
-        pred_mag_spectrum = torch.abs(pred_fft)
-        target_mag_spectrum = torch.abs(target_fft)
-        magnitude_spectrum_loss = self.mse_loss(pred_mag_spectrum, target_mag_spectrum)
+        pred_fft_mag = torch.abs(pred_fft)
+        target_fft_mag = torch.abs(target_fft)
 
-        # Phase spectrum loss
-        pred_phase_spectrum = torch.angle(pred_fft)
-        target_phase_spectrum = torch.angle(target_fft)
-        phase_spectrum_diff = pred_phase_spectrum - target_phase_spectrum
-        phase_spectrum_diff = torch.atan2(
-            torch.sin(phase_spectrum_diff), torch.cos(phase_spectrum_diff)
-        )
-        phase_spectrum_loss = torch.mean(phase_spectrum_diff**2)
+        # Optional: Normalize FFT magnitudes
+        if self.normalize_fft:
+            pred_fft_mag = pred_fft_mag / (torch.mean(pred_fft_mag, dim=-1, keepdim=True) + 1e-8)
+            target_fft_mag = target_fft_mag / (torch.mean(target_fft_mag, dim=-1, keepdim=True) + 1e-8)
 
-        return magnitude_spectrum_loss + 0.5 * phase_spectrum_loss
+        fft_loss = torch.mean((pred_fft_mag - target_fft_mag) ** 2)
+        return fft_loss
 
-    def compute_component_targets(self, target_signal):
-        """Compute proper targets for each component"""
-        batch_size = target_signal.shape[0]
+    def instantaneous_frequency_loss(self, pred_signal, target_signal):
+        """Instantaneous Frequency Loss: L_IF = ||f_inst(s) - f_inst(ŝ)||²₂"""
+        pred_i, pred_q = pred_signal[:, 0], pred_signal[:, 1]
+        target_i, target_q = target_signal[:, 0], target_signal[:, 1]
 
-        # Convert to complex
-        target_i = target_signal[:, 0].float()
-        target_q = target_signal[:, 1].float()
-        target_complex = torch.complex(target_i, target_q)
+        pred_complex = torch.complex(pred_i.float(), pred_q.float())
+        target_complex = torch.complex(target_i.float(), target_q.float())
 
-        # 1. Magnitude Target - Time-domain envelope (CHANGED from FFT magnitude)
-        envelope = torch.abs(target_complex)  # Time-domain envelope
-        magnitude_target = torch.stack(
-            [envelope, envelope], dim=1
-        )  # [batch, 2, length]
+        # Compute instantaneous frequencies
+        pred_inst_freq = compute_instantaneous_frequency_shared(pred_complex)
+        target_inst_freq = compute_instantaneous_frequency_shared(target_complex)
 
-        # 2. Phase Target - FFT phase spectrum
-        target_fft = torch.fft.fft(target_complex, dim=-1)
-        phase_spectrum = torch.angle(target_fft)
-        phase_target = torch.stack([phase_spectrum, phase_spectrum], dim=1)
+        if_loss = torch.mean((pred_inst_freq - target_inst_freq) ** 2)
+        return if_loss
 
-        # 3. Frequency Target - Instantaneous frequency
-        instantaneous_freq = compute_instantaneous_frequency_shared(target_complex)
-        frequency_target = torch.stack([instantaneous_freq, instantaneous_freq], dim=1)
+    def forward(self, decoder_output, target_signal, labels=None):
+        pred_signal = decoder_output["signal"] if isinstance(decoder_output, dict) else decoder_output
 
-        # 4. Modulation Target - Envelope and phase modulation
-        envelope_mod = torch.abs(target_complex)
-        phase_time = torch.angle(target_complex)
-        modulation_target = torch.stack([envelope_mod, phase_time], dim=1)
+        # Four focused losses including explicit phase
+        complex_mse = self.complex_mse_loss(pred_signal, target_signal)
+        phase_loss = self.phase_loss(pred_signal, target_signal)          # NEW!
+        fft_loss = self.spectral_fft_loss(pred_signal, target_signal)
+        if_loss = self.instantaneous_frequency_loss(pred_signal, target_signal)
 
-        return {
-            "magnitude": magnitude_target.to(target_signal.dtype),
-            "phase": phase_target.to(target_signal.dtype),
-            "frequency": frequency_target.to(target_signal.dtype),
-            "modulation": modulation_target.to(target_signal.dtype),
-        }
-
-    def forward(self, decoder_output, target_signal, labels):
-        pred_signal = decoder_output["signal"]
-
-        # Time domain losses
-        time_mse = self.mse_loss(pred_signal, target_signal)
-        time_l1 = self.l1_loss(pred_signal, target_signal)
-
-        # Frequency domain loss
-        freq_loss = self.frequency_domain_loss(pred_signal, target_signal)
-
-        # Constellation loss
-        constellation_loss = self.constellation_loss(pred_signal, target_signal, labels)
-
-        # Component-specific losses with proper targets
-        component_targets = self.compute_component_targets(target_signal)
-        component_losses = {}
-        total_component_loss = 0
-
-        if "magnitude" in decoder_output:
-            mag_loss = self.mse_loss(
-                decoder_output["magnitude"], component_targets["magnitude"]
-            )
-            component_losses["magnitude"] = mag_loss
-            total_component_loss += 0.3 * mag_loss  # Increased weight
-
-        if "phase" in decoder_output:
-            phase_loss = self.mse_loss(
-                decoder_output["phase"], component_targets["phase"]
-            )
-            component_losses["phase"] = phase_loss
-            total_component_loss += 0.3 * phase_loss  # Increased weight
-
-        if "frequency" in decoder_output:
-            freq_comp_loss = self.mse_loss(
-                decoder_output["frequency"], component_targets["frequency"]
-            )
-            component_losses["frequency"] = freq_comp_loss
-            total_component_loss += 0.2 * freq_comp_loss
-
-        if "modulation" in decoder_output:
-            mod_loss = self.mse_loss(
-                decoder_output["modulation"], component_targets["modulation"]
-            )
-            component_losses["modulation"] = mod_loss
-            total_component_loss += 0.2 * mod_loss
-
-        # Combine all losses with balanced weights
+        # Weighted combination
         total_loss = (
-            0.3 * time_mse
-            + 0.1 * time_l1
-            + 0.2 * freq_loss
-            + 0.1 * constellation_loss
-            + 0.3 * total_component_loss
-        )  # Increased component weight
+            10.0 * complex_mse +      # Primary: Complex MSE
+            1.0 * phase_loss +       # Explicit phase preservation
+            0.1 * fft_loss +         # Spectral preservation
+            0.1 * if_loss            # Modulation structure
+        )
 
         return total_loss, {
-            "time_mse": time_mse,
-            "time_l1": time_l1,
-            "frequency": freq_loss,
-            "constellation": constellation_loss,
-            "component_total": total_component_loss,
-            **component_losses,  # Individual component losses
+            "complex_mse": complex_mse,
+            "phase_loss": phase_loss,
+            "fft_loss": fft_loss,
+            "instantaneous_frequency": if_loss,
         }
 
 
@@ -1201,7 +1134,7 @@ class RFDecoderEnhanced(nn.Module):
             nn.ReLU(inplace=True),
             # Output layer
             nn.Conv1d(32, 2, kernel_size=5, padding=2),
-            nn.Tanh(),
+            # nn.Tanh(),
         )
 
     def forward(self, latent):
@@ -1385,12 +1318,12 @@ class RFEncoderDecoder(L.LightningModule):
         learning_rate=1e-3,
         arcface_margin=0.4,
         arcface_scale=32,
-        reconstruction_weight=0.0,
-        arcface_weight=1.0,
+        reconstruction_weight=1.0,
+        arcface_weight=0.0,
         curriculum_learning=True,
-        initial_snr_threshold=-20,
+        initial_snr_threshold=16,
         final_snr_threshold=-20,
-        curriculum_epochs=10,
+        curriculum_epochs=75,
         use_snr_aware=False,
         use_enhanced_decoder=True,
     ):
@@ -1418,10 +1351,7 @@ class RFEncoderDecoder(L.LightningModule):
             self.encoder = RFEncoder(signal_length, latent_dim)
 
         # Choose decoder type
-        if use_enhanced_decoder:
-            self.decoder = EnhancedPhaseFrequencyAwareDecoder(latent_dim, signal_length)
-        else:
-            self.decoder = PhaseFrequencyAwareDecoder(latent_dim, signal_length)
+        self.decoder = RFDecoderEnhanced(latent_dim, signal_length)  # Single decoder
 
         # Loss functions
         if use_snr_aware:
@@ -1434,7 +1364,7 @@ class RFEncoderDecoder(L.LightningModule):
                 latent_dim, self.num_classes, arcface_margin, arcface_scale
             )
 
-        self.reconstruction_loss = MultiComponentLoss(signal_length)
+        self.reconstruction_loss = EnhancedReconstructionLoss(signal_length)
 
     def get_current_snr_threshold(self):
         """Calculate current SNR threshold based on training progress"""
@@ -1457,10 +1387,10 @@ class RFEncoderDecoder(L.LightningModule):
 
             if isinstance(encoder_output, dict):
                 # For SNR-aware encoder, use signal features or full embedding
-                if 'signal_features' in encoder_output:
-                    embeddings = encoder_output['signal_features']
+                if "signal_features" in encoder_output:
+                    embeddings = encoder_output["signal_features"]
                 else:
-                    embeddings = encoder_output['full_embedding']
+                    embeddings = encoder_output["full_embedding"]
             else:
                 # For regular encoder
                 embeddings = encoder_output
@@ -1476,12 +1406,13 @@ class RFEncoderDecoder(L.LightningModule):
             encoder_output = self.encode(x)
 
             if isinstance(encoder_output, dict):
-                if 'signal_features' in encoder_output:
-                    return encoder_output['signal_features']
+                if "signal_features" in encoder_output:
+                    return encoder_output["signal_features"]
                 else:
-                    return encoder_output['full_embedding']
+                    return encoder_output["full_embedding"]
             else:
                 return encoder_output
+
     def create_curriculum_mask(self, snrs, current_threshold):
         """Create mask for samples that should participate in training"""
         # Only train on samples with SNR >= current_threshold
@@ -1533,72 +1464,34 @@ class RFEncoderDecoder(L.LightningModule):
         # Forward pass
         encoder_output, decoder_output = self.forward(x_curriculum)
 
-        # Handle different encoder types
-        if self.use_snr_aware and isinstance(encoder_output, dict):
-            latent_for_arcface = encoder_output["signal_features"]
-            full_latent = encoder_output["full_embedding"]
-
-            # Check for NaN
-            if torch.isnan(full_latent).any():
-                print(f"NaN detected in latent at batch {batch_idx}")
-                return None
-
-            # SNR prediction loss
-            snr_loss = F.mse_loss(
-                encoder_output["predicted_snr"].squeeze(), snrs_curriculum.float()
-            )
-
-            # ArcFace loss on signal features only
-            arcface_loss = self.arcface_loss(
-                latent_for_arcface, labels_curriculum.squeeze()
-            )
-
-        else:
-            latent_for_arcface = encoder_output
-
-            # Check for NaN
-            if torch.isnan(latent_for_arcface).any():
-                print(f"NaN detected in latent at batch {batch_idx}")
-                return None
-
-            snr_loss = 0
-            # ArcFace loss with SNR adaptation
-            arcface_loss = self.arcface_loss(
-                latent_for_arcface, labels_curriculum.squeeze(), snrs_curriculum
-            )
-
-        # Compute reconstruction loss
+        # Simple reconstruction loss (no component losses)
         recon_loss, loss_components = self.reconstruction_loss(
             decoder_output, x_curriculum, labels_curriculum
         )
 
+        # ArcFace loss
+        if self.use_snr_aware and isinstance(encoder_output, dict):
+            arcface_loss = self.arcface_loss(
+                encoder_output["signal_features"], labels_curriculum.squeeze()
+            )
+        else:
+            arcface_loss = self.arcface_loss(
+                encoder_output, labels_curriculum.squeeze(), snrs_curriculum
+            )
+
         # Combined loss
         total_loss = (
-            self.reconstruction_weight * recon_loss + self.arcface_weight * arcface_loss
+            self.reconstruction_weight * recon_loss +
+            self.arcface_weight * arcface_loss
         )
 
-        if self.use_snr_aware and isinstance(encoder_output, dict):
-            total_loss += 0.1 * snr_loss  # Small weight for SNR prediction
-
-        # Logging
+        # Clean logging
         self.log("train_loss", total_loss, prog_bar=True)
         self.log("train_recon_loss", recon_loss)
         self.log("train_arcface_loss", arcface_loss)
-        if self.use_snr_aware and isinstance(encoder_output, dict):
-            self.log("train_snr_loss", snr_loss)
-        self.log("curriculum_snr_threshold", current_threshold, prog_bar=True)
-        self.log("curriculum_batch_skipped", 0.0)
-        self.log("curriculum_samples_used", float(curriculum_mask.sum()))
-        self.log("curriculum_usage_ratio", float(curriculum_mask.sum()) / batch_size)
 
-        # Log individual loss components
         for key, value in loss_components.items():
-            self.log(f"train_{key}_loss", value)
-
-        # Log SNR statistics for monitoring
-        self.log("train_mean_snr", snrs_curriculum.float().mean())
-        self.log("train_min_snr", snrs_curriculum.float().min())
-        self.log("train_max_snr", snrs_curriculum.float().max())
+            self.log(f"train_{key}", value)
 
         return total_loss
 
@@ -1608,7 +1501,7 @@ class RFEncoderDecoder(L.LightningModule):
         # Forward pass
         encoder_output, decoder_output = self.forward(x)
 
-        # Handle different encoder types
+        # Handle different encoder types for ArcFace
         if self.use_snr_aware and isinstance(encoder_output, dict):
             latent_for_arcface = encoder_output["signal_features"]
             full_latent = encoder_output["full_embedding"]
@@ -1627,49 +1520,53 @@ class RFEncoderDecoder(L.LightningModule):
             # ArcFace loss with SNR adaptation
             arcface_loss = self.arcface_loss(latent_for_arcface, labels.squeeze(), snrs)
 
-        # Compute reconstruction loss
+        # Compute focused reconstruction loss
         recon_loss, loss_components = self.reconstruction_loss(
             decoder_output, x, labels
         )
 
         # Combined loss
         total_loss = (
-            self.reconstruction_weight * recon_loss + self.arcface_weight * arcface_loss
+            self.reconstruction_weight * recon_loss +
+            self.arcface_weight * arcface_loss
         )
 
         if self.use_snr_aware and isinstance(encoder_output, dict):
             total_loss += 0.1 * snr_loss
 
-        # Logging
+        # Logging - clean and focused
         self.log("val_loss", total_loss, prog_bar=True)
         self.log("val_recon_loss", recon_loss)
         self.log("val_arcface_loss", arcface_loss)
+
         if self.use_snr_aware and isinstance(encoder_output, dict):
             self.log("val_snr_loss", snr_loss)
 
-        # Log individual loss components
+        # Log the three core reconstruction loss components
         for key, value in loss_components.items():
-            self.log(f"val_{key}_loss", value)
+            self.log(f"val_{key}", value)
 
-        # Save for visualization
+        # Save for visualization (first batch only)
         if batch_idx == 0:
+            # Save embeddings for visualization
             if self.use_snr_aware and isinstance(encoder_output, dict):
-                self.val_latents = (
-                    latent_for_arcface.detach().cpu()
-                )  # Use signal features for visualization
+                self.val_latents = latent_for_arcface.detach().cpu()  # Use signal features
                 self.val_encoder_output = {
                     k: v.detach().cpu() for k, v in encoder_output.items()
                 }
             else:
                 self.val_latents = latent_for_arcface.detach().cpu()
 
+            # Save basic data for visualization
             self.val_labels = labels.detach().cpu()
             self.val_snrs = snrs.detach().cpu()
             self.val_original = x.detach().cpu()
-            self.val_reconstructed = decoder_output["signal"].detach().cpu()
-            self.val_decoder_output = {
-                k: v.detach().cpu() for k, v in decoder_output.items()
-            }
+
+            # Handle decoder output
+            if isinstance(decoder_output, dict):
+                self.val_reconstructed = decoder_output["signal"].detach().cpu()
+            else:
+                self.val_reconstructed = decoder_output.detach().cpu()
 
         return total_loss
 
@@ -1692,12 +1589,12 @@ class RFEncoderDecoder(L.LightningModule):
             print("Curriculum learning completed - training on all SNR levels")
 
     def _plot_reconstruction_quality(self):
-        """Complete reconstruction quality: I/Q, constellation, frequency/phase, PSD, and component targets"""
+        """Enhanced visualization including phase analysis"""
         if not hasattr(self, "val_original") or not hasattr(self, "val_reconstructed"):
             return
 
         try:
-            fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+            fig, axes = plt.subplots(3, 3, figsize=(20, 15))  # 3x3 grid now
 
             # Use first sample for detailed analysis
             sample_idx = 0
@@ -1711,286 +1608,144 @@ class RFEncoderDecoder(L.LightningModule):
             recon_complex = torch.complex(recon_i, recon_q)
             time_axis = np.arange(len(orig_i))
 
-            # 1. I/Q Time Domain Reconstruction
-            axes[0, 0].plot(
-                time_axis, orig_i.numpy(), "b-", label="Original I", alpha=0.8
-            )
-            axes[0, 0].plot(
-                time_axis, recon_i.numpy(), "r--", label="Reconstructed I", alpha=0.8
-            )
-            axes[0, 0].plot(
-                time_axis, orig_q.numpy(), "c-", label="Original Q", alpha=0.8
-            )
-            axes[0, 0].plot(
-                time_axis, recon_q.numpy(), "m--", label="Reconstructed Q", alpha=0.8
-            )
+            # 1. I/Q Time Domain
+            axes[0, 0].plot(time_axis, orig_i.numpy(), "b-", label="Original I", alpha=0.8)
+            axes[0, 0].plot(time_axis, recon_i.numpy(), "r--", label="Reconstructed I", alpha=0.8)
+            axes[0, 0].plot(time_axis, orig_q.numpy(), "c-", label="Original Q", alpha=0.8)
+            axes[0, 0].plot(time_axis, recon_q.numpy(), "m--", label="Reconstructed Q", alpha=0.8)
 
-            # Add MSE to title
-            mse_i = torch.mean((orig_i - recon_i) ** 2).item()
-            mse_q = torch.mean((orig_q - recon_q) ** 2).item()
-            axes[0, 0].set_title(
-                f"I/Q Reconstruction\n{self.label_names[int(self.val_labels[sample_idx])]} - SNR: {self.val_snrs[sample_idx].item():.1f}dB\nMSE_I: {mse_i:.6f}, MSE_Q: {mse_q:.6f}"
-            )
+            complex_mse = torch.mean(torch.abs(orig_complex - recon_complex) ** 2).item()
+            axes[0, 0].set_title(f"I/Q Reconstruction\nComplex MSE: {complex_mse:.6f}")
             axes[0, 0].set_xlabel("Time Sample")
             axes[0, 0].set_ylabel("Amplitude")
             axes[0, 0].legend()
             axes[0, 0].grid(True, alpha=0.3)
 
-            # 2. Constellation Diagram Comparison
-            axes[0, 1].scatter(
-                orig_complex.real.numpy(),
-                orig_complex.imag.numpy(),
-                alpha=0.6,
-                s=20,
-                c="blue",
-                label="Original",
-            )
-            axes[0, 1].scatter(
-                recon_complex.real.numpy(),
-                recon_complex.imag.numpy(),
-                alpha=0.6,
-                s=20,
-                c="red",
-                label="Reconstructed",
-            )
-            axes[0, 1].set_title("Constellation Diagram")
-            axes[0, 1].set_xlabel("I (Real)")
-            axes[0, 1].set_ylabel("Q (Imaginary)")
+            # 2. Phase Comparison (NEW!)
+            orig_phase = torch.angle(orig_complex).numpy()
+            recon_phase = torch.angle(recon_complex).numpy()
+
+            # Unwrap phases for better visualization
+            orig_phase_unwrapped = np.unwrap(orig_phase)
+            recon_phase_unwrapped = np.unwrap(recon_phase)
+
+            axes[0, 1].plot(time_axis, orig_phase_unwrapped, "b-", label="Original Phase", alpha=0.8)
+            axes[0, 1].plot(time_axis, recon_phase_unwrapped, "r--", label="Reconstructed Phase", alpha=0.8)
+
+            # Calculate phase loss
+            phase_diff = torch.atan2(torch.sin(torch.angle(orig_complex) - torch.angle(recon_complex)),
+                                    torch.cos(torch.angle(orig_complex) - torch.angle(recon_complex)))
+            phase_mse = torch.mean(phase_diff ** 2).item()
+
+            axes[0, 1].set_title(f"Phase Comparison\nPhase MSE: {phase_mse:.6f} rad²")
+            axes[0, 1].set_xlabel("Time Sample")
+            axes[0, 1].set_ylabel("Phase (radians)")
             axes[0, 1].legend()
             axes[0, 1].grid(True, alpha=0.3)
-            axes[0, 1].axis("equal")
 
-            # 3. FFT Magnitude Spectrum (Frequency Domain)
+            # 3. Phase Error (NEW!)
+            phase_error = phase_diff.numpy()
+            axes[0, 2].plot(time_axis, phase_error, "r-", alpha=0.8)
+            axes[0, 2].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+            axes[0, 2].set_title(f"Phase Error\nMean: {np.mean(phase_error):.4f}, Std: {np.std(phase_error):.4f}")
+            axes[0, 2].set_xlabel("Time Sample")
+            axes[0, 2].set_ylabel("Phase Error (radians)")
+            axes[0, 2].grid(True, alpha=0.3)
+
+            # 4. Constellation Diagram
+            axes[1, 0].scatter(orig_complex.real.numpy(), orig_complex.imag.numpy(),
+                            alpha=0.6, s=20, c="blue", label="Original")
+            axes[1, 0].scatter(recon_complex.real.numpy(), recon_complex.imag.numpy(),
+                            alpha=0.6, s=20, c="red", label="Reconstructed")
+            axes[1, 0].set_title("Constellation Diagram")
+            axes[1, 0].set_xlabel("I (Real)")
+            axes[1, 0].set_ylabel("Q (Imaginary)")
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+            axes[1, 0].axis("equal")
+
+            # 5. FFT Magnitude Spectrum
             orig_fft = torch.fft.fft(orig_complex)
             recon_fft = torch.fft.fft(recon_complex)
             freqs = np.arange(len(orig_fft))
 
-            axes[0, 2].plot(
-                freqs, torch.abs(orig_fft).numpy(), "b-", label="Original", alpha=0.8
-            )
-            axes[0, 2].plot(
-                freqs,
-                torch.abs(recon_fft).numpy(),
-                "r--",
-                label="Reconstructed",
-                alpha=0.8,
-            )
-            axes[0, 2].set_title("FFT Magnitude Spectrum\n(Frequency Domain)")
-            axes[0, 2].set_xlabel("Frequency Bin")
-            axes[0, 2].set_ylabel("FFT Magnitude")
-            axes[0, 2].legend()
-            axes[0, 2].grid(True, alpha=0.3)
+            fft_loss = torch.mean((torch.abs(orig_fft) - torch.abs(recon_fft)) ** 2).item()
 
-            # 4. Phase Spectrum
-            axes[1, 0].plot(
-                freqs, torch.angle(orig_fft).numpy(), "b-", label="Original", alpha=0.8
-            )
-            axes[1, 0].plot(
-                freqs,
-                torch.angle(recon_fft).numpy(),
-                "r--",
-                label="Reconstructed",
-                alpha=0.8,
-            )
-            axes[1, 0].set_title("Phase Spectrum")
-            axes[1, 0].set_xlabel("Frequency Bin")
-            axes[1, 0].set_ylabel("Phase (radians)")
-            axes[1, 0].legend()
-            axes[1, 0].grid(True, alpha=0.3)
-
-            # 5. Instantaneous Frequency
-            orig_inst_freq = self._compute_instantaneous_frequency(orig_complex)
-            recon_inst_freq = self._compute_instantaneous_frequency(recon_complex)
-
-            axes[1, 1].plot(
-                time_axis, orig_inst_freq.numpy(), "b-", label="Original", alpha=0.8
-            )
-            axes[1, 1].plot(
-                time_axis,
-                recon_inst_freq.numpy(),
-                "r--",
-                label="Reconstructed",
-                alpha=0.8,
-            )
-            axes[1, 1].set_title("Instantaneous Frequency")
-            axes[1, 1].set_xlabel("Time Sample")
-            axes[1, 1].set_ylabel("Frequency (rad/sample)")
+            axes[1, 1].plot(freqs, torch.abs(orig_fft).numpy(), "b-", label="Original", alpha=0.8)
+            axes[1, 1].plot(freqs, torch.abs(recon_fft).numpy(), "r--", label="Reconstructed", alpha=0.8)
+            axes[1, 1].set_title(f"FFT Magnitude Spectrum\nFFT Loss: {fft_loss:.6f}")
+            axes[1, 1].set_xlabel("Frequency Bin")
+            axes[1, 1].set_ylabel("FFT Magnitude")
             axes[1, 1].legend()
             axes[1, 1].grid(True, alpha=0.3)
 
-            # 6. Power Spectral Density (PSD)
-            orig_psd = torch.abs(orig_fft) ** 2
-            recon_psd = torch.abs(recon_fft) ** 2
+            # 6. FFT Phase Spectrum (NEW!)
+            orig_fft_phase = torch.angle(orig_fft).numpy()
+            recon_fft_phase = torch.angle(recon_fft).numpy()
 
-            axes[1, 2].plot(
-                freqs,
-                10 * torch.log10(orig_psd + 1e-10).numpy(),
-                "b-",
-                label="Original",
-                alpha=0.8,
-            )
-            axes[1, 2].plot(
-                freqs,
-                10 * torch.log10(recon_psd + 1e-10).numpy(),
-                "r--",
-                label="Reconstructed",
-                alpha=0.8,
-            )
-            axes[1, 2].set_title("Power Spectral Density")
+            axes[1, 2].plot(freqs, orig_fft_phase, "b-", label="Original", alpha=0.8)
+            axes[1, 2].plot(freqs, recon_fft_phase, "r--", label="Reconstructed", alpha=0.8)
+            axes[1, 2].set_title("FFT Phase Spectrum")
             axes[1, 2].set_xlabel("Frequency Bin")
-            axes[1, 2].set_ylabel("Power (dB)")
+            axes[1, 2].set_ylabel("Phase (radians)")
             axes[1, 2].legend()
             axes[1, 2].grid(True, alpha=0.3)
 
-            if (
-                hasattr(self, "val_decoder_output")
-                and "magnitude" in self.val_decoder_output
-            ):
-                loss_fn = MultiComponentLoss(self.hparams.signal_length)
-                component_targets = loss_fn.compute_component_targets(
-                    self.val_original[sample_idx : sample_idx + 1]
-                )
+            # 7. Instantaneous Frequency
+            orig_inst_freq = self._compute_instantaneous_frequency(orig_complex)
+            recon_inst_freq = self._compute_instantaneous_frequency(recon_complex)
 
-                # 7. Time-Domain Magnitude Component (Envelope)
-                if "magnitude" in self.val_decoder_output:
-                    # CHANGED: Use time-domain envelope instead of FFT magnitude
-                    target_envelope = torch.abs(
-                        orig_complex
-                    ).numpy()  # Time-domain envelope
-                    recon_mag = self.val_decoder_output["magnitude"][
-                        sample_idx, 0
-                    ].numpy()
+            if_loss = torch.mean((orig_inst_freq - recon_inst_freq) ** 2).item()
 
-                    axes[2, 0].plot(
-                        time_axis,
-                        target_envelope,
-                        "b-",
-                        label="Target Envelope (Time)",
-                        alpha=0.8,
-                    )
-                    axes[2, 0].plot(
-                        time_axis,
-                        recon_mag,
-                        "r--",
-                        label="Reconstructed Component",
-                        alpha=0.8,
-                    )
-                    axes[2, 0].set_title(
-                        "Magnitude Component Target\n(Time-Domain Envelope)"
-                    )
-                    axes[2, 0].set_xlabel("Time Sample")
-                    axes[2, 0].set_ylabel("Amplitude")
-                    axes[2, 0].legend()
-                    axes[2, 0].grid(True, alpha=0.3)
-                # 8. Phase Component vs Target
-                if "phase" in self.val_decoder_output:
-                    target_phase = component_targets["phase"][0, 0].numpy()
-                    recon_phase = self.val_decoder_output["phase"][
-                        sample_idx, 0
-                    ].numpy()
+            axes[2, 0].plot(time_axis, orig_inst_freq.numpy(), "b-", label="Original", alpha=0.8)
+            axes[2, 0].plot(time_axis, recon_inst_freq.numpy(), "r--", label="Reconstructed", alpha=0.8)
+            axes[2, 0].set_title(f"Instantaneous Frequency\nIF Loss: {if_loss:.6f}")
+            axes[2, 0].set_xlabel("Time Sample")
+            axes[2, 0].set_ylabel("Frequency (rad/sample)")
+            axes[2, 0].legend()
+            axes[2, 0].grid(True, alpha=0.3)
 
-                    axes[2, 1].plot(
-                        target_phase, "b-", label="Target FFT Phase", alpha=0.8
-                    )
-                    axes[2, 1].plot(
-                        recon_phase, "r--", label="Reconstructed Component", alpha=0.8
-                    )
-                    axes[2, 1].set_title("Phase Component Target")
-                    axes[2, 1].set_xlabel("Frequency Bin")
-                    axes[2, 1].set_ylabel("Phase (radians)")
-                    axes[2, 1].legend()
-                    axes[2, 1].grid(True, alpha=0.3)
+            # 8. Power Spectral Density
+            orig_psd = torch.abs(orig_fft) ** 2
+            recon_psd = torch.abs(recon_fft) ** 2
 
-                # 9. SNR Prediction Accuracy (REPLACED THE FREQUENCY/MODULATION PLOT)
-                if (
-                    self.use_snr_aware
-                    and hasattr(self, "val_encoder_output")
-                    and "predicted_snr" in self.val_encoder_output
-                ):
-                    actual_snrs = self.val_snrs.squeeze().numpy()
-                    predicted_snrs = (
-                        self.val_encoder_output["predicted_snr"].squeeze().numpy()
-                    )
+            axes[2, 1].plot(freqs, 10 * torch.log10(orig_psd + 1e-10).numpy(),
+                        "b-", label="Original", alpha=0.8)
+            axes[2, 1].plot(freqs, 10 * torch.log10(recon_psd + 1e-10).numpy(),
+                        "r--", label="Reconstructed", alpha=0.8)
+            axes[2, 1].set_title("Power Spectral Density")
+            axes[2, 1].set_xlabel("Frequency Bin")
+            axes[2, 1].set_ylabel("Power (dB)")
+            axes[2, 1].legend()
+            axes[2, 1].grid(True, alpha=0.3)
 
-                    # Scatter plot: actual vs predicted
-                    axes[2, 2].scatter(
-                        actual_snrs, predicted_snrs, alpha=0.6, c="blue", s=30
-                    )
+            # 9. Loss Component Breakdown
+            with torch.no_grad():
+                sample_orig = self.val_original[sample_idx:sample_idx+1]
+                sample_recon = self.val_reconstructed[sample_idx:sample_idx+1]
 
-                    # Perfect prediction line
-                    snr_range = [actual_snrs.min(), actual_snrs.max()]
-                    axes[2, 2].plot(
-                        snr_range,
-                        snr_range,
-                        "r--",
-                        alpha=0.8,
-                        linewidth=2,
-                        label="Perfect Prediction",
-                    )
+                loss_fn = EnhancedReconstructionLoss(self.hparams.signal_length)
+                _, loss_breakdown = loss_fn(sample_recon, sample_orig)
 
-                    # Calculate and display metrics
-                    mse_snr = np.mean((actual_snrs - predicted_snrs) ** 2)
-                    mae_snr = np.mean(np.abs(actual_snrs - predicted_snrs))
-                    r2_snr = (
-                        np.corrcoef(actual_snrs, predicted_snrs)[0, 1] ** 2
-                        if len(actual_snrs) > 1
-                        else 0
-                    )
+                loss_names = ['Complex MSE', 'Phase Loss', 'FFT Loss', 'Inst. Freq']  # Updated
+                loss_values = [
+                    loss_breakdown['complex_mse'].item(),
+                    loss_breakdown['phase_loss'].item(),      # NEW!
+                    loss_breakdown['fft_loss'].item(),
+                    loss_breakdown['instantaneous_frequency'].item()
+                ]
 
-                    axes[2, 2].set_xlabel("Actual SNR (dB)")
-                    axes[2, 2].set_ylabel("Predicted SNR (dB)")
-                    axes[2, 2].set_title(
-                        f"SNR Prediction Accuracy\nMSE: {mse_snr:.2f}, MAE: {mae_snr:.2f}, R²: {r2_snr:.3f}"
-                    )
-                    axes[2, 2].legend()
-                    axes[2, 2].grid(True, alpha=0.3)
+                bars = axes[2, 2].bar(loss_names, loss_values,
+                                    color=['blue', 'red', 'orange', 'green'], alpha=0.7)
+                axes[2, 2].set_title("Loss Component Breakdown")
+                axes[2, 2].set_ylabel("Loss Value")
+                axes[2, 2].tick_params(axis='x', rotation=45)
 
-                    # Add text with statistics
-                    stats_text = f"Samples: {len(actual_snrs)}\nRange: {actual_snrs.min():.1f} to {actual_snrs.max():.1f} dB"
-                    axes[2, 2].text(
-                        0.05,
-                        0.95,
-                        stats_text,
-                        transform=axes[2, 2].transAxes,
-                        verticalalignment="top",
-                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-                    )
-
-                    # Make axes equal if reasonable
-                    all_snrs = np.concatenate([actual_snrs, predicted_snrs])
-                    snr_min, snr_max = all_snrs.min(), all_snrs.max()
-                    margin = (snr_max - snr_min) * 0.1
-                    axes[2, 2].set_xlim(snr_min - margin, snr_max + margin)
-                    axes[2, 2].set_ylim(snr_min - margin, snr_max + margin)
-
-                else:
-                    # Fallback if no SNR prediction available
-                    axes[2, 2].text(
-                        0.5,
-                        0.5,
-                        "SNR Prediction\nNot Available\n(Non-SNR-aware encoder or no data)",
-                        ha="center",
-                        va="center",
-                        transform=axes[2, 2].transAxes,
-                        bbox=dict(boxstyle="round", facecolor="lightgray", alpha=0.5),
-                    )
-                    axes[2, 2].set_title("SNR Prediction")
-
-            else:
-                # If no component outputs, show placeholder messages
-                for i, title in enumerate(
-                    ["Magnitude Component", "Phase Component", "Modulation"]
-                ):
-                    axes[2, i].text(
-                        0.5,
-                        0.5,
-                        f"{title}\nNo component data available",
-                        ha="center",
-                        va="center",
-                        transform=axes[2, i].transAxes,
-                        bbox=dict(boxstyle="round", facecolor="lightgray", alpha=0.5),
-                    )
-                    axes[2, i].set_title(title)
+                # Add value labels on bars
+                for bar, value in zip(bars, loss_values):
+                    height = bar.get_height()
+                    axes[2, 2].text(bar.get_x() + bar.get_width()/2., height,
+                                f'{value:.4f}', ha='center', va='bottom')
 
             plt.tight_layout()
 
@@ -2135,30 +1890,31 @@ class RFEncoderDecoder(L.LightningModule):
         self._plot_arcface_embeddings()  # Class separation and angular distances
 
     def configure_optimizers(self):
-        """Configure optimizers and learning rate schedulers"""
-        # Main optimizer for encoder and decoder
+        """
+        Cosine Annealing with Warm Restarts - periodically resets to high LR
+        """
+        # Main optimizer
         optimizer = AdamW(
             self.parameters(),
-            lr=self.learning_rate,
+            lr=self.learning_rate,  # This becomes the max LR
             weight_decay=1e-4,
             betas=(0.9, 0.999),
             eps=1e-8,
         )
 
-        # Learning rate scheduler - reduce on plateau for stability
+        # Cosine Annealing with Warm Restarts
         scheduler = {
-            "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+            "scheduler": torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 optimizer,
-                mode="min",
-                factor=0.5,
-                patience=10,
-                min_lr=1e-6,
-                verbose=True,
+                T_0=10,        # Initial restart period (epochs)
+                T_mult=2,      # Multiply restart period by this after each restart
+                eta_min=1e-6,  # Minimum learning rate
+                last_epoch=-1
             ),
             "monitor": "val_loss",
             "interval": "epoch",
             "frequency": 1,
-            "strict": True,
+            "name": "cosine_warm_restarts"
         }
 
         return {"optimizer": optimizer, "lr_scheduler": scheduler}

@@ -1,0 +1,91 @@
+project_name: arcface
+run_name: arcface_loss_only
+train_encoder: true
+linear_probe_encoder: false
+contrastive_encoder: true
+train_diffusion: false
+conditon: false
+diffusion_contrastive: bottleneck
+vis_diffusion: false
+train_classifier: false
+classifier_free: true
+fine_tune_diffusion: true
+encoder_checkpoint_name: arcface_encoder.ckpt
+diffusion_checkpoint_name: prototype.ckpt
+mode: online
+debug: false
+log_model: true
+seed: 42
+hyperparams:
+  epochs: 20
+  classifier_epochs: 100
+  learning_rate: 0.001
+  batch_size: 1024
+  contrastive_batch_size: 4096
+  dropout: 0.25
+  hidden_dim: 32
+  feature_dim: 16
+  num_classes: 11
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+Encoder:
+  _target_: models.latent_encoder_models.arcface.RFEncoderDecoder
+  learning_rate: 0.0001
+  arcface_margin: 0.4
+  arcface_scale: 32
+Diffusion:
+  _target_: models.diffusion.latent_diffusion.LatentDiffusion
+  learning_rate: ${hyperparams.learning_rate}
+  n_steps: 500
+  linear_start: 0.0001
+  linear_end: 0.01
+  weight_decay: 0.01
+  latent_scaling: 1.1981
+  diffusion_contrastive: ${diffusion_contrastive}
+  num_classes: ${hyperparams.num_classes}
+  unet:
+    _target_: models.diffusion.unet_1d.UNet1DModel
+    sample_size: 64
+    in_channels: 32
+    out_channels: 32
+    down_block_types:
+    - DownResnetBlock1D
+    - AttnDownBlock1D
+    - AttnDownBlock1D
+    up_block_types:
+    - AttnUpBlock1D
+    - AttnUpBlock1D
+    - UpResnetBlock1D
+    mid_block_type: UNetMidBlock1D
+    block_out_channels:
+    - 32
+    - 64
+    - 128
+    layers_per_block: 3
+    condition: ${conditon}
+    conditional: 11
+Classifier:
+  _target_: models.classifier.classifier.LatentClassifier
+  learning_rate: 0.0001
+  beta: 0.25
+  fine_tune_diffusion: ${fine_tune_diffusion}
+  num_classes: ${hyperparams.num_classes}
+  classifier_free: ${classifier_free}
+  classifier_head:
+    _target_: models.classifier.conv_classifier.Conv1DHead
+    num_classes: ${hyperparams.num_classes}
+ArcFaceLinearProbe:
+  _target_: models.classifier.linear_probe.ArcFaceLinearProbe
+  learning_rate: 0.001
+  num_classes: ${hyperparams.num_classes}
+  use_normalized_embeddings: true
+  embedding_type: arcface
+dataset:
+  iq: true
+  batch_size: ${hyperparams.batch_size}
+  contrastive_batch_size: ${hyperparams.contrastive_batch_size}
+  num_workers: 12
+  train_val_split:
+  - 0.8
+  - 0.2
+  random_seed: ${seed}

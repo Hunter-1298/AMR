@@ -118,7 +118,9 @@ def main(cfg: DictConfig):
         print("Testing encoder with linear probe...")
 
         # Create linear probe
-        linear_probe = hydra.utils.instantiate(cfg.ArcFaceLinearProbe, label_names=label_names, encoder=encoder)
+        linear_probe = hydra.utils.instantiate(
+            cfg.ArcFaceLinearProbe, label_names=label_names, encoder=encoder
+        )
         # Create checkpoint dir
         probe_trainer = L.Trainer(
             max_epochs=50,  # Fewer epochs needed for linear probe
@@ -184,43 +186,44 @@ def main(cfg: DictConfig):
                 ),
                 LearningRateMonitor(logging_interval="step"),
                 DiffusionTSNEVisualizationCallback(
-                    every_n_epochs=10, create_animation=True, label_names=label_names)
+                    every_n_epochs=10, create_animation=True, label_names=label_names
+                ),
             ],
         )
 
         trainer.fit(model, train_loader, val_loader)  # pyright: ignore
         print("Diffusion Model Finished Training")
 
-    else:
-        # Load and freeze the diffusion model
-        diffusion = hydra.utils.instantiate(
-            cfg.Diffusion, encoder=encoder, label_names=label_names
-        )
-        checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
-        checkpoint_name = cfg.diffusion_checkpoint_name
-        checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
-        diffusion.load_state_dict(checkpoint["state_dict"])
-        diffusion.eval()
-        diffusion = torch.compile(diffusion)
-
-        if cfg.vis_diffusion:
-            for param in diffusion.parameters():
-                param.requires_grad = False
-
-            # Set up trainer for MoE
-            trainer = L.Trainer(
-                max_epochs=cfg.hyperparams.epochs,
-                logger=wandb_logger,
-                callbacks=[
-                    # DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True, label_names=label_names),
-                    DiffusionTSNEVisualizationCallback(
-                        every_n_epochs=1, create_animation=True, label_names=label_names
-                    )
-                ],
-            )
-
-            trainer.validate(model=diffusion, dataloaders=val_loader)  # pyright: ignore
-            sys.exit("Diffusion Vis finished")
+    # else:
+    #     # Load and freeze the diffusion model
+    #     diffusion = hydra.utils.instantiate(
+    #         cfg.Diffusion, encoder=encoder, label_names=label_names
+    #     )
+    #     checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
+    #     checkpoint_name = cfg.diffusion_checkpoint_name
+    #     checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
+    #     diffusion.load_state_dict(checkpoint["state_dict"])
+    #     diffusion.eval()
+    #     diffusion = torch.compile(diffusion)
+    #
+    #     if cfg.vis_diffusion:
+    #         for param in diffusion.parameters():
+    #             param.requires_grad = False
+    #
+    #         # Set up trainer for MoE
+    #         trainer = L.Trainer(
+    #             max_epochs=cfg.hyperparams.epochs,
+    #             logger=wandb_logger,
+    #             callbacks=[
+    #                 # DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True, label_names=label_names),
+    #                 DiffusionTSNEVisualizationCallback(
+    #                     every_n_epochs=1, create_animation=True, label_names=label_names
+    #                 )
+    #             ],
+    #         )
+    #
+    #         trainer.validate(model=diffusion, dataloaders=val_loader)  # pyright: ignore
+    #         sys.exit("Diffusion Vis finished")
 
     if cfg.train_classifier:
         print("Training Classifier on Latent Representations...")

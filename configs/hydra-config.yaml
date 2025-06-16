@@ -1,6 +1,6 @@
 # Global configurations
 project_name: arcface
-run_name: arcface_loss_only
+run_name: Reconstruction_Only
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -34,7 +34,7 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 20
+    epochs: 100
     classifier_epochs: 100
     learning_rate: .001
     batch_size: 1024
@@ -59,8 +59,8 @@ data_dir: data/
 Encoder:
     _target_: models.latent_encoder_models.arcface.RFEncoderDecoder
     learning_rate: .0001
-    arcface_margin: 0.4
-    arcface_scale: 32
+    arcface_margin: 0.17
+    arcface_scale: 16
 
 Diffusion:
     _target_: models.diffusion.latent_diffusion.LatentDiffusion
