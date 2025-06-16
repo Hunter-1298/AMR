@@ -78,205 +78,6 @@ def compute_instantaneous_frequency_shared(complex_signal):
         else:
             return np.zeros_like(np.real(complex_signal))
 
-
-class EnhancedPhaseFrequencyAwareDecoder(nn.Module):
-    """Enhanced decoder with significantly more capacity for complex RF signal reconstruction"""
-
-    def __init__(self, latent_dim=256, signal_length=128):
-        super().__init__()
-        self.signal_length = signal_length
-        self.latent_dim = latent_dim
-        self.init_size = signal_length // 16  # Start smaller for more upsampling layers
-
-        # Increased component dimensions for better separation
-        self.magnitude_dim = latent_dim // 4  # 64 dims for magnitude
-        self.phase_dim = latent_dim // 4  # 64 dims for phase
-        self.frequency_dim = latent_dim // 4  # 64 dims for frequency
-        self.modulation_dim = latent_dim // 4  # 64 dims for modulation features
-
-        # Much larger separate decoders for different signal components
-        self.magnitude_decoder = self._build_enhanced_component_decoder(
-            self.magnitude_dim, "magnitude"
-        )
-        self.phase_decoder = self._build_enhanced_component_decoder(
-            self.phase_dim, "phase"
-        )
-        self.frequency_decoder = self._build_enhanced_component_decoder(
-            self.frequency_dim, "frequency"
-        )
-        self.modulation_decoder = self._build_enhanced_component_decoder(
-            self.modulation_dim, "modulation"
-        )
-
-        # Enhanced fusion network with much more capacity
-        self.fusion_network = nn.Sequential(
-            # Initial feature processing
-            nn.Conv1d(
-                8, 128, kernel_size=7, padding=3
-            ),  # 4 components * 2 channels each
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            # Residual blocks for better gradient flow
-            ResidualBlock1D(128, 128),
-            ResidualBlock1D(128, 128),
-            # Progressive refinement
-            nn.Conv1d(128, 256, kernel_size=5, padding=2),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            ResidualBlock1D(256, 256),
-            ResidualBlock1D(256, 256),
-            # Attention mechanism for feature selection
-            SelfAttention1D(256),
-            # Final refinement layers
-            nn.Conv1d(256, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Conv1d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Conv1d(32, 2, kernel_size=3, padding=1),  # Final I/Q channels
-            # nn.Tanh(),
-        )
-
-        # Enhanced constellation-aware refinement
-        self.constellation_refiner = EnhancedConstellationRefiner(signal_length)
-
-        # Additional phase consistency network
-        self.phase_consistency_network = PhaseConsistencyNetwork(signal_length)
-
-    def _build_enhanced_component_decoder(self, input_dim, component_type):
-        """Build enhanced decoder for specific signal component with more capacity"""
-        activation = nn.Tanh() if component_type == "phase" else nn.ReLU()
-
-        # Much larger initial mapping
-        initial_channels = 128 if component_type in ["magnitude", "phase"] else 96
-
-        return nn.Sequential(
-            # Enhanced initial mapping
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, initial_channels * self.init_size),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            # Reshape for convolutions
-            nn.Unflatten(1, (initial_channels, self.init_size)),
-            # First upsampling block (init_size -> 2*init_size)
-            nn.ConvTranspose1d(
-                initial_channels,
-                256,
-                kernel_size=5,
-                stride=2,
-                padding=2,
-                output_padding=1,
-            ),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            ResidualBlock1D(256, 256),
-            # Second upsampling block (2*init_size -> 4*init_size)
-            nn.ConvTranspose1d(
-                256, 128, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            ResidualBlock1D(128, 128),
-            # Third upsampling block (4*init_size -> 8*init_size)
-            nn.ConvTranspose1d(
-                128, 64, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            ResidualBlock1D(64, 64),
-            # Fourth upsampling block (8*init_size -> 16*init_size = signal_length)
-            nn.ConvTranspose1d(
-                64, 32, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            # Component-specific refinement
-            nn.Conv1d(32, 32, kernel_size=7, padding=3),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Conv1d(32, 16, kernel_size=5, padding=2),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.Conv1d(16, 2, kernel_size=3, padding=1),  # Output I/Q for this component
-            # activation,
-        )
-
-    def forward(self, latent):
-        batch_size = latent.shape[0]
-
-        # Split latent into components
-        mag_latent = latent[:, : self.magnitude_dim]
-        phase_latent = latent[
-            :, self.magnitude_dim : self.magnitude_dim + self.phase_dim
-        ]
-        freq_latent = latent[
-            :,
-            self.magnitude_dim + self.phase_dim : self.magnitude_dim
-            + self.phase_dim
-            + self.frequency_dim,
-        ]
-        mod_latent = latent[:, -self.modulation_dim :]
-
-        # Decode each component with enhanced decoders
-        magnitude_component = self.magnitude_decoder(mag_latent)
-        phase_component = self.phase_decoder(phase_latent)
-        frequency_component = self.frequency_decoder(freq_latent)
-        modulation_component = self.modulation_decoder(mod_latent)
-
-        # Ensure all components have the same length
-        target_length = self.signal_length
-        magnitude_component = F.interpolate(
-            magnitude_component, size=target_length, mode="linear", align_corners=False
-        )
-        phase_component = F.interpolate(
-            phase_component, size=target_length, mode="linear", align_corners=False
-        )
-        frequency_component = F.interpolate(
-            frequency_component, size=target_length, mode="linear", align_corners=False
-        )
-        modulation_component = F.interpolate(
-            modulation_component, size=target_length, mode="linear", align_corners=False
-        )
-
-        # Concatenate all components
-        combined_features = torch.cat(
-            [
-                magnitude_component,
-                phase_component,
-                frequency_component,
-                modulation_component,
-            ],
-            dim=1,
-        )  # [batch, 8, signal_length]
-
-        # Enhanced fusion with attention
-        fused_signal = self.fusion_network(combined_features)
-
-        # Apply enhanced constellation refinement
-        refined_signal = self.constellation_refiner(fused_signal)
-
-        # Apply phase consistency
-        final_signal = self.phase_consistency_network(refined_signal)
-
-        return {
-            "signal": final_signal,
-            "magnitude": magnitude_component,
-            "phase": phase_component,
-            "frequency": frequency_component,
-            "modulation": modulation_component,
-            "fused": fused_signal,  # Before final refinement
-            "refined": refined_signal,  # After constellation refinement
-        }
-
-
 class ResidualBlock1D(nn.Module):
     """1D Residual block for better gradient flow"""
 
@@ -301,324 +102,6 @@ class ResidualBlock1D(nn.Module):
         out = self.bn2(self.conv2(out))
 
         return F.relu(out + identity)
-
-
-class SelfAttention1D(nn.Module):
-    """Self-attention mechanism for 1D signals"""
-
-    def __init__(self, channels):
-        super().__init__()
-        self.channels = channels
-        self.query = nn.Conv1d(channels, channels // 8, 1)
-        self.key = nn.Conv1d(channels, channels // 8, 1)
-        self.value = nn.Conv1d(channels, channels, 1)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        batch_size, channels, length = x.shape
-
-        # Generate query, key, value
-        q = self.query(x).view(batch_size, -1, length).permute(0, 2, 1)  # [B, L, C//8]
-        k = self.key(x).view(batch_size, -1, length)  # [B, C//8, L]
-        v = self.value(x).view(batch_size, -1, length).permute(0, 2, 1)  # [B, L, C]
-
-        # Attention weights
-        attention = torch.bmm(q, k)  # [B, L, L]
-        attention = F.softmax(attention, dim=-1)
-
-        # Apply attention
-        out = torch.bmm(attention, v)  # [B, L, C]
-        out = out.permute(0, 2, 1).view(batch_size, channels, length)
-
-        return self.gamma * out + x
-
-
-class EnhancedConstellationRefiner(nn.Module):
-    """Enhanced constellation refiner with more sophisticated processing"""
-
-    def __init__(self, signal_length):
-        super().__init__()
-        self.signal_length = signal_length
-
-        # Learnable constellation templates (increased capacity)
-        self.register_buffer(
-            "constellation_templates", torch.randn(11, 64, 2)
-        )  # More constellation points
-
-        # Enhanced constellation selector with more capacity
-        self.constellation_selector = nn.Sequential(
-            nn.Conv1d(2, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 11),  # 11 modulation types
-            nn.Softmax(dim=1),
-        )
-
-        # Multi-scale refinement network
-        self.refiner = nn.Sequential(
-            # Multi-scale processing
-            nn.Conv1d(2, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            ResidualBlock1D(64, 64),
-            ResidualBlock1D(64, 64),
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            ResidualBlock1D(128, 128),
-            nn.Conv1d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Conv1d(32, 2, kernel_size=3, padding=1),
-            # nn.Tanh(),
-        )
-
-    def forward(self, signal):
-        # Select appropriate constellation
-        constellation_weights = self.constellation_selector(signal)  # [batch, 11]
-
-        # Apply enhanced refinement
-        refined = self.refiner(signal)
-
-        # Stronger residual connection with learnable weight
-        output = signal + 0.2 * refined  # Increased residual strength
-
-        return output
-
-
-class PhaseConsistencyNetwork(nn.Module):
-    """Network to ensure phase consistency across the signal"""
-
-    def __init__(self, signal_length):
-        super().__init__()
-        self.signal_length = signal_length
-
-        # Phase unwrapping and consistency network
-        self.phase_processor = nn.Sequential(
-            nn.Conv1d(2, 64, kernel_size=9, padding=4),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 128, kernel_size=7, padding=3),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            ResidualBlock1D(128, 128),
-            nn.Conv1d(128, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Conv1d(32, 2, kernel_size=3, padding=1),
-            # nn.Tanh(),
-        )
-
-        # Learnable phase correction weight
-        self.phase_weight = nn.Parameter(torch.tensor(0.1))
-
-    def forward(self, signal):
-        # Process for phase consistency
-        phase_correction = self.phase_processor(signal)
-
-        # Apply phase correction with learnable weight
-        corrected_signal = signal + self.phase_weight * phase_correction
-
-        return corrected_signal
-
-
-class PhaseFrequencyAwareDecoder(nn.Module):
-    """Decoder that explicitly reconstructs phase and frequency components"""
-
-    def __init__(self, latent_dim=256, signal_length=128):
-        super().__init__()
-        self.signal_length = signal_length
-        self.latent_dim = latent_dim
-        self.init_size = signal_length // 8
-
-        # Split latent space into different components
-        self.magnitude_dim = latent_dim // 4  # 64 dims for magnitude
-        self.phase_dim = latent_dim // 4  # 64 dims for phase
-        self.frequency_dim = latent_dim // 4  # 64 dims for frequency
-        self.modulation_dim = latent_dim // 4  # 64 dims for modulation features
-
-        # Separate decoders for different signal components
-        self.magnitude_decoder = self._build_component_decoder(
-            self.magnitude_dim, "magnitude"
-        )
-        self.phase_decoder = self._build_component_decoder(self.phase_dim, "phase")
-        self.frequency_decoder = self._build_component_decoder(
-            self.frequency_dim, "frequency"
-        )
-        self.modulation_decoder = self._build_component_decoder(
-            self.modulation_dim, "modulation"
-        )
-
-        # Fusion network to combine components
-        self.fusion_network = nn.Sequential(
-            nn.Conv1d(
-                8, 64, kernel_size=7, padding=3
-            ),  # 4 components * 2 channels each
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Conv1d(32, 16, kernel_size=3, padding=1),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.Conv1d(16, 2, kernel_size=3, padding=1),  # Final I/Q channels
-            # nn.Tanh(),
-        )
-
-        # Constellation-aware refinement
-        self.constellation_refiner = ConstellationRefiner(signal_length)
-
-    def _build_component_decoder(self, input_dim, component_type):
-        """Build decoder for specific signal component"""
-        activation = nn.Tanh() if component_type == "phase" else nn.ReLU()
-
-        return nn.Sequential(
-            nn.Linear(input_dim, 32 * self.init_size),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            # Reshape and upsample
-            nn.Unflatten(1, (32, self.init_size)),
-            nn.ConvTranspose1d(
-                32, 64, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.ConvTranspose1d(
-                64, 32, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.ConvTranspose1d(
-                32, 16, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.Conv1d(16, 2, kernel_size=3, padding=1),  # Output I/Q for this component
-            # activation,
-        )
-
-    def forward(self, latent):
-        batch_size = latent.shape[0]
-
-        # Split latent into components
-        mag_latent = latent[:, : self.magnitude_dim]
-        phase_latent = latent[
-            :, self.magnitude_dim : self.magnitude_dim + self.phase_dim
-        ]
-        freq_latent = latent[
-            :,
-            self.magnitude_dim + self.phase_dim : self.magnitude_dim
-            + self.phase_dim
-            + self.frequency_dim,
-        ]
-        mod_latent = latent[:, -self.modulation_dim :]
-
-        # Decode each component
-        magnitude_component = self.magnitude_decoder(mag_latent)
-        phase_component = self.phase_decoder(phase_latent)
-        frequency_component = self.frequency_decoder(freq_latent)
-        modulation_component = self.modulation_decoder(mod_latent)
-
-        # Ensure all components have the same length
-        target_length = self.signal_length
-        magnitude_component = F.interpolate(
-            magnitude_component, size=target_length, mode="linear", align_corners=False
-        )
-        phase_component = F.interpolate(
-            phase_component, size=target_length, mode="linear", align_corners=False
-        )
-        frequency_component = F.interpolate(
-            frequency_component, size=target_length, mode="linear", align_corners=False
-        )
-        modulation_component = F.interpolate(
-            modulation_component, size=target_length, mode="linear", align_corners=False
-        )
-
-        # Concatenate all components
-        combined_features = torch.cat(
-            [
-                magnitude_component,
-                phase_component,
-                frequency_component,
-                modulation_component,
-            ],
-            dim=1,
-        )  # [batch, 8, signal_length]
-
-        # Fuse components
-        fused_signal = self.fusion_network(combined_features)
-
-        # Apply constellation refinement
-        refined_signal = self.constellation_refiner(fused_signal)
-
-        return {
-            "signal": refined_signal,
-            "magnitude": magnitude_component,
-            "phase": phase_component,
-            "frequency": frequency_component,
-            "modulation": modulation_component,
-        }
-
-
-class ConstellationRefiner(nn.Module):
-    """Refines signals based on constellation diagram constraints"""
-
-    def __init__(self, signal_length):
-        super().__init__()
-        self.signal_length = signal_length
-
-        # Learnable constellation points for different modulation schemes
-        # These will be updated during training to match actual constellations
-        self.register_buffer(
-            "constellation_templates", torch.randn(11, 16, 2)
-        )  # 11 mod types, 16 points each, I/Q
-
-        # Attention mechanism to select appropriate constellation
-        self.constellation_selector = nn.Sequential(
-            nn.Conv1d(2, 32, kernel_size=7, padding=3),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(32, 11),  # 11 modulation types
-            nn.Softmax(dim=1),
-        )
-
-        # Refinement network
-        self.refiner = nn.Sequential(
-            nn.Conv1d(2, 32, kernel_size=5, padding=2),
-            nn.ReLU(),
-            nn.Conv1d(32, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(32, 2, kernel_size=3, padding=1),
-            # nn.Tanh(),
-        )
-
-    def forward(self, signal):
-        # Select appropriate constellation
-        constellation_weights = self.constellation_selector(signal)  # [batch, 11]
-
-        # Apply refinement
-        refined = self.refiner(signal)
-
-        # Add residual connection
-        output = signal + 0.1 * refined  # Small residual correction
-
-        return output
 
 
 class ComplexConv1d(nn.Module):
@@ -819,39 +302,6 @@ class MultiScaleFeatureExtractor(nn.Module):
 
         return complex_features
 
-
-class AttentionBlock(nn.Module):
-    """Self-attention for important feature selection"""
-
-    def __init__(self, channels):
-        super().__init__()
-        self.channels = channels
-        self.query = nn.Conv1d(
-            channels, max(1, channels // 8), 1
-        )  # Ensure at least 1 channel
-        self.key = nn.Conv1d(channels, max(1, channels // 8), 1)
-        self.value = nn.Conv1d(channels, channels, 1)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        batch_size, channels, length = x.shape
-
-        # Generate query, key, value
-        q = self.query(x).view(batch_size, -1, length).permute(0, 2, 1)  # [B, L, C//8]
-        k = self.key(x).view(batch_size, -1, length)  # [B, C//8, L]
-        v = self.value(x).view(batch_size, -1, length).permute(0, 2, 1)  # [B, L, C]
-
-        # Attention weights
-        attention = torch.bmm(q, k)  # [B, L, L]
-        attention = F.softmax(attention, dim=-1)
-
-        # Apply attention
-        out = torch.bmm(attention, v)  # [B, L, C]
-        out = out.permute(0, 2, 1).view(batch_size, channels, length)
-
-        return self.gamma * out + x
-
-
 class FrequencyDomainProcessor(nn.Module):
     """Process frequency domain features"""
 
@@ -905,111 +355,8 @@ class FrequencyDomainProcessor(nn.Module):
 
         return torch.cat([mag_features, phase_features], dim=1)  # [batch, 64, length]
 
-
-class SNRAwareEncoder(nn.Module):
-    """Encoder that separates signal features from SNR effects"""
-
-    def __init__(self, signal_length=128, latent_dim=256):
-        super().__init__()
-        self.signal_length = signal_length
-        self.latent_dim = latent_dim
-
-        # Multi-scale time domain features
-        self.time_features = MultiScaleFeatureExtractor(in_channels=1)
-
-        # Frequency domain features
-        self.freq_features = FrequencyDomainProcessor(signal_length)
-
-        # Combine features (64 from time + 64 from freq = 128 channels)
-        combined_channels = 64 + 64
-
-        # Attention mechanism
-        self.attention = AttentionBlock(combined_channels)
-
-        # Encoder layers with residual connections
-        self.encoder_layers = nn.Sequential(
-            nn.Conv1d(combined_channels, 256, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Conv1d(256, 128, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Conv1d(128, 64, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-        )
-
-        # Calculate the size after convolutions
-        self.encoded_size = self._get_encoded_size()
-
-        # Split latent space
-        self.signal_features_dim = latent_dim // 2  # 128 dims for modulation features
-        self.noise_features_dim = latent_dim // 2  # 128 dims for noise/SNR features
-
-        # Final latent representation
-        self.to_latent = nn.Sequential(
-            nn.Linear(self.encoded_size, latent_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(latent_dim * 2, latent_dim),
-        )
-
-        # SNR prediction head
-        self.snr_predictor = nn.Sequential(
-            nn.Linear(self.noise_features_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),  # Predict SNR value
-        )
-
-    def _get_encoded_size(self):
-        """Calculate the size after convolutions"""
-        with torch.no_grad():
-            x = torch.randn(1, 2, self.signal_length)
-            time_feat = self.time_features(x)
-            freq_feat = self.freq_features(x)
-            combined = torch.cat([time_feat, freq_feat], dim=1)
-            attended = self.attention(combined)
-            encoded = self.encoder_layers(attended)
-            return encoded.numel()
-
-    def forward(self, x):
-        # Extract time and frequency domain features
-        time_features = self.time_features(x)
-        freq_features = self.freq_features(x)
-
-        # Combine features
-        combined_features = torch.cat([time_features, freq_features], dim=1)
-
-        # Apply attention
-        attended_features = self.attention(combined_features)
-
-        # Encode
-        encoded = self.encoder_layers(attended_features)
-
-        # Flatten and get latent representation
-        encoded_flat = encoded.view(encoded.shape[0], -1)
-        full_embedding = self.to_latent(encoded_flat)
-
-        # Split into signal and noise features
-        signal_features = full_embedding[:, : self.signal_features_dim]
-        noise_features = full_embedding[:, self.signal_features_dim :]
-
-        # Predict SNR from noise features
-        predicted_snr = self.snr_predictor(noise_features)
-
-        return {
-            "full_embedding": full_embedding,
-            "signal_features": signal_features,
-            "noise_features": noise_features,
-            "predicted_snr": predicted_snr,
-        }
-
-
 class RFEncoder(nn.Module):
-    """Original encoder for backward compatibility"""
+    """Enhanced encoder using PyTorch's native transformer directly"""
 
     def __init__(self, signal_length=128, latent_dim=256):
         super().__init__()
@@ -1018,26 +365,64 @@ class RFEncoder(nn.Module):
 
         # Multi-scale time domain features
         self.time_features = MultiScaleFeatureExtractor(in_channels=1)
-
         # Frequency domain features
         self.freq_features = FrequencyDomainProcessor(signal_length)
 
         # Combine features (64 from time + 64 from freq = 128 channels)
-        combined_channels = 64 + 64  # Updated based on actual output sizes
+        combined_channels = 128
 
-        # Attention mechanism
-        self.attention = AttentionBlock(combined_channels)
+        # Feature-level transformer - directly use PyTorch's implementation
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=combined_channels,
+            nhead=8,  # 128 is divisible by 8
+            dim_feedforward=combined_channels * 4,
+            dropout=0.1,
+            activation='relu',
+            batch_first=False,
+            norm_first=True
+        )
+        self.feature_transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # Encoder layers with residual connections
-        self.encoder_layers = nn.Sequential(
+        # Encoder layers with progressive downsampling
+        self.conv1 = nn.Sequential(
             nn.Conv1d(combined_channels, 256, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
+        )
+
+        # Transformer at 256 channels
+        encoder_layer_256 = nn.TransformerEncoderLayer(
+            d_model=256,
+            nhead=8,  # 256 is divisible by 8
+            dim_feedforward=256 * 4,
+            dropout=0.2,
+            activation='relu',
+            batch_first=False,
+            norm_first=True
+        )
+        self.transformer_256 = nn.TransformerEncoder(encoder_layer_256, num_layers=1)
+
+        self.conv2 = nn.Sequential(
             nn.Conv1d(256, 128, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
+        )
+
+        # Transformer at 128 channels
+        encoder_layer_128 = nn.TransformerEncoderLayer(
+            d_model=128,
+            nhead=8,  # 128 is divisible by 8
+            dim_feedforward=128 * 4,
+            dropout=0.2,
+            activation='relu',
+            batch_first=False,
+            norm_first=True
+        )
+        self.transformer_128 = nn.TransformerEncoder(encoder_layer_128, num_layers=1)
+
+        self.conv3 = nn.Sequential(
             nn.Conv1d(128, 64, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(64),
             nn.ReLU(inplace=True),
@@ -1049,9 +434,12 @@ class RFEncoder(nn.Module):
 
         # Final latent representation
         self.to_latent = nn.Sequential(
-            nn.Linear(self.encoded_size, latent_dim * 2),
+            nn.Linear(self.encoded_size, latent_dim * 3),
             nn.ReLU(),
             nn.Dropout(0.2),
+            nn.Linear(latent_dim * 3, latent_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(latent_dim * 2, latent_dim),
         )
 
@@ -1062,9 +450,25 @@ class RFEncoder(nn.Module):
             time_feat = self.time_features(x)
             freq_feat = self.freq_features(x)
             combined = torch.cat([time_feat, freq_feat], dim=1)
-            attended = self.attention(combined)
-            encoded = self.encoder_layers(attended)
-            return encoded.numel()
+
+            # Apply transformations
+            x = combined.permute(2, 0, 1)  # [length, batch, channels]
+            x = self.feature_transformer(x)
+            x = x.permute(1, 2, 0)  # back to [batch, channels, length]
+
+            x = self.conv1(x)
+            x = x.permute(2, 0, 1)
+            x = self.transformer_256(x)
+            x = x.permute(1, 2, 0)
+
+            x = self.conv2(x)
+            x = x.permute(2, 0, 1)
+            x = self.transformer_128(x)
+            x = x.permute(1, 2, 0)
+
+            x = self.conv3(x)
+
+            return x.numel()
 
     def forward(self, x):
         # Extract time and frequency domain features
@@ -1074,131 +478,135 @@ class RFEncoder(nn.Module):
         # Combine features
         combined_features = torch.cat([time_features, freq_features], dim=1)
 
-        # Apply attention
-        attended_features = self.attention(combined_features)
+        # Apply feature transformer
+        # [batch, channels, length] -> [length, batch, channels]
+        x = combined_features.permute(2, 0, 1)
+        x = self.feature_transformer(x)
+        # [length, batch, channels] -> [batch, channels, length]
+        x = x.permute(1, 2, 0)
 
-        # Encode
-        encoded = self.encoder_layers(attended_features)
+        # Progressive encoding with attention
+        x = self.conv1(x)
+
+        # Apply transformer at 256 channels
+        x = x.permute(2, 0, 1)  # [batch, 256, length] -> [length, batch, 256]
+        x = self.transformer_256(x)
+        x = x.permute(1, 2, 0)  # [length, batch, 256] -> [batch, 256, length]
+
+        x = self.conv2(x)
+
+        # Apply transformer at 128 channels
+        x = x.permute(2, 0, 1)
+        x = self.transformer_128(x)
+        x = x.permute(1, 2, 0)
+
+        x = self.conv3(x)
 
         # Flatten and get latent representation
-        encoded_flat = encoded.view(encoded.shape[0], -1)
+        encoded_flat = x.view(x.shape[0], -1)
         latent = self.to_latent(encoded_flat)
+
         return latent
 
 
 class RFDecoderEnhanced(nn.Module):
-    """Enhanced decoder with more capacity for noisy signals"""
+    """Decoder using PyTorch's native transformer directly"""
 
     def __init__(self, latent_dim=256, signal_length=128):
         super().__init__()
         self.signal_length = signal_length
-        self.latent_dim = latent_dim
+        self.init_size = signal_length // 8
 
-        # Calculate initial size for decoder
-        self.init_size = signal_length // 8  # After 3 upsampling layers
-
-        # Moderate initial mapping (much smaller than 40M version)
+        # Initial mapping
         self.from_latent = nn.Sequential(
-            nn.Linear(latent_dim, 128 * self.init_size),  # Reasonable increase from 64
+            nn.Linear(latent_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256 * self.init_size),
             nn.ReLU(),
             nn.Dropout(0.1),
         )
 
-        # Balanced decoder layers
+        # Main decoder layers
         self.decoder_layers = nn.Sequential(
-            # First upsampling block
-            nn.ConvTranspose1d(
-                128, 256, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
+            # First upsampling
+            nn.ConvTranspose1d(256, 512, kernel_size=5, stride=2, padding=2, output_padding=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            ResidualBlock1D(512, 512),
+
+            # Second upsampling
+            nn.ConvTranspose1d(512, 256, kernel_size=5, stride=2, padding=2, output_padding=1),
             nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            # Second upsampling block
-            nn.ConvTranspose1d(
-                256, 128, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
+            nn.ReLU(),
+            ResidualBlock1D(256, 256),
+
+            # Third upsampling
+            nn.ConvTranspose1d(256, 128, kernel_size=5, stride=2, padding=2, output_padding=1),
             nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
-            # Third upsampling block
-            nn.ConvTranspose1d(
-                128, 64, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            # Additional refinement layer (this is the key improvement)
-            nn.Conv1d(64, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            # Final layers
-            nn.Conv1d(64, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32),
-            nn.ReLU(inplace=True),
-            # Output layer
-            nn.Conv1d(32, 2, kernel_size=5, padding=2),
-            # nn.Tanh(),
+            nn.ReLU(),
         )
 
+        # Transformer for long-range dependencies - direct PyTorch usage
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=128,
+            nhead=8,
+            dim_feedforward=128 * 4,
+            dropout=0.1,
+            activation='relu',
+            batch_first=False,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        # Final refinement layers
+        self.final_layers = nn.Sequential(
+            nn.Conv1d(128, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Conv1d(32, 2, kernel_size=7, padding=3),
+        )
+
+        self.output_scale = nn.Parameter(torch.tensor(1.0))
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
+                if hasattr(m, 'out_channels') and m.out_channels == 2:
+                    nn.init.xavier_uniform_(m.weight, gain=1.5)
+                else:
+                    nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(self, latent):
-        # From latent to feature map
         x = self.from_latent(latent)
-        x = x.view(x.shape[0], 128, self.init_size)
+        x = x.view(x.shape[0], 256, self.init_size)
 
-        # Decode
-        reconstructed = self.decoder_layers(x)
+        # Apply decoder layers
+        x = self.decoder_layers(x)
 
-        # Ensure correct output size
+        # Apply transformer
+        # [batch, 128, length] -> [length, batch, 128]
+        x = x.permute(2, 0, 1)
+        x = self.transformer(x)
+        # [length, batch, 128] -> [batch, 128, length]
+        x = x.permute(1, 2, 0)
+
+        # Final processing
+        x = self.final_layers(x)
+        reconstructed = x * self.output_scale
+
         if reconstructed.shape[-1] != self.signal_length:
             reconstructed = F.interpolate(
-                reconstructed,
-                size=self.signal_length,
-                mode="linear",
-                align_corners=False,
+                reconstructed, size=self.signal_length, mode="linear", align_corners=False
             )
 
         return reconstructed
-
-
-class SNRAwareArcFaceLoss(nn.Module):
-    """ArcFace loss that focuses on signal features, not noise"""
-
-    def __init__(self, embedding_dim, num_classes, margin=0.5, scale=64):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_classes = num_classes
-        self.margin = margin
-        self.scale = scale
-
-        # Weight matrix for signal features only
-        self.weight = nn.Parameter(torch.FloatTensor(num_classes, embedding_dim))
-        nn.init.xavier_uniform_(self.weight)
-
-    def forward(self, signal_embeddings, labels):
-        # Use only signal features for classification, ignore noise features
-        embeddings = signal_embeddings.float()
-        device = embeddings.device
-
-        # Normalize embeddings and weights
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-        weight = F.normalize(self.weight.float(), p=2, dim=1)
-
-        # Compute cosine similarity
-        cosine = F.linear(embeddings, weight)
-
-        # Get target cosine values
-        target_cosine = cosine[torch.arange(len(labels), device=device), labels]
-
-        # Add margin to target
-        target_theta = torch.acos(torch.clamp(target_cosine, -1 + 1e-7, 1 - 1e-7))
-        target_theta_margin = target_theta + self.margin
-        target_cosine_margin = torch.cos(target_theta_margin)
-
-        # Replace target values with margin-adjusted values
-        logits = cosine.clone()
-        logits[torch.arange(len(labels), device=device), labels] = target_cosine_margin
-
-        # Scale logits
-        logits *= self.scale
-
-        return F.cross_entropy(logits, labels)
 
 
 class AdaptiveArcFaceLoss(nn.Module):
@@ -1258,55 +666,6 @@ class AdaptiveArcFaceLoss(nn.Module):
         return F.cross_entropy(logits, labels)
 
 
-class ArcFaceLoss(nn.Module):
-    """Original ArcFace loss for backward compatibility"""
-
-    def __init__(self, embedding_dim, num_classes, margin=0.5, scale=64):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_classes = num_classes
-        self.margin = margin
-        self.scale = scale
-
-        # Weight matrix
-        self.weight = nn.Parameter(torch.FloatTensor(num_classes, embedding_dim))
-        nn.init.xavier_uniform_(self.weight)
-
-    def forward(self, embeddings, labels):
-        # Force float32 computation for numerical stability
-        original_dtype = embeddings.dtype
-        embeddings = embeddings.float()
-        device = embeddings.device
-
-        # Normalize embeddings and weights
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-        weight = F.normalize(self.weight.float(), p=2, dim=1)
-
-        # Compute cosine similarity
-        cosine = F.linear(embeddings, weight)
-
-        # Get target cosine values
-        target_cosine = cosine[torch.arange(len(labels), device=device), labels]
-
-        # Add margin to target
-        target_theta = torch.acos(torch.clamp(target_cosine, -1 + 1e-7, 1 - 1e-7))
-        target_theta_margin = target_theta + self.margin
-        target_cosine_margin = torch.cos(target_theta_margin)
-
-        # Replace target values with margin-adjusted values
-        logits = cosine.clone()
-        logits[torch.arange(len(labels), device=device), labels] = target_cosine_margin
-
-        # Scale logits
-        logits *= self.scale
-
-        # Convert back to original dtype if needed
-        if original_dtype != torch.float32:
-            logits = logits.to(dtype=original_dtype)
-
-        return F.cross_entropy(logits, labels)
-
-
 class RFEncoderDecoder(L.LightningModule):
     """Enhanced Phase and frequency aware encoder-decoder"""
 
@@ -1324,7 +683,6 @@ class RFEncoderDecoder(L.LightningModule):
         initial_snr_threshold=16,
         final_snr_threshold=-20,
         curriculum_epochs=75,
-        use_snr_aware=False,
         use_enhanced_decoder=True,
     ):
         super().__init__()
@@ -1335,7 +693,6 @@ class RFEncoderDecoder(L.LightningModule):
         self.learning_rate = learning_rate
         self.reconstruction_weight = reconstruction_weight
         self.arcface_weight = arcface_weight
-        self.use_snr_aware = use_snr_aware
         self.use_enhanced_decoder = use_enhanced_decoder
 
         # Curriculum learning parameters
@@ -1345,24 +702,15 @@ class RFEncoderDecoder(L.LightningModule):
         self.curriculum_epochs = curriculum_epochs
 
         # Networks - choose encoder type
-        if use_snr_aware:
-            self.encoder = SNRAwareEncoder(signal_length, latent_dim)
-        else:
-            self.encoder = RFEncoder(signal_length, latent_dim)
+        self.encoder = RFEncoder(signal_length, latent_dim)
 
         # Choose decoder type
         self.decoder = RFDecoderEnhanced(latent_dim, signal_length)  # Single decoder
 
         # Loss functions
-        if use_snr_aware:
-            signal_dim = latent_dim // 2
-            self.arcface_loss = SNRAwareArcFaceLoss(
-                signal_dim, self.num_classes, arcface_margin, arcface_scale
-            )
-        else:
-            self.arcface_loss = AdaptiveArcFaceLoss(
-                latent_dim, self.num_classes, arcface_margin, arcface_scale
-            )
+        self.arcface_loss = AdaptiveArcFaceLoss(
+            latent_dim, self.num_classes, arcface_margin, arcface_scale
+        )
 
         self.reconstruction_loss = EnhancedReconstructionLoss(signal_length)
 
@@ -1470,14 +818,9 @@ class RFEncoderDecoder(L.LightningModule):
         )
 
         # ArcFace loss
-        if self.use_snr_aware and isinstance(encoder_output, dict):
-            arcface_loss = self.arcface_loss(
-                encoder_output["signal_features"], labels_curriculum.squeeze()
-            )
-        else:
-            arcface_loss = self.arcface_loss(
-                encoder_output, labels_curriculum.squeeze(), snrs_curriculum
-            )
+        arcface_loss = self.arcface_loss(
+            encoder_output, labels_curriculum.squeeze(), snrs_curriculum
+        )
 
         # Combined loss
         total_loss = (
@@ -1502,23 +845,10 @@ class RFEncoderDecoder(L.LightningModule):
         encoder_output, decoder_output = self.forward(x)
 
         # Handle different encoder types for ArcFace
-        if self.use_snr_aware and isinstance(encoder_output, dict):
-            latent_for_arcface = encoder_output["signal_features"]
-            full_latent = encoder_output["full_embedding"]
-
-            # SNR prediction loss
-            snr_loss = F.mse_loss(
-                encoder_output["predicted_snr"].squeeze(), snrs.float()
-            )
-
-            # ArcFace loss on signal features only
-            arcface_loss = self.arcface_loss(latent_for_arcface, labels.squeeze())
-
-        else:
-            latent_for_arcface = encoder_output
-            snr_loss = 0
-            # ArcFace loss with SNR adaptation
-            arcface_loss = self.arcface_loss(latent_for_arcface, labels.squeeze(), snrs)
+        latent_for_arcface = encoder_output
+        snr_loss = 0
+        # ArcFace loss with SNR adaptation
+        arcface_loss = self.arcface_loss(latent_for_arcface, labels.squeeze(), snrs)
 
         # Compute focused reconstruction loss
         recon_loss, loss_components = self.reconstruction_loss(
@@ -1531,16 +861,11 @@ class RFEncoderDecoder(L.LightningModule):
             self.arcface_weight * arcface_loss
         )
 
-        if self.use_snr_aware and isinstance(encoder_output, dict):
-            total_loss += 0.1 * snr_loss
 
         # Logging - clean and focused
         self.log("val_loss", total_loss, prog_bar=True)
         self.log("val_recon_loss", recon_loss)
         self.log("val_arcface_loss", arcface_loss)
-
-        if self.use_snr_aware and isinstance(encoder_output, dict):
-            self.log("val_snr_loss", snr_loss)
 
         # Log the three core reconstruction loss components
         for key, value in loss_components.items():
@@ -1549,14 +874,7 @@ class RFEncoderDecoder(L.LightningModule):
         # Save for visualization (first batch only)
         if batch_idx == 0:
             # Save embeddings for visualization
-            if self.use_snr_aware and isinstance(encoder_output, dict):
-                self.val_latents = latent_for_arcface.detach().cpu()  # Use signal features
-                self.val_encoder_output = {
-                    k: v.detach().cpu() for k, v in encoder_output.items()
-                }
-            else:
-                self.val_latents = latent_for_arcface.detach().cpu()
-
+            self.val_latents = latent_for_arcface.detach().cpu()
             # Save basic data for visualization
             self.val_labels = labels.detach().cpu()
             self.val_snrs = snrs.detach().cpu()
