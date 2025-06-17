@@ -678,7 +678,7 @@ class RFEncoderDecoder(L.LightningModule):
         arcface_margin=0.4,
         arcface_scale=32,
         reconstruction_weight=1.0,
-        arcface_weight=0.0,
+        arcface_weight=0.1,
         curriculum_learning=True,
         initial_snr_threshold=16,
         final_snr_threshold=-20,

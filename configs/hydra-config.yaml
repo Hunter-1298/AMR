@@ -1,7 +1,7 @@
 # Global configurations
 project_name: arcface
-run_name: Reconstruction_Only
-train_encoder: True
+run_name: Reconstruction_ArcFace0.1
+train_encoder: False
 linear_probe_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
