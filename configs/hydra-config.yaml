@@ -1,6 +1,6 @@
 # Global configurations
 project_name: arcface
-run_name: Reconstruction_ArcFace0.1
+run_name: Diffusion
 train_encoder: False
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -12,7 +12,7 @@ vis_diffusion: False
 # Classifier Settings #
 train_classifier: False
 classifier_free: True
-fine_tune_diffusion: True
+fine_tune_diffusion: False
 # Checkpoints to load #
 encoder_checkpoint_name: arcface_encoder.ckpt
 # checkpoint for reconstruction vae
@@ -27,8 +27,8 @@ encoder_checkpoint_name: arcface_encoder.ckpt
 diffusion_checkpoint_name: prototype.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_noncondition_val_loss=0.3309.ckpt
 mode: online
-debug: False
-log_model: True
+debug: True
+log_model: False
 seed: 42
 
 # In your hydra config
@@ -69,7 +69,7 @@ Diffusion:
     linear_start: 0.0001 # starting noise value for beta schedule
     linear_end: 0.01 # ending value for the beta schedule
     weight_decay: 1e-2
-    latent_scaling: 1.1981 # contrastive scaling # 2.98697 - reconstruction encoder # False - set to false if we want to recalcualte
+    latent_scaling: 0.57221 #- arcface encoder #1.1981 # contrastive scaling # 2.98697 - reconstruction encoder # False - set to false if we want to recalcualte
     diffusion_contrastive: ${diffusion_contrastive}
     num_classes: ${hyperparams.num_classes}
     unet:
@@ -85,6 +85,12 @@ Diffusion:
         layers_per_block: 3
         condition: ${conditon}
         conditional: 11 # Class conditioning
+    rfnet:
+        _target_: models.classifier.rfnet.RFNet
+        num_classes: 11
+        input_channels: 2 # I/Q channels
+        input_length: 128
+        dropout_rate: 0.2
 
 Classifier:
     _target_: models.classifier.classifier.LatentClassifier
