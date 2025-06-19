@@ -158,7 +158,7 @@ def main(cfg: DictConfig):
         model = hydra.utils.instantiate(
             cfg.Diffusion, encoder=encoder, label_names=label_names
         )
-        # model = torch.compile(model)
+        model = torch.compile(model)
 
         # Create checkpoint dir
         checkpoint_dir = os.path.join(

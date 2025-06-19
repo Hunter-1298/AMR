@@ -55,7 +55,7 @@ class UNet1DModel(nn.Module):
         block_out_channels: List[int] = [32, 32, 32],  # pyright: ignore
         num_attention_heads: int = 8,
         layers_per_block: int = 1,
-        condition: bool = True,
+        condition: bool = False,
         conditional: int = 11,
     ):
         super().__init__()

@@ -167,8 +167,9 @@ class ArcFaceCenters(nn.Module):
         """
         # Handle different embedding shapes
         if embeddings.dim() == 3:
-            # Pool spatial dimensions if needed [batch, channels, length] -> [batch, channels]
-            embeddings = F.adaptive_avg_pool1d(embeddings, 1).squeeze(-1)
+            # Reshape from [batch, channels, length] to [batch, channels*length]
+            batch_size = embeddings.shape[0]
+            embeddings = embeddings.reshape(batch_size, -1)
 
         # Normalize embeddings
         embeddings_norm = F.normalize(embeddings, p=2, dim=1)
@@ -282,31 +283,19 @@ class AWGNScheduler(nn.Module):
 
     def add_awgn_noise(self, signal: torch.Tensor, current_snr_db: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Add AWGN noise to degrade signal from current SNR to target SNR
-
-        Args:
-            signal: RF signal [batch, 2, length] - already has some noise
-            current_snr_db: Current SNR of the signal [batch]
-            t: Timestep [batch] - determines target SNR
-
-        Returns:
-            noisy_signal: Signal degraded to target SNR
-            noise: Additional noise that was added
+        Add AWGN noise to degrade signal from current SNR to target SNR, with realistic clipping
         """
         # Convert timestep to target SNR
         target_snr_db = self.timestep_to_snr(t)
 
-        # Calculate signal power (includes existing signal + existing noise)
+        # Calculate signal power
         total_power = torch.mean(signal ** 2, dim=(1, 2), keepdim=True)  # [batch, 1, 1]
 
         # Convert SNRs to linear scale
-        current_snr_linear = 10 ** (current_snr_db / 10)  # [batch]
-        target_snr_linear = 10 ** (target_snr_db / 10)   # [batch]
+        current_snr_linear = 10 ** (current_snr_db / 10)
+        target_snr_linear = 10 ** (target_snr_db / 10)
 
-        # Calculate clean signal power from current noisy signal
-        # current_snr = signal_power / current_noise_power
-        # total_power = signal_power + current_noise_power
-        # Solving: signal_power = total_power * current_snr / (1 + current_snr)
+        # Calculate clean signal power
         signal_power = total_power * current_snr_linear.view(-1, 1, 1) / (1 + current_snr_linear.view(-1, 1, 1))
 
         # Calculate current noise power
@@ -317,8 +306,6 @@ class AWGNScheduler(nn.Module):
 
         # Additional noise power needed
         additional_noise_power = target_total_noise_power - current_noise_power
-
-        # Only add noise if target SNR is lower than current SNR
         additional_noise_power = torch.clamp(additional_noise_power, min=0)
 
         # Generate additional AWGN noise
@@ -327,6 +314,9 @@ class AWGNScheduler(nn.Module):
 
         # Add additional noise to signal
         noisy_signal = signal + additional_noise
+
+        # Apply realistic hardware clipping at [-1, 1]
+        noisy_signal = torch.clamp(noisy_signal, -1.0, 1.0)
 
         return noisy_signal, additional_noise
 
@@ -342,259 +332,6 @@ class AWGNScheduler(nn.Module):
         normalized_t = timestep.float() / (self.n_steps - 1)
         snr_db = self.snr_max - normalized_t * (self.snr_max - self.snr_min)
         return snr_db
-
-
-# class ConstellationPrototypeLoss(nn.Module):
-#     """
-#     Constellation prototype loss that matches modulation-specific characteristics
-#     instead of exact signal-to-signal constellation matching
-#     """
-
-#     def __init__(self, label_names, temperature=0.1):
-#         super().__init__()
-#         self.temperature = temperature
-#         self.label_names = label_names
-
-#     def forward(self, x_denoised: torch.Tensor, class_labels: torch.Tensor) -> torch.Tensor:
-#         """
-#         Compute constellation prototype loss for each signal based on its modulation class
-
-#         Args:
-#             x_denoised: Denoised signal [batch, 2, length] (I/Q)
-#             class_labels: Class labels [batch]
-
-#         Returns:
-#             loss: Average prototype loss across batch
-#         """
-#         batch_size = x_denoised.shape[0]
-#         losses = []
-
-#         for batch_idx in range(batch_size):
-#             signal = x_denoised[batch_idx:batch_idx+1]  # [1, 2, length]
-#             class_id = class_labels[batch_idx].item()
-#             modulation = self.label_names[class_id]
-
-#             # Route to appropriate prototype loss based on modulation type
-#             if 'PSK' in modulation.upper():
-#                 loss = self.psk_prototype_loss(signal)
-#             elif 'QAM' in modulation.upper():
-#                 loss = self.qam_prototype_loss(signal)
-#             elif 'FSK' in modulation.upper():
-#                 loss = self.fsk_prototype_loss(signal)
-#             elif 'AM' in modulation.upper():
-#                 loss = self.am_prototype_loss(signal)
-#             else:
-#                 # Generic modulation loss for unknown types
-#                 loss = self.generic_modulation_loss(signal)
-
-#             losses.append(loss)
-
-#         return torch.stack(losses).mean()
-
-#     def extract_constellation(self, signal: torch.Tensor) -> torch.Tensor:
-#         """Extract complex constellation from I/Q signal"""
-#         i_channel = signal[:, 0]  # [batch, length]
-#         q_channel = signal[:, 1]  # [batch, length]
-#         return torch.complex(i_channel, q_channel)
-
-#     def psk_prototype_loss(self, signal: torch.Tensor) -> torch.Tensor:
-#         """
-#         PSK prototype: uniform amplitude, clustered phases
-#         Information encoded in phase only
-#         """
-#         const = self.extract_constellation(signal)  # [1, length]
-#         const = const.squeeze(0)  # [length]
-
-#         # 1. Amplitude should be relatively uniform (constant envelope)
-#         amplitude = torch.abs(const)
-#         amplitude_mean = torch.mean(amplitude)
-#         amplitude_variance = torch.var(amplitude) / (amplitude_mean ** 2 + 1e-8)  # Normalized variance
-
-#         # 2. Phase should form clusters (low entropy when quantized)
-#         phase = torch.angle(const)  # [-π, π]
-
-#         # Create phase histogram
-#         n_bins = 32
-#         phase_hist = self._compute_phase_histogram(phase, n_bins)
-
-#         # Encourage clustering by minimizing entropy
-#         phase_entropy = -torch.sum(phase_hist * torch.log(phase_hist + 1e-8))
-#         max_entropy = torch.log(torch.tensor(float(n_bins)))  # Normalize
-#         normalized_entropy = phase_entropy / max_entropy
-
-#         # 3. Phase consistency (phases should be stable, not random)
-#         phase_unwrapped = torch.unwrap(phase)
-#         phase_derivative = torch.diff(phase_unwrapped)
-#         phase_stability = torch.var(phase_derivative)
-
-#         # Combine losses (lower is better)
-#         psk_loss = (
-#             1.0 * amplitude_variance +      # Penalize amplitude variation
-#             0.5 * normalized_entropy +      # Penalize phase randomness
-#             0.3 * phase_stability           # Penalize phase instability
-#         )
-
-#         return psk_loss
-
-#     def qam_prototype_loss(self, signal: torch.Tensor) -> torch.Tensor:
-#         """
-#         QAM prototype: grid structure in I/Q plane
-#         Information encoded in both amplitude and phase
-#         """
-#         const = self.extract_constellation(signal).squeeze(0)  # [length]
-
-#         i_channel = torch.real(const)
-#         q_channel = torch.imag(const)
-
-#         # 1. Both I and Q should have discrete levels (grid structure)
-#         i_discreteness = self._measure_discreteness(i_channel)
-#         q_discreteness = self._measure_discreteness(q_channel)
-
-#         # 2. Constellation should form clusters around grid points
-#         grid_structure_loss = self._measure_grid_structure(i_channel, q_channel)
-
-#         # 3. Power should be relatively uniform across symbols
-#         power = torch.abs(const) ** 2
-#         power_variance = torch.var(power) / (torch.mean(power) ** 2 + 1e-8)
-
-#         qam_loss = (
-#             0.4 * (2.0 - i_discreteness - q_discreteness) +  # Encourage discreteness
-#             0.4 * grid_structure_loss +                      # Encourage grid structure
-#             0.2 * power_variance                             # Moderate power variation
-#         )
-
-#         return qam_loss
-
-#     def fsk_prototype_loss(self, signal: torch.Tensor) -> torch.Tensor:
-#         """
-#         FSK prototype: frequency domain characteristics
-#         Information encoded as frequency shifts
-#         """
-#         const = self.extract_constellation(signal).squeeze(0)  # [length]
-
-#         # 1. Instantaneous frequency should have discrete levels
-#         phase = torch.angle(const)
-#         phase_unwrapped = torch.unwrap(phase)
-#         inst_freq = torch.gradient(phase_unwrapped)[0]  # Approximate derivative
-
-#         freq_discreteness = self._measure_discreteness(inst_freq)
-
-#         # 2. Frequency transitions should be clean (not gradual)
-#         freq_derivative = torch.gradient(inst_freq)[0]
-#         transition_sharpness = torch.mean(torch.abs(freq_derivative))
-
-#         # 3. Power should be relatively constant (like PSK)
-#         amplitude = torch.abs(const)
-#         amplitude_variance = torch.var(amplitude) / (torch.mean(amplitude) ** 2 + 1e-8)
-
-#         fsk_loss = (
-#             0.5 * (1.0 - freq_discreteness) +     # Encourage discrete frequencies
-#             0.3 * (-transition_sharpness) +       # Encourage sharp transitions
-#             0.2 * amplitude_variance              # Discourage amplitude variation
-#         )
-
-#         return fsk_loss
-
-#     def am_prototype_loss(self, signal: torch.Tensor) -> torch.Tensor:
-#         """
-#         AM prototype: amplitude modulation characteristics
-#         Information encoded in amplitude variations
-#         """
-#         const = self.extract_constellation(signal).squeeze(0)  # [length]
-
-#         # 1. Amplitude should vary significantly (that's where the information is)
-#         amplitude = torch.abs(const)
-#         amplitude_range = torch.max(amplitude) - torch.min(amplitude)
-#         amplitude_mean = torch.mean(amplitude)
-#         amplitude_variation = amplitude_range / (amplitude_mean + 1e-8)
-
-#         # 2. Phase should be relatively stable
-#         phase = torch.angle(const)
-#         phase_unwrapped = torch.unwrap(phase)
-#         phase_stability = torch.var(torch.gradient(phase_unwrapped)[0])
-
-#         # 3. Amplitude changes should be smooth (not abrupt)
-#         amplitude_smoothness = torch.var(torch.gradient(amplitude)[0])
-
-#         am_loss = (
-#             0.4 * (-amplitude_variation) +        # Encourage amplitude variation
-#             0.4 * phase_stability +               # Discourage phase variation
-#             0.2 * amplitude_smoothness            # Encourage smooth amplitude changes
-#         )
-
-#         return am_loss
-
-#     def generic_modulation_loss(self, signal: torch.Tensor) -> torch.Tensor:
-#         """Generic loss for unknown modulation types"""
-#         const = self.extract_constellation(signal).squeeze(0)
-
-#         # Basic modulation characteristics
-#         amplitude = torch.abs(const)
-#         phase = torch.angle(const)
-
-#         # Encourage some structure (not completely random)
-#         amplitude_structure = -torch.var(amplitude)  # Some amplitude variation
-#         phase_structure = -torch.var(torch.gradient(torch.unwrap(phase))[0])  # Some phase structure
-
-#         return 0.5 * amplitude_structure + 0.5 * phase_structure
-
-#     def _compute_phase_histogram(self, phase: torch.Tensor, n_bins: int = 32) -> torch.Tensor:
-#         """Compute soft histogram of phase values"""
-#         # Create bin edges from -π to π
-#         bin_edges = torch.linspace(-torch.pi, torch.pi, n_bins + 1, device=phase.device)
-#         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-#         bin_width = bin_edges[1] - bin_edges[0]
-
-#         # Soft binning using Gaussian kernels
-#         phase_expanded = phase.unsqueeze(-1)  # [length, 1]
-#         centers_expanded = bin_centers.unsqueeze(0)  # [1, n_bins]
-
-#         # Gaussian kernel for soft assignment
-#         sigma = bin_width / 3
-#         weights = torch.exp(-0.5 * ((phase_expanded - centers_expanded) / sigma) ** 2)
-
-#         # Normalize to get probability distribution
-#         histogram = torch.sum(weights, dim=0)  # [n_bins]
-#         histogram = histogram / (torch.sum(histogram) + 1e-8)
-
-#         return histogram
-
-#     def _measure_discreteness(self, values: torch.Tensor) -> torch.Tensor:
-#         """
-#         Measure how discrete/quantized a signal is
-#         Returns value between 0 (continuous) and 1 (perfectly discrete)
-#         """
-#         # Compute histogram
-#         n_bins = 16
-#         hist = torch.histc(values, bins=n_bins, min=values.min(), max=values.max())
-#         hist = hist / (torch.sum(hist) + 1e-8)
-
-#         # High peaks indicate discreteness
-#         # Use negative entropy as discreteness measure
-#         entropy = -torch.sum(hist * torch.log(hist + 1e-8))
-#         max_entropy = torch.log(torch.tensor(float(n_bins)))
-
-#         discreteness = 1.0 - (entropy / max_entropy)
-#         return torch.clamp(discreteness, 0, 1)
-
-#     def _measure_grid_structure(self, i_values: torch.Tensor, q_values: torch.Tensor) -> torch.Tensor:
-#         """Measure how well I/Q values form a grid structure"""
-#         # For QAM, I and Q values should be uncorrelated and form rectangular grid
-
-#         # 1. Measure correlation (should be low for rectangular grid)
-#         i_centered = i_values - torch.mean(i_values)
-#         q_centered = q_values - torch.mean(q_values)
-
-#         correlation = torch.abs(torch.mean(i_centered * q_centered))
-#         correlation_normalized = correlation / (torch.std(i_values) * torch.std(q_values) + 1e-8)
-
-#         # 2. Both I and Q should span reasonable range (not collapsed to single value)
-#         i_range = torch.max(i_values) - torch.min(i_values)
-#         q_range = torch.max(q_values) - torch.min(q_values)
-#         range_penalty = torch.exp(-(i_range + q_range))  # Penalty if ranges are too small
-
-#         grid_loss = correlation_normalized + range_penalty
-#         return grid_loss
 
 
 class LatentDiffusion(L.LightningModule):
@@ -618,8 +355,8 @@ class LatentDiffusion(L.LightningModule):
         arcface_alignment_weight: float = 0.2,
         classification_loss_weight: float = 0.1,
         # Curriculum learning
-        curriculum_epochs: int = 150,
-        high_snr_start: float = 10.0,
+        curriculum_epochs: int = 50,
+        high_snr_start: float = 16.0,
         low_snr_end: float = -20.0,
         # Training strategy
         predict_noise: bool = True,  # Whether to predict noise or clean latent
@@ -661,6 +398,7 @@ class LatentDiffusion(L.LightningModule):
 
         # Initialize RFNet classifier
         self.rfnet = rfnet
+
         # Initialize ArcFace centers
         self.arcface_centers = ArcFaceCenters(
             encoder_decoder=encoder,
@@ -675,22 +413,6 @@ class LatentDiffusion(L.LightningModule):
 
         # Enhanced reconstruction loss (from your encoder-decoder)
         self.enhanced_reconstruction_loss = self.encoder_decoder.reconstruction_loss
-
-        # Extract ArcFace centers from pre-trained encoder-decoder
-        self._extract_arcface_centers()
-
-    def _extract_arcface_centers(self):
-        """Extract ArcFace class centers from pre-trained encoder-decoder"""
-        if hasattr(self.encoder_decoder, 'arcface_loss') and hasattr(self.encoder_decoder.arcface_loss, 'weight'):
-            # Get normalized ArcFace centers
-            arcface_centers = F.normalize(self.encoder_decoder.arcface_loss.weight, p=2, dim=1)
-            self.register_buffer("arcface_centers", arcface_centers)
-        else:
-            # Fallback: create learnable class prototypes
-            print("Warning: ArcFace centers not found, creating random prototypes")
-            centers = torch.randn(self.num_classes, self.encoder.hparams.latent_dim)
-            centers = F.normalize(centers, p=2, dim=1)
-            self.register_buffer("arcface_centers", centers)
 
     def get_curriculum_snr_threshold(self) -> float:
         """Get current SNR threshold for curriculum learning"""
@@ -712,11 +434,20 @@ class LatentDiffusion(L.LightningModule):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode input to latent space and scale"""
         z = self.encoder(x) * self.latent_scaling
+
+        # Reshape from [batch_size, 256] to [batch_size, 32, 8]
+        # Distributing 256 features as 32 channels × 8 sequence length
+        z = z.reshape(z.shape[0], 32, 8)
+
         return z
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode from latent space"""
-        z_unscaled = z / self.latent_scaling
+        # Reshape from [batch_size, 32, 8] back to [batch_size, 256]
+        batch_size = z.shape[0]
+        z_flat = z.reshape(batch_size, 256)
+
+        z_unscaled = z_flat / self.latent_scaling
         return self.decoder(z_unscaled)
 
     def forward(
@@ -733,7 +464,7 @@ class LatentDiffusion(L.LightningModule):
             t: Timestep [batch]
             class_embedding: Class conditioning [batch, embedding_dim]
         """
-        return self.unet(z_noisy, t, class_embedding)
+        return self.unet(z_noisy, t)
 
     def compute_reconstruction_losses(
         self,
@@ -753,7 +484,7 @@ class LatentDiffusion(L.LightningModule):
         """
         losses = {}
 
-        if is_paired:
+        if is_paired:  # Fixed syntax error here
             # For paired data, use full reconstruction loss against clean signal
             recon_loss, loss_components = self.enhanced_reconstruction_loss(
                 x_denoised, x_clean
@@ -770,6 +501,7 @@ class LatentDiffusion(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # Get optimizer
+        # import ipdb; ipdb.set_trace()
         optimizer = self.optimizers()
         scheduler = self.lr_schedulers()
 
@@ -794,7 +526,7 @@ class LatentDiffusion(L.LightningModule):
         t = torch.randint(0, self.n_steps, (batch_size,), device=self.device).long()
 
         # Add AWGN noise to clean signal based on timestep
-        x_noisy, signal_noise = self.awgn_scheduler.add_awgn_noise(x_clean, t)
+        x_noisy, signal_noise = self.awgn_scheduler.add_awgn_noise(x_clean, original_snr, t)
 
         # Encode both clean and noisy signals
         z_clean = self.encode(x_clean)
@@ -813,7 +545,7 @@ class LatentDiffusion(L.LightningModule):
         class_embedding = self.arcface_centers[class_labels]
 
         # Predict using UNet in latent space
-        predicted = self.forward(z_noisy, t, class_embedding)
+        predicted = self.forward(z_noisy, t)
 
         # Primary latent denoising loss
         if self.predict_noise:
@@ -828,7 +560,7 @@ class LatentDiffusion(L.LightningModule):
         x_denoised = self.decode(z_denoised)
 
         # Determine if we have paired data (synthetic noise) or unpaired (real low-SNR)
-        current_snr = self.awgn_scheduler.get_snr_at_timestep(t)
+        current_snr = self.awgn_scheduler.timestep_to_snr(t)
         is_paired = True  # We're always adding synthetic AWGN noise
 
         # Compute reconstruction losses
@@ -840,15 +572,23 @@ class LatentDiffusion(L.LightningModule):
         arcface_loss = self.compute_arcface_alignment_loss(z_denoised, class_labels)
 
         # Classification loss using RFNet on denoised signal
-        class_logits, class_features = self.rfnet(x_denoised, return_features=True)
+        class_logits, class_features = self.rfnet(z_denoised, return_features=True)
         classification_loss = F.cross_entropy(class_logits, class_labels)
 
-        # Combined loss
+        snr_factor = torch.sigmoid((original_snr - snr_threshold) / 5.0)  # [batch]
+        snr_factor_mean = snr_factor.mean()  # Scalar
+
+        # Apply weights using the scalar mean
+        recon_weight = self.reconstruction_loss_weight * snr_factor_mean
+        arcface_weight = self.arcface_alignment_weight + self.reconstruction_loss_weight * (1 - snr_factor_mean) * 0.5
+        class_weight = self.classification_loss_weight + self.reconstruction_loss_weight * (1 - snr_factor_mean) * 0.5
+
+        # Apply weighted losses
         total_loss = (
             self.latent_denoise_weight * latent_denoise_loss +
-            self.reconstruction_loss_weight * reconstruction_losses['total_reconstruction'] +
-            self.arcface_alignment_weight * arcface_loss +
-            self.classification_loss_weight * classification_loss
+            recon_weight * reconstruction_losses['total_reconstruction'] +
+            arcface_weight * arcface_loss +
+            class_weight * classification_loss
         )
 
         # Backprop
@@ -882,50 +622,133 @@ class LatentDiffusion(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         x_clean, class_labels, original_snr = batch
 
-        # Store for confusion matrix
+        # Store for confusion matrix and analysis
         if not hasattr(self, "val_preds"):
             self.val_preds = []
             self.val_labels = []
             self.val_snrs = []
             self.val_denoised_preds = []
+            self.val_latents = []
+
+        # Initialize storage for visualization examples
+        if not hasattr(self, "viz_examples"):
+            self.viz_examples = {
+                'clean': [],
+                'noisy': [],
+                'denoised': [],
+                'labels': [],
+                'original_snr': [],
+                'target_snr': [],
+                'timesteps': []
+            }
 
         batch_size = x_clean.shape[0]
+
+        # First encode the clean signal
+        z_clean = self.encode(x_clean)
+        self.val_latents.append(z_clean.reshape(batch_size, -1).detach().cpu())  # Store flattened latents
+
+
+        # Classify on latent representation of original signal
+        original_logits, _ = self.rfnet(z_clean, return_features=True)
+        original_pred_classes = torch.argmax(original_logits, dim=1)
+
+        # Add predictions from original clean signal
+        self.val_preds.append(original_pred_classes.detach().cpu())
+        self.val_labels.append(class_labels.detach().cpu())
+        self.val_snrs.append(original_snr.detach().cpu())
 
         # Test denoising at multiple noise levels
         test_timesteps = [100, 300, 500, 700, 900]  # Different noise levels
         total_losses = []
 
+        # Create lists to store denoised predictions
+        all_denoised_preds = []
+        all_noise_levels = []
+
+        # Choose a few representative examples for visualization
+        # Collect a few examples for visualization (limited to first few batches)
+        if len(self.viz_examples['clean']) < 10 and batch_idx < 3:
+            # Try to select diverse examples (high SNR, medium SNR, low SNR)
+            if batch_size > 3:
+                # Sort by SNR and take examples from different parts of the range
+                snr_indices = torch.argsort(original_snr)
+                viz_indices = [snr_indices[0], snr_indices[-1]]  # Lowest and highest SNR
+                if batch_size > 3:
+                    viz_indices.append(snr_indices[batch_size // 2])  # Middle SNR
+            else:
+                viz_indices = list(range(min(batch_size, 2)))  # Just use available examples
+
+            # For each selected example
+            for viz_idx in viz_indices:
+                # Use middle timestep for visualization
+                viz_timestep_idx = len(test_timesteps) // 2
+                viz_timestep = test_timesteps[viz_timestep_idx]
+                t = torch.tensor([viz_timestep], device=self.device).long()
+
+                # Add noise
+                x_noisy_single, _ = self.awgn_scheduler.add_awgn_noise(
+                    x_clean[viz_idx:viz_idx+1],
+                    original_snr[viz_idx:viz_idx+1],
+                    t
+                )
+
+                # Encode noisy signal
+                z_noisy_single = self.encode(x_noisy_single)
+
+                # Denoise in latent space
+                predicted = self.forward(z_noisy_single, t)
+
+                # Reconstruct denoised signal
+                if self.predict_noise:
+                    z_denoised = z_noisy_single - predicted
+                else:
+                    z_denoised = predicted
+
+                # Decode
+                x_denoised_single = self.decode(z_denoised)
+
+                # Get target SNR
+                target_snr = self.awgn_scheduler.timestep_to_snr(t)
+
+                # Store for visualization
+                self.viz_examples['clean'].append(x_clean[viz_idx:viz_idx+1].detach().cpu().float())  # Ensure float32
+                self.viz_examples['noisy'].append(x_noisy_single.detach().cpu().float())
+                self.viz_examples['denoised'].append(x_denoised_single.detach().cpu().float())
+                self.viz_examples['labels'].append(class_labels[viz_idx:viz_idx+1].detach().cpu())
+                self.viz_examples['original_snr'].append(original_snr[viz_idx:viz_idx+1].detach().cpu())
+                self.viz_examples['target_snr'].append(target_snr.detach().cpu())
+                self.viz_examples['timesteps'].append(t.detach().cpu())
+
+        # Continue with regular validation for all examples
         for test_t in test_timesteps:
             t = torch.full((batch_size,), test_t, device=self.device).long()
+            target_snr = self.awgn_scheduler.timestep_to_snr(t)
 
             # Add AWGN noise
-            x_noisy, signal_noise = self.awgn_scheduler.add_awgn_noise(x_clean, t)
+            x_noisy, signal_noise = self.awgn_scheduler.add_awgn_noise(x_clean, original_snr, t)
 
-            # Encode
-            z_clean = self.encode(x_clean)
+            # Encode noisy signal
             z_noisy = self.encode(x_noisy)
+
+            # Denoise in latent space
+            predicted = self.forward(z_noisy, t)
 
             # Compute target
             if self.predict_noise:
                 latent_noise = z_noisy - z_clean
                 target = latent_noise
-            else:
-                target = z_clean
-
-            # Get class conditioning
-            class_embedding = self.arcface_centers[class_labels]
-
-            # Denoise in latent space
-            predicted = self.forward(z_noisy, t, class_embedding)
-            latent_denoise_loss = F.mse_loss(predicted, target)
-
-            # Reconstruct
-            if self.predict_noise:
+                # Reconstruct denoised signal
                 z_denoised = z_noisy - predicted
             else:
+                target = z_clean
                 z_denoised = predicted
 
+            # Decode
             x_denoised = self.decode(z_denoised)
+
+            # Compute losses
+            latent_denoise_loss = F.mse_loss(predicted, target)
 
             # Reconstruction losses
             recon_losses = self.compute_reconstruction_losses(
@@ -935,9 +758,19 @@ class LatentDiffusion(L.LightningModule):
             # ArcFace alignment
             arcface_loss = self.compute_arcface_alignment_loss(z_denoised, class_labels)
 
-            # Classification on denoised signal
-            class_logits, _ = self.rfnet(x_denoised, return_features=True)
-            classification_loss = F.cross_entropy(class_logits, class_labels)
+            # Classification on denoised latent
+            denoised_logits, _ = self.rfnet(z_denoised, return_features=True)
+            denoised_pred_classes = torch.argmax(denoised_logits, dim=1)
+            classification_loss = F.cross_entropy(denoised_logits, class_labels)
+
+            # Save predictions at this noise level
+            all_denoised_preds.append(denoised_pred_classes.detach().cpu())
+            all_noise_levels.append(target_snr.mean().detach().cpu())
+
+            # Calculate denoising accuracy for this noise level
+            denoised_acc = (denoised_pred_classes == class_labels).float().mean()
+            self.log(f"val/denoised_acc_t{test_t}", denoised_acc)
+            self.log(f"val/denoised_snr{target_snr.mean().item():.1f}", denoised_acc)
 
             total_loss = (
                 self.latent_denoise_weight * latent_denoise_loss +
@@ -949,48 +782,20 @@ class LatentDiffusion(L.LightningModule):
             total_losses.append(total_loss)
 
             # Log per timestep
-            target_snr = self.awgn_scheduler.get_snr_at_timestep(t[0])
             self.log(f"val/latent_denoise_loss_t{test_t}", latent_denoise_loss)
             self.log(f"val/total_loss_t{test_t}", total_loss)
+
+        # Store all denoised predictions for later analysis
+        if len(all_denoised_preds) > 0:
+            self.val_denoised_preds.extend(all_denoised_preds)
 
         # Average validation loss
         avg_val_loss = torch.stack(total_losses).mean()
         self.log("val_loss", avg_val_loss, prog_bar=True)
 
-        # Classification on original clean signal for comparison
-        original_logits, _ = self.rfnet(x_clean, return_features=True)
-        original_pred_classes = torch.argmax(original_logits, dim=1)
-
-        # Classification on noisy signal (worst case - highest noise)
-        t_worst = torch.full((batch_size,), self.n_steps - 1, device=self.device).long()
-        x_very_noisy, _ = self.awgn_scheduler.add_awgn_noise(x_clean, t_worst)
-        z_very_noisy = self.encode(x_very_noisy)
-
-        # Denoise the very noisy signal
-        class_embedding = self.arcface_centers[class_labels]
-        predicted_noise_or_clean = self.forward(z_very_noisy, t_worst, class_embedding)
-
-        if self.predict_noise:
-            z_final_denoised = z_very_noisy - predicted_noise_or_clean
-        else:
-            z_final_denoised = predicted_noise_or_clean
-
-        x_final_denoised = self.decode(z_final_denoised)
-        denoised_logits, _ = self.rfnet(x_final_denoised, return_features=True)
-        denoised_pred_classes = torch.argmax(denoised_logits, dim=1)
-
-        # Store predictions
-        self.val_preds.append(original_pred_classes.detach().cpu())
-        self.val_denoised_preds.append(denoised_pred_classes.detach().cpu())
-        self.val_labels.append(class_labels.detach().cpu())
-        self.val_snrs.append(original_snr.detach().cpu())
-
         # Log accuracies
         original_acc = (original_pred_classes == class_labels).float().mean()
-        denoised_acc = (denoised_pred_classes == class_labels).float().mean()
-
-        self.log("val/original_acc", original_acc)
-        self.log("val/denoised_acc", denoised_acc, prog_bar=True)
+        self.log("val/original_acc", original_acc, prog_bar=True)
 
         return avg_val_loss
 
@@ -998,45 +803,103 @@ class LatentDiffusion(L.LightningModule):
         if hasattr(self, "val_preds") and len(self.val_preds) > 0:
             # Concatenate predictions
             original_preds = torch.cat(self.val_preds).cpu().numpy()
-            denoised_preds = torch.cat(self.val_denoised_preds).cpu().numpy()
+            denoised_preds = torch.cat(self.val_denoised_preds).cpu().numpy() if hasattr(self, "val_denoised_preds") and len(self.val_denoised_preds) > 0 else None
             all_labels = torch.cat(self.val_labels).cpu().numpy()
             all_snrs = torch.cat(self.val_snrs).cpu().numpy()
-
-            # Create comprehensive analysis plots
-            self._plot_validation_analysis(original_preds, denoised_preds, all_labels, all_snrs)
-
+            # Concatenate latent representations if they exist
+            if hasattr(self, "val_latents") and len(self.val_latents) > 0:
+                # Store the concatenated tensor
+                latents_tensor = torch.cat(self.val_latents)
+                # Replace the list with the tensor (temporary)
+                self.val_latents = latents_tensor
+                # Create comprehensive analysis plots
+                self._plot_validation_analysis(original_preds, denoised_preds, all_labels, all_snrs)
+                # Create denoising visualizations if we have collected examples
+                if hasattr(self, "viz_examples") and len(self.viz_examples['clean']) > 0:
+                    self._create_denoising_visualizations()
+                # Add ArcFace prototype visualization
+                self.visualize_arcface_prototypes()
+                # Reset val_latents to an empty list
+                self.val_latents = []
+            else:
+                print("Warning: No latent representations collected, skipping ArcFace visualization")
             # Clear stored predictions
             self.val_preds.clear()
-            self.val_denoised_preds.clear()
             self.val_labels.clear()
             self.val_snrs.clear()
+            self.val_denoised_preds.clear()
 
-    def _plot_validation_analysis(self, preds, labels, snrs):
-        """Plot confusion matrix and SNR vs accuracy analysis"""
-        label_names = [self.label_names[i] for i in range(self.num_classes)]
+    def _create_denoising_visualizations(self):
+        """Create all visualization plots from collected examples"""
+        # Limit to a reasonable number of examples
+        num_examples = min(len(self.viz_examples['clean']), 5)
+
+        # Process each example
+        for i in range(num_examples):
+            # Get the data for this example - make sure to convert to float32
+            x_clean = self.viz_examples['clean'][i].to(self.device).float()  # Explicitly use float
+            x_noisy = self.viz_examples['noisy'][i].to(self.device).float()
+            x_denoised = self.viz_examples['denoised'][i].to(self.device).float()
+            class_labels = self.viz_examples['labels'][i].to(self.device)
+            target_snr = self.viz_examples['target_snr'][i].to(self.device)
+
+            # Encode for latent space visualization
+            with torch.no_grad():
+                z_clean = self.encode(x_clean)
+                z_noisy = self.encode(x_noisy)
+                z_denoised = self.encode(x_denoised)
+
+
+            # 2. Visualize denoising process
+            self.visualize_denoising_process(
+                x_clean, x_noisy, x_denoised, z_clean, z_noisy, z_denoised,
+                target_snr, class_labels, max_samples=1
+            )
+
+
+        # Clear the examples after visualization
+        for key in self.viz_examples:
+            self.viz_examples[key] = []
+
+
+    def _plot_validation_analysis(self, original_preds, denoised_preds, labels, snrs):
+        """Plot confusion matrix and SNR vs accuracy analysis using actual label names"""
+        # Convert label_names to a Python list to avoid OmegaConf issues
+        if not isinstance(self.label_names, list):
+            try:
+                label_names = [self.label_names[str(i)] if isinstance(self.label_names, dict)
+                            else self.label_names[i] for i in range(self.num_classes)]
+            except:
+                # Fallback if we can't extract names
+                label_names = [f"Class {i}" for i in range(self.num_classes)]
+        else:
+            label_names = self.label_names
 
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
 
-        # Confusion Matrix
-        cm = confusion_matrix(labels, preds, labels=range(self.num_classes))
+        # Plot 1: Confusion Matrix for original predictions
+        cm = confusion_matrix(labels, original_preds, labels=range(self.num_classes))
         cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
 
         sns.heatmap(
             cm_norm, annot=True, fmt='.2f', cmap='Blues',
             xticklabels=label_names, yticklabels=label_names, ax=axes[0, 0]
         )
-        axes[0, 0].set_title('Confusion Matrix')
+        axes[0, 0].set_title('Confusion Matrix (Original)')
         axes[0, 0].set_xlabel('Predicted')
         axes[0, 0].set_ylabel('True')
 
-        # Accuracy vs SNR
+        # Rotate x-axis labels for better readability
+        plt.setp(axes[0, 0].get_xticklabels(), rotation=45, ha='right')
+
+        # Plot 2: Accuracy vs SNR
         snr_bins = np.arange(-20, 25, 5)
         accuracies = []
 
         for i in range(len(snr_bins) - 1):
             mask = (snrs >= snr_bins[i]) & (snrs < snr_bins[i + 1])
             if mask.sum() > 0:
-                acc = (preds[mask] == labels[mask]).mean()
+                acc = (original_preds[mask] == labels[mask]).mean()
                 accuracies.append(acc)
             else:
                 accuracies.append(0)
@@ -1048,36 +911,41 @@ class LatentDiffusion(L.LightningModule):
         axes[0, 1].grid(True, alpha=0.3)
         axes[0, 1].set_ylim(0, 1.05)
 
-        # Per-class accuracy
+        # Plot 3: Per-class accuracy with actual label names
         class_accuracies = []
         for class_id in range(self.num_classes):
             mask = labels == class_id
             if mask.sum() > 0:
-                acc = (preds[mask] == labels[mask]).mean()
+                acc = (original_preds[mask] == labels[mask]).mean()
                 class_accuracies.append(acc)
             else:
                 class_accuracies.append(0)
 
+        # Use actual label names for x-axis
         axes[1, 0].bar(range(self.num_classes), class_accuracies)
-        axes[1, 0].set_xlabel('Class')
+        axes[1, 0].set_xlabel('Modulation Type')
         axes[1, 0].set_ylabel('Accuracy')
         axes[1, 0].set_title('Per-Class Accuracy')
         axes[1, 0].set_xticks(range(self.num_classes))
-        axes[1, 0].set_xticklabels(label_names, rotation=45)
+        axes[1, 0].set_xticklabels(label_names, rotation=45, ha='right')
 
-        # SNR distribution
+        # Plot 4: SNR distribution
         axes[1, 1].hist(snrs, bins=20, alpha=0.7, edgecolor='black')
         axes[1, 1].set_xlabel('SNR (dB)')
         axes[1, 1].set_ylabel('Count')
         axes[1, 1].set_title('SNR Distribution')
         axes[1, 1].axvline(self.get_curriculum_snr_threshold(), color='red',
-                          linestyle='--', label=f'Current Threshold')
+                        linestyle='--', label=f'Current Threshold: {self.get_curriculum_snr_threshold():.1f} dB')
         axes[1, 1].legend()
+
+        # Add epoch information to the figure
+        if hasattr(self, 'current_epoch'):
+            fig.suptitle(f"Validation Analysis - Epoch {self.current_epoch}", fontsize=16, y=0.98)
 
         plt.tight_layout()
 
         # Log to wandb
-        if self.logger:
+        if self.logger and hasattr(self.logger, "experiment"):
             buf = io.BytesIO()
             plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
             buf.seek(0)
@@ -1085,6 +953,474 @@ class LatentDiffusion(L.LightningModule):
             self.logger.experiment.log({"validation_analysis": wandb.Image(img)})
 
         plt.close()
+    def visualize_denoising_process(self, x_clean, x_noisy, x_denoised, z_clean, z_noisy, z_denoised,
+                                target_snr, class_labels=None, max_samples=2):
+        """
+        Visualize the denoising process in both signal and latent space using t-SNE.
+
+        Args:
+            x_clean: Clean signals [batch, 2, length]
+            x_noisy: Noisy signals [batch, 2, length]
+            x_denoised: Denoised signals [batch, 2, length]
+            z_clean: Clean latents [batch, channels, length]
+            z_noisy: Noisy latents [batch, channels, length]
+            z_denoised: Denoised latents [batch, channels, length]
+            target_snr: Target SNR values after noise addition [batch]
+            class_labels: Optional class labels for signals [batch]
+            max_samples: Maximum number of samples to visualize
+        """
+        batch_size = x_clean.shape[0]
+        num_samples = min(batch_size, max_samples)
+
+        # Create figure with multiple rows (one per sample) and 3 columns
+        fig, axes = plt.subplots(num_samples, 3, figsize=(15, 4*num_samples))
+
+        # If only one sample, expand axes dimensions
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+
+        for i in range(num_samples):
+            # Get sample data
+            clean = x_clean[i].detach().cpu().numpy()  # [2, length]
+            noisy = x_noisy[i].detach().cpu().numpy()  # [2, length]
+            denoised = x_denoised[i].detach().cpu().numpy()  # [2, length]
+            targ_snr = target_snr[i].item()
+
+            # Get class label if provided
+            label_str = ""
+            if class_labels is not None:
+                label_idx = class_labels[i].item()
+                # Get actual label name
+                label_str = f" - {self.label_names[int(label_idx)]}"
+
+            time_axis = np.arange(clean.shape[1])
+
+            # Plot time-domain signals
+            axes[i, 0].plot(time_axis, clean[0], 'b-', label='Clean I', alpha=0.9)
+            axes[i, 0].plot(time_axis, clean[1], 'b--', label='Clean Q', alpha=0.9)
+            axes[i, 0].plot(time_axis, noisy[0], 'r-', label='Noisy I', alpha=0.5)
+            axes[i, 0].plot(time_axis, noisy[1], 'r--', label='Noisy Q', alpha=0.5)
+            axes[i, 0].plot(time_axis, denoised[0], 'g-', label='Denoised I', alpha=0.7)
+            axes[i, 0].plot(time_axis, denoised[1], 'g--', label='Denoised Q', alpha=0.7)
+            axes[i, 0].set_title(f"Time Domain (SNR: {targ_snr:.1f}dB){label_str}")
+            axes[i, 0].legend(loc='upper right')
+            axes[i, 0].grid(True, alpha=0.3)
+
+            # Plot I/Q constellations
+            axes[i, 1].scatter(clean[0], clean[1], s=4, c='blue', alpha=0.7, label='Clean')
+            axes[i, 1].scatter(noisy[0], noisy[1], s=2, c='red', alpha=0.3, label='Noisy')
+            axes[i, 1].scatter(denoised[0], denoised[1], s=3, c='green', alpha=0.5, label='Denoised')
+            axes[i, 1].set_title(f"I/Q Constellation{label_str}")
+            axes[i, 1].set_xlim(-2, 2)
+            axes[i, 1].set_ylim(-2, 2)
+            axes[i, 1].grid(True, alpha=0.3)
+            axes[i, 1].legend(loc='upper right')
+
+            try:
+                # Plot latent space visualizations using t-SNE instead of PCA
+                from sklearn.manifold import TSNE
+
+                # Reshape latents for t-SNE
+                z_clean_flat = z_clean[i].detach().cpu().numpy().reshape(1, -1)  # [1, features]
+                z_noisy_flat = z_noisy[i].detach().cpu().numpy().reshape(1, -1)  # [1, features]
+                z_denoised_flat = z_denoised[i].detach().cpu().numpy().reshape(1, -1)  # [1, features]
+
+                # Stack for t-SNE
+                z_combined = np.vstack([z_clean_flat, z_noisy_flat, z_denoised_flat])  # [3, features]
+
+                if z_combined.shape[0] > 1:  # Need at least 2 samples for t-SNE
+                    # For single examples, we'll create copies to allow t-SNE to work
+                    if z_combined.shape[0] < 4:
+                        # Add small noise to create multiple versions of each point
+                        noise_scale = 1e-4
+                        z_expanded = []
+                        for z in z_combined:
+                            z_expanded.append(z)  # Original
+                            for _ in range(3):  # 3 noisy copies
+                                z_expanded.append(z + np.random.normal(0, noise_scale, z.shape))
+                        z_combined = np.vstack(z_expanded)
+
+                    # Apply t-SNE with appropriate perplexity (lower for fewer samples)
+                    perplexity = min(5, z_combined.shape[0] - 1)  # Perplexity must be less than n_samples
+                    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity,
+                                learning_rate='auto', init='pca')
+                    z_2d = tsne.fit_transform(z_combined)
+
+                    # Only keep the first 3 points (original clean, noisy, denoised)
+                    z_2d = z_2d[:3]
+
+                    # Plot t-SNE latent space
+                    axes[i, 2].scatter(z_2d[0, 0], z_2d[0, 1], s=100, c='blue', marker='o', label='Clean')
+                    axes[i, 2].scatter(z_2d[1, 0], z_2d[1, 1], s=100, c='red', marker='x', label='Noisy')
+                    axes[i, 2].scatter(z_2d[2, 0], z_2d[2, 1], s=100, c='green', marker='+', label='Denoised')
+
+                    # Add arrows to show denoising direction
+                    axes[i, 2].arrow(z_2d[1, 0], z_2d[1, 1],
+                                    z_2d[2, 0]-z_2d[1, 0], z_2d[2, 1]-z_2d[1, 1],
+                                    head_width=0.1, head_length=0.1, fc='black', ec='black', alpha=0.7)
+
+                    # Add another arrow from noisy to clean for comparison
+                    axes[i, 2].arrow(z_2d[1, 0], z_2d[1, 1],
+                                    z_2d[0, 0]-z_2d[1, 0], z_2d[0, 1]-z_2d[1, 1],
+                                    head_width=0.1, head_length=0.1, fc='blue', ec='blue', alpha=0.3,
+                                    linestyle='--')
+
+                    axes[i, 2].set_title(f"Latent Space (t-SNE){label_str}")
+                    axes[i, 2].grid(True, alpha=0.3)
+                    axes[i, 2].legend(loc='upper right')
+                else:
+                    # Fallback if t-SNE doesn't work
+                    axes[i, 2].text(0.5, 0.5, "t-SNE requires multiple points",
+                                ha='center', va='center', transform=axes[i, 2].transAxes)
+                    axes[i, 2].set_title("Latent Space (t-SNE unavailable)")
+
+            except Exception as e:
+                # Fallback visualization if t-SNE fails
+                print(f"t-SNE failed, using simple representation: {e}")
+                axes[i, 2].text(0.5, 0.5, f"t-SNE Error: {str(e)[:50]}...",
+                            ha='center', va='center', transform=axes[i, 2].transAxes)
+                axes[i, 2].set_title("Latent Space (t-SNE failed)")
+
+            # Calculate and display metrics
+            mse_noisy = np.mean((clean - noisy)**2)
+            mse_denoised = np.mean((clean - denoised)**2)
+            improvement = (mse_noisy - mse_denoised) / mse_noisy * 100
+
+            # Add text annotations with metrics
+            axes[i, 1].text(0.05, 0.05,
+                        f"MSE Noisy: {mse_noisy:.4f}\nMSE Denoised: {mse_denoised:.4f}\nImprovement: {improvement:.1f}%",
+                        transform=axes[i, 1].transAxes,
+                        bbox=dict(facecolor='white', alpha=0.8))
+
+        plt.tight_layout()
+
+        # Add main title with epoch
+        if hasattr(self, 'current_epoch'):
+            plt.suptitle(f"Denoising Process - Epoch {self.current_epoch}", y=1.02)
+
+        # Convert to wandb Image
+        if self.logger:
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150)
+            buf.seek(0)
+            img = Image.open(buf)
+            self.logger.experiment.log({"denoising_process_visualization": wandb.Image(img)})
+
+        plt.close(fig)
+        return fig
+
+    def visualize_arcface_prototypes(self):
+        """
+        Visualize ArcFace class prototypes and sample projections using t-SNE.
+        Shows how latent embeddings are distributed relative to class centers.
+        """
+        if not hasattr(self, "arcface_centers") or not hasattr(self, "val_latents"):
+            return
+
+        try:
+            # Create figure with 2 subplots (not 3)
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+            # Get ArcFace centers (prototypes)
+            centers = self.arcface_centers.centers.detach().cpu().numpy()
+
+            # Ensure val_latents is a tensor
+            if isinstance(self.val_latents, list):
+                if len(self.val_latents) == 0:
+                    print("No latent samples available for visualization")
+                    return
+                embeddings = torch.cat(self.val_latents)
+            else:
+                embeddings = self.val_latents
+
+            # Ensure val_labels is a tensor
+            if isinstance(self.val_labels, list):
+                if len(self.val_labels) == 0:
+                    print("No labels available for visualization")
+                    return
+                labels = torch.cat(self.val_labels).cpu().numpy()
+            else:
+                labels = self.val_labels.cpu().numpy()
+
+            # Handle labels shape - squeeze if needed
+            if labels.ndim > 1:
+                labels = labels.squeeze()
+
+            # Normalize latent embeddings
+            embeddings_norm = F.normalize(embeddings, p=2, dim=1).cpu().numpy()
+
+            # Set up colors and class names
+            unique_labels = np.unique(labels)
+            num_classes = len(self.label_names)
+            colors = plt.cm.tab20(np.linspace(0, 1, num_classes))
+
+            # 1. Plot class prototypes on unit circle (first 2 dimensions)
+            prototype_2d = centers[:, :2]  # First 2 dimensions
+            prototype_2d = prototype_2d / np.maximum(np.linalg.norm(prototype_2d, axis=1, keepdims=True), 1e-10)
+
+            for i in range(num_classes):
+                # Get actual label name
+                label_name = self.label_names[i]
+
+                # Plot class prototype
+                axes[0].scatter(
+                    prototype_2d[i, 0], prototype_2d[i, 1],
+                    s=200, marker='*', c=[colors[i]], label=label_name,
+                    edgecolors='black', linewidths=1, alpha=0.9, zorder=10
+                )
+
+                # Add text label
+                axes[0].text(
+                    prototype_2d[i, 0] * 1.1, prototype_2d[i, 1] * 1.1,
+                    label_name, color=colors[i], fontweight='bold',
+                    ha='center', va='center', fontsize=9
+                )
+
+                # Draw lines from origin to prototype
+                axes[0].plot([0, prototype_2d[i, 0]], [0, prototype_2d[i, 1]],
+                            color=colors[i], linestyle='--', alpha=0.5)
+
+            # Draw unit circle
+            circle = plt.Circle((0, 0), 1, fill=False, color='gray', linestyle='-', alpha=0.8)
+            axes[0].add_artist(circle)
+
+            # Draw axes
+            axes[0].axhline(y=0, color='k', linestyle=':', alpha=0.3)
+            axes[0].axvline(x=0, color='k', linestyle=':', alpha=0.3)
+
+            # Set limits and title
+            axes[0].set_xlim(-1.2, 1.2)
+            axes[0].set_ylim(-1.2, 1.2)
+            axes[0].set_aspect('equal')
+            axes[0].set_title('ArcFace Class Prototypes on Unit Circle')
+            axes[0].grid(True, alpha=0.3)
+
+            # 2. Use t-SNE to visualize prototypes and embeddings together
+            from sklearn.manifold import TSNE
+
+            # Combine prototypes and embeddings for t-SNE
+            combined_data = np.vstack([centers, embeddings_norm])
+            combined_labels = np.concatenate([
+                np.arange(num_classes),  # Class indices for prototypes
+                labels  # Class labels for embeddings
+            ])
+
+            # Create indicator for prototypes vs samples
+            is_prototype = np.concatenate([
+                np.ones(num_classes),    # 1 for prototypes
+                np.zeros(len(labels))    # 0 for embeddings
+            ])
+
+            # Apply t-SNE
+            perplexity = min(30, len(combined_data) // 5)  # Lower perplexity for smaller datasets
+            tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity,
+                    learning_rate='auto', init='pca')
+            combined_2d = tsne.fit_transform(combined_data)
+
+            # Separate prototype and sample points
+            prototype_points = combined_2d[:num_classes]
+            sample_points = combined_2d[num_classes:]
+
+            # Plot prototypes and samples in t-SNE space
+            for i in range(num_classes):
+                # Plot class prototype
+                axes[1].scatter(
+                    prototype_points[i, 0], prototype_points[i, 1],
+                    s=200, marker='*', c=[colors[i]],
+                    edgecolors='black', linewidths=1, alpha=1.0, zorder=10
+                )
+
+                # Add prototype label
+                axes[1].text(
+                    prototype_points[i, 0], prototype_points[i, 1] + 0.5,
+                    self.label_names[i], color=colors[i], fontweight='bold',
+                    ha='center', va='bottom', fontsize=9
+                )
+
+                # Plot embeddings for this class
+                mask = labels == i
+                if mask.sum() > 0:
+                    axes[1].scatter(
+                        sample_points[mask, 0], sample_points[mask, 1],
+                        s=30, c=[colors[i]], alpha=0.5, label=self.label_names[i]
+                    )
+
+            axes[1].set_title('t-SNE: ArcFace Embeddings and Prototypes')
+            axes[1].grid(True, alpha=0.3)
+
+            # Add a single legend for the t-SNE plot
+            handles, labels = axes[1].get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            axes[1].legend(by_label.values(), by_label.keys(),
+                        loc='upper center', bbox_to_anchor=(0.5, -0.1),
+                        ncol=3, fontsize=9)
+
+            # Add epoch information
+            if hasattr(self, 'current_epoch'):
+                fig.suptitle(f"ArcFace Prototype Analysis - Epoch {self.current_epoch}",
+                            fontsize=14, y=0.98)
+
+            # Add spacing margin
+            plt.tight_layout()
+
+            # Log to wandb
+            if self.logger and hasattr(self.logger, "experiment"):
+                self.logger.experiment.log({"arcface_embeddings_tsne": wandb.Image(fig)})
+
+            plt.close(fig)
+
+            # Create additional visualization: Angular distribution between samples and their prototypes
+            self._plot_angular_distribution()
+
+        except Exception as e:
+            print(f"Error in ArcFace prototype visualization: {e}")
+            import traceback
+            traceback.print_exc()
+            plt.close("all")
+
+    def _plot_angular_distribution(self):
+        """
+        Plot the distribution of angular distances between embeddings and their class prototypes.
+        This shows how closely samples align with their class centers.
+        """
+        try:
+            # Get ArcFace centers
+            centers = self.arcface_centers.centers.detach().cpu()
+
+            # Ensure val_latents is a tensor
+            if isinstance(self.val_latents, list):
+                if len(self.val_latents) == 0:
+                    print("No latent samples available for visualization")
+                    return
+                embeddings = torch.cat(self.val_latents)
+            else:
+                embeddings = self.val_latents
+
+            # Ensure val_labels is a tensor
+            if isinstance(self.val_labels, list):
+                if len(self.val_labels) == 0:
+                    print("No labels available for visualization")
+                    return
+                labels = torch.cat(self.val_labels)
+            else:
+                labels = self.val_labels
+
+            # Handle labels shape - squeeze if needed
+            if labels.ndim > 1 and labels.shape[1] == 1:
+                labels = labels.squeeze(1)
+
+            # Normalize embeddings
+            centers_norm = F.normalize(centers, p=2, dim=1)
+            embeddings_norm = F.normalize(embeddings, p=2, dim=1)
+
+            # Calculate angular distances to matching class centers
+            cos_similarities = []
+            angular_dists = []
+            class_names = []  # Store class names for each sample
+            snrs = []
+
+            # Process each embedding individually
+            for i in range(len(embeddings_norm)):
+                if i >= len(labels):
+                    print(f"Warning: More embeddings ({len(embeddings_norm)}) than labels ({len(labels)})")
+                    break
+
+                # Get label as Python integer
+                label_idx = labels[i].item()
+
+                # Get center for this class
+                class_center = centers_norm[label_idx]
+                embedding = embeddings_norm[i]
+
+                # Get the actual modulation name
+                class_name = self.label_names[label_idx]
+                class_names.append(class_name)
+
+                # Compute cosine similarity
+                cos_sim = F.cosine_similarity(embedding.unsqueeze(0), class_center.unsqueeze(0)).item()
+                cos_similarities.append(cos_sim)
+
+                # Convert to angle in degrees
+                angle = np.arccos(np.clip(cos_sim, -1.0, 1.0)) * 180 / np.pi
+                angular_dists.append(angle)
+
+                # Get SNR if available
+                if hasattr(self, "val_snrs") and isinstance(self.val_snrs, list) and len(self.val_snrs) > 0:
+                    if i < len(torch.cat(self.val_snrs)):
+                        snrs.append(torch.cat(self.val_snrs)[i].item())
+                elif hasattr(self, "val_snrs") and torch.is_tensor(self.val_snrs):
+                    if i < len(self.val_snrs):
+                        snrs.append(self.val_snrs[i].item())
+
+            # Skip visualization if we don't have any valid data
+            if len(angular_dists) == 0:
+                print("No valid angular distances computed")
+                return
+
+            # Create figure
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+            # Plot 1: Histogram of angular distances
+            axes[0].hist(angular_dists, bins=30, alpha=0.7, color='blue', edgecolor='black')
+            axes[0].axvline(x=np.mean(angular_dists), color='red', linestyle='--',
+                        label=f'Mean: {np.mean(angular_dists):.2f}°')
+            axes[0].set_xlabel('Angular Distance to Class Prototype (degrees)')
+            axes[0].set_ylabel('Count')
+            axes[0].set_title('Distribution of Angular Distances')
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+
+            # Plot 2: Angular distance vs SNR (if available)
+            if len(snrs) > 0:
+                # Create array for colormap based on class
+                unique_classes = np.unique(class_names)
+                class_to_idx = {name: i for i, name in enumerate(unique_classes)}
+                color_indices = np.array([class_to_idx[name] for name in class_names])
+
+                scatter = axes[1].scatter(snrs, angular_dists, alpha=0.6,
+                                    c=color_indices, cmap='tab20')
+
+                # Add legend for modulation types
+                legend_elements = [plt.Line2D([0], [0], marker='o', color='w',
+                                            markerfacecolor=plt.cm.tab20(i/len(unique_classes)),
+                                            label=name, markersize=8)
+                                for i, name in enumerate(unique_classes)]
+
+                axes[1].legend(handles=legend_elements, title="Modulation",
+                            loc='upper right', fontsize=8)
+
+                axes[1].set_xlabel('SNR (dB)')
+                axes[1].set_ylabel('Angular Distance (degrees)')
+                axes[1].set_title('Angular Distance vs SNR by Modulation Type')
+                axes[1].grid(True, alpha=0.3)
+
+                # Fit and plot trend line
+                if len(snrs) > 2:  # Need at least 3 points for meaningful trend
+                    z = np.polyfit(snrs, angular_dists, 1)
+                    p = np.poly1d(z)
+                    snr_range = np.linspace(min(snrs), max(snrs), 100)
+                    axes[1].plot(snr_range, p(snr_range), "r--", alpha=0.8,
+                            label=f'Trend: {z[0]:.4f} deg/dB')
+                    axes[1].legend(handles=legend_elements + [plt.Line2D([0], [0], linestyle='--', color='r',
+                                                                        label=f'Trend: {z[0]:.4f} deg/dB')],
+                                title="Modulation", loc='upper right', fontsize=8)
+            else:
+                axes[1].text(0.5, 0.5, "No SNR data available",
+                        ha='center', va='center', transform=axes[1].transAxes)
+
+            plt.tight_layout()
+
+            # Log to wandb
+            if self.logger and hasattr(self.logger, "experiment"):
+                self.logger.experiment.log({"arcface_angular_distribution": wandb.Image(fig)})
+
+            plt.close(fig)
+
+        except Exception as e:
+            print(f"Error in angular distribution plot: {e}")
+            import traceback
+            traceback.print_exc()
+            plt.close("all")
 
     def configure_optimizers(self):
         # Single optimizer for all components

@@ -5,7 +5,7 @@ train_encoder: False
 linear_probe_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
-train_diffusion: False
+train_diffusion: True
 conditon: False
 diffusion_contrastive: "bottleneck" #"output"
 vis_diffusion: False
@@ -27,14 +27,14 @@ encoder_checkpoint_name: arcface_encoder.ckpt
 diffusion_checkpoint_name: prototype.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_noncondition_val_loss=0.3309.ckpt
 mode: online
-debug: True
-log_model: False
+debug: False
+log_model: True
 seed: 42
 
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 100
+    epochs: 200
     classifier_epochs: 100
     learning_rate: .001
     batch_size: 1024
@@ -66,11 +66,8 @@ Diffusion:
     _target_: models.diffusion.latent_diffusion.LatentDiffusion
     learning_rate: ${hyperparams.learning_rate}
     n_steps: 500
-    linear_start: 0.0001 # starting noise value for beta schedule
-    linear_end: 0.01 # ending value for the beta schedule
     weight_decay: 1e-2
     latent_scaling: 0.57221 #- arcface encoder #1.1981 # contrastive scaling # 2.98697 - reconstruction encoder # False - set to false if we want to recalcualte
-    diffusion_contrastive: ${diffusion_contrastive}
     num_classes: ${hyperparams.num_classes}
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
@@ -88,8 +85,6 @@ Diffusion:
     rfnet:
         _target_: models.classifier.rfnet.RFNet
         num_classes: 11
-        input_channels: 2 # I/Q channels
-        input_length: 128
         dropout_rate: 0.2
 
 Classifier:
