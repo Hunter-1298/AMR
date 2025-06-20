@@ -1,16 +1,16 @@
 # Global configurations
 project_name: arcface
-run_name: Diffusion
+run_name: Diffusion_Classifier_RFNET
 train_encoder: False
 linear_probe_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
-train_diffusion: True
+train_diffusion: False
 conditon: False
 diffusion_contrastive: "bottleneck" #"output"
 vis_diffusion: False
 # Classifier Settings #
-train_classifier: False
+train_classifier: True
 classifier_free: True
 fine_tune_diffusion: False
 # Checkpoints to load #
@@ -24,7 +24,7 @@ encoder_checkpoint_name: arcface_encoder.ckpt
 # diffusion_checkpoint_name: diffusion_condition_3MParams_epoch=181_val_loss=0.0757.ckpt
 # diffusion_checkpoint_name: diffusion_no_condition_2.3MParams_epoch=191_val_loss=0.0702.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_condition_val_loss=0.3279.ckpt
-diffusion_checkpoint_name: prototype.ckpt
+diffusion_checkpoint_name: arcface_diffusion.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_noncondition_val_loss=0.3309.ckpt
 mode: online
 debug: False
@@ -37,7 +37,7 @@ hyperparams:
     epochs: 200
     classifier_epochs: 100
     learning_rate: .001
-    batch_size: 1024
+    batch_size: 512
     contrastive_batch_size: 4096 # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
@@ -95,8 +95,11 @@ Classifier:
     num_classes: ${hyperparams.num_classes}
     classifier_free: ${classifier_free}
     classifier_head:
-        _target_: models.classifier.conv_classifier.Conv1DHead
-        num_classes: ${hyperparams.num_classes}
+        _target_: models.classifier.rfnet.RFNet
+        num_classes: 11
+        dropout_rate: 0.2
+        # _target_: models.classifier.conv_classifier.Conv1DHead
+        # num_classes: ${hyperparams.num_classes}
 
 ArcFaceLinearProbe:
     _target_: models.classifier.linear_probe.ArcFaceLinearProbe

@@ -1,6 +1,7 @@
 
 from .latent_diffusion_visualization import DiffusionVisualizationCallback
 from .latent_TSNE_visulization import DiffusionTSNEVisualizationCallback
+from .latent_TSNE_visulization import ClassifierTSNECallback
 from .decision_boundry_callback import DecisionBoundaryVisualizationCallback
 
-__all__ = ['DiffusionVisualizationCallback', 'DiffusionTSNEVisualizationCallback', 'DecisionBoundaryVisualizationCallback']
+__all__ = ['DiffusionVisualizationCallback', 'DiffusionTSNEVisualizationCallback', 'DecisionBoundaryVisualizationCallback','ClassifierTSNECallback']

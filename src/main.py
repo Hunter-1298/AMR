@@ -16,6 +16,7 @@ from callbacks import (
     DiffusionVisualizationCallback,
     DiffusionTSNEVisualizationCallback,
     DecisionBoundaryVisualizationCallback,
+    ClassifierTSNECallback
 )
 from utils.latent_scaling import calculate_latent_scaling_factor
 import os
@@ -158,7 +159,7 @@ def main(cfg: DictConfig):
         model = hydra.utils.instantiate(
             cfg.Diffusion, encoder=encoder, label_names=label_names
         )
-        model = torch.compile(model)
+        # model = torch.compile(model)
 
         # Create checkpoint dir
         checkpoint_dir = os.path.join(
@@ -194,36 +195,36 @@ def main(cfg: DictConfig):
         trainer.fit(model, train_loader, val_loader)  # pyright: ignore
         print("Diffusion Model Finished Training")
 
-    # else:
-    #     # Load and freeze the diffusion model
-    #     diffusion = hydra.utils.instantiate(
-    #         cfg.Diffusion, encoder=encoder, label_names=label_names
-    #     )
-    #     checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
-    #     checkpoint_name = cfg.diffusion_checkpoint_name
-    #     checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
-    #     diffusion.load_state_dict(checkpoint["state_dict"])
-    #     diffusion.eval()
-    #     diffusion = torch.compile(diffusion)
-    #
-    #     if cfg.vis_diffusion:
-    #         for param in diffusion.parameters():
-    #             param.requires_grad = False
-    #
-    #         # Set up trainer for MoE
-    #         trainer = L.Trainer(
-    #             max_epochs=cfg.hyperparams.epochs,
-    #             logger=wandb_logger,
-    #             callbacks=[
-    #                 # DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True, label_names=label_names),
-    #                 DiffusionTSNEVisualizationCallback(
-    #                     every_n_epochs=1, create_animation=True, label_names=label_names
-    #                 )
-    #             ],
-    #         )
-    #
-    #         trainer.validate(model=diffusion, dataloaders=val_loader)  # pyright: ignore
-    #         sys.exit("Diffusion Vis finished")
+    else:
+        # Load and freeze the diffusion model
+        diffusion = hydra.utils.instantiate(
+            cfg.Diffusion, encoder=encoder, label_names=label_names
+        )
+        checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
+        checkpoint_name = cfg.diffusion_checkpoint_name
+        checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
+        diffusion.load_state_dict(checkpoint["state_dict"])
+        diffusion.eval()
+        # diffusion = torch.compile(diffusion)
+
+        if cfg.vis_diffusion:
+            for param in diffusion.parameters():
+                param.requires_grad = False
+
+            # Set up trainer for MoE
+            trainer = L.Trainer(
+                max_epochs=cfg.hyperparams.epochs,
+                logger=wandb_logger,
+                callbacks=[
+                    # DiffusionVisualizationCallback(every_n_epochs=1, create_animation=True, label_names=label_names),
+                    DiffusionTSNEVisualizationCallback(
+                        every_n_epochs=1, create_animation=True, label_names=label_names
+                    )
+                ],
+            )
+
+            trainer.validate(model=diffusion, dataloaders=val_loader)  # pyright: ignore
+            sys.exit("Diffusion Vis finished")
 
     if cfg.train_classifier:
         print("Training Classifier on Latent Representations...")
@@ -235,7 +236,7 @@ def main(cfg: DictConfig):
             encoder=encoder,
             label_names=label_names,
         )
-        classifier = torch.compile(classifier)
+        # classifier = torch.compile(classifier)
 
         # Create checkpoint dir for classifier
         checkpoint_dir = os.path.join(get_original_cwd(), "checkpoints", "classifier")
@@ -253,16 +254,17 @@ def main(cfg: DictConfig):
             precision="16-mixed",
             callbacks=[
                 ModelCheckpoint(
-                    monitor="val_acc",
+                    monitor="val/acc",
                     filename="classifier_{epoch:02d}_{val_acc:.4f}",
                     dirpath=checkpoint_dir,
                     save_top_k=3,
                     mode="max",
                 ),
                 LearningRateMonitor(logging_interval="step"),
-                DecisionBoundaryVisualizationCallback(
-                    every_n_epochs=1, create_animation=True, label_names=label_names
-                ),
+                ClassifierTSNECallback(
+                    every_n_epochs=2,  # Visualize every 2 epochs
+                    label_names=label_names
+                )
             ],
         )
 
