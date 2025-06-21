@@ -1,7 +1,7 @@
 # Global configurations
 project_name: arcface
 run_name: Diffusion_Classifier_RFNET
-train_encoder: False
+train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
@@ -10,7 +10,7 @@ conditon: False
 diffusion_contrastive: "bottleneck" #"output"
 vis_diffusion: False
 # Classifier Settings #
-train_classifier: True
+train_classifier: False
 classifier_free: True
 fine_tune_diffusion: False
 # Checkpoints to load #
@@ -27,8 +27,8 @@ encoder_checkpoint_name: arcface_encoder.ckpt
 diffusion_checkpoint_name: arcface_diffusion.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_noncondition_val_loss=0.3309.ckpt
 mode: online
-debug: False
-log_model: True
+debug: True
+log_model: False
 seed: 42
 
 # In your hydra config
@@ -109,6 +109,7 @@ ArcFaceLinearProbe:
     embedding_type: "arcface" # 'arcface', 'raw', or 'both'
 
 dataset:
+    data: 2018
     iq: true #true
     batch_size: ${hyperparams.batch_size}
     contrastive_batch_size: ${hyperparams.contrastive_batch_size}

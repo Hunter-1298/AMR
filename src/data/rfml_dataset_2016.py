@@ -1,4 +1,5 @@
 import torch
+import h5py
 import random
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -10,22 +11,23 @@ from tqdm import tqdm
 
 
 class RFMLDataset(Dataset):
-    def __init__(self, dataPath = '/home/hshayde/Projects/MIT/AMR/Dataset/RML2016.10a_dict.pkl', iq=False):
+    def __init__(self, dataPath = '/home/hshayde/Projects/MIT/AMR/Dataset/RML2016.10a_dict.pkl', data = 2016, iq=False):
         # Data in the shape of dict[('Mod_type','snr')] = [1000,2,128]
-        data = self._load_data(dataPath)
-
-        # Get first key to determine total samples
-        first_key = list(data.keys())[0]
-        total_samples = data[first_key].shape[0]
+        if data == 2018:
+            data = self._load_2018_data()
+        else:
+            data = self._load_data(dataPath)
 
         # Convert data to tensors and split
         self.samples = []
         self.labels = []
         self.snr = []
         self.encoded_hash = {}
-
         for (mod_type, snr), signals in data.items():
-            signals = torch.from_numpy(signals).float()  # signals shape: [1000, 2, 128]
+            if type(signals) == list:
+                signals = torch.from_numpy(np.array(signals)).float()  # signals shape: [1000, 2, 128]
+            else:
+                signals = torch.from_numpy(signals).float()  # signals shape: [1000, 2, 128]
             mod_label = mod_type
             # Normalize all signals at once
             if iq:
@@ -54,6 +56,36 @@ class RFMLDataset(Dataset):
         with open(dataPath, 'rb') as f:
             data = pickle.load(f, encoding="latin")
         return data
+
+    def _load_2018_data(self):
+        classes = [
+            "OOK", "4ASK", "8ASK", "BPSK", "QPSK", "8PSK", "16PSK", "32PSK",
+            "16APSK", "32APSK", "64APSK", "128APSK", "16QAM", "32QAM", "64QAM",
+            "128QAM", "256QAM", "AM-SSB-WC", "AM-SSB-SC", "AM-DSB-WC", "AM-DSB-SC",
+            "FM", "GMSK", "OQPSK"
+        ]
+        data_path = '/home/hshayde/Projects/MIT/AMR/Dataset/2018.01/2018_RFML.hdf5'
+        data_dict = {}
+        with h5py.File(data_path, 'r') as f:
+            X = f['X'][:]   # [num_samples, 2, signal_length]
+            Y = f['Y'][:]   # [num_samples]
+            Z = f['Z'][:]   # [num_samples]
+            # Decode byte labels to string if necessary
+            if isinstance(Y[0], bytes):
+                Y = [y.decode('utf-8') for y in Y]
+
+            for x, y, z in tqdm(zip(X, Y, Z)):
+                if -20 <= z <= 18:
+                    key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
+                    if key not in data_dict:
+                        data_dict[key] = []
+                    import pdb; pdb.set_trace()
+                    data_dict[key].append(x[:100])
+        print(f"Total keys created: {len(data_dict)}")
+        total_samples = sum(len(v) for v in data_dict.values())
+        print(f"Total signals stored: {total_samples}")
+        return data_dict
+
 
     def _encode_labels(self,label):
         # takes samples and return one hot encoding
@@ -117,7 +149,7 @@ class RFMLDataset(Dataset):
 
 def get_dataloaders(config):
     # Create full dataset
-    full_dataset = RFMLDataset(iq = config.iq)
+    full_dataset = RFMLDataset(data=config.data, iq = config.iq)
 
     # Get parameters from config
     batch_size = config.batch_size

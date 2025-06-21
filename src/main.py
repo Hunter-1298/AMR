@@ -50,6 +50,7 @@ def main(cfg: DictConfig):
 
     # Get original dataloaders
     train_loader, val_loader, label_names = get_dataloaders(cfg.dataset)
+    import pdb; pdb.set_trace()
 
     # If we need to train the encoder
     if cfg.train_encoder:
