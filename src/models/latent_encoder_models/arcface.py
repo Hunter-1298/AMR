@@ -78,6 +78,7 @@ def compute_instantaneous_frequency_shared(complex_signal):
         else:
             return np.zeros_like(np.real(complex_signal))
 
+
 class ResidualBlock1D(nn.Module):
     """1D Residual block for better gradient flow"""
 
@@ -164,7 +165,7 @@ class EnhancedReconstructionLoss(nn.Module):
         target_complex = torch.complex(target_i.float(), target_q.float())
 
         # Compute phases
-        pred_phase = torch.angle(pred_complex)      # [-π, π]
+        pred_phase = torch.angle(pred_complex)  # [-π, π]
         target_phase = torch.angle(target_complex)  # [-π, π]
 
         # Handle phase wrapping: compute shortest angular distance
@@ -174,7 +175,7 @@ class EnhancedReconstructionLoss(nn.Module):
         phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
 
         # MSE of phase differences
-        phase_mse = torch.mean(phase_diff ** 2)
+        phase_mse = torch.mean(phase_diff**2)
 
         return phase_mse
 
@@ -195,8 +196,12 @@ class EnhancedReconstructionLoss(nn.Module):
 
         # Optional: Normalize FFT magnitudes
         if self.normalize_fft:
-            pred_fft_mag = pred_fft_mag / (torch.mean(pred_fft_mag, dim=-1, keepdim=True) + 1e-8)
-            target_fft_mag = target_fft_mag / (torch.mean(target_fft_mag, dim=-1, keepdim=True) + 1e-8)
+            pred_fft_mag = pred_fft_mag / (
+                torch.mean(pred_fft_mag, dim=-1, keepdim=True) + 1e-8
+            )
+            target_fft_mag = target_fft_mag / (
+                torch.mean(target_fft_mag, dim=-1, keepdim=True) + 1e-8
+            )
 
         fft_loss = torch.mean((pred_fft_mag - target_fft_mag) ** 2)
         return fft_loss
@@ -217,20 +222,24 @@ class EnhancedReconstructionLoss(nn.Module):
         return if_loss
 
     def forward(self, decoder_output, target_signal, labels=None):
-        pred_signal = decoder_output["signal"] if isinstance(decoder_output, dict) else decoder_output
+        pred_signal = (
+            decoder_output["signal"]
+            if isinstance(decoder_output, dict)
+            else decoder_output
+        )
 
         # Four focused losses including explicit phase
         complex_mse = self.complex_mse_loss(pred_signal, target_signal)
-        phase_loss = self.phase_loss(pred_signal, target_signal)          # NEW!
+        phase_loss = self.phase_loss(pred_signal, target_signal)  # NEW!
         fft_loss = self.spectral_fft_loss(pred_signal, target_signal)
         if_loss = self.instantaneous_frequency_loss(pred_signal, target_signal)
 
         # Weighted combination
         total_loss = (
-            10.0 * complex_mse +      # Primary: Complex MSE
-            1.0 * phase_loss +       # Explicit phase preservation
-            0.1 * fft_loss +         # Spectral preservation
-            0.1 * if_loss            # Modulation structure
+            10.0 * complex_mse  # Primary: Complex MSE
+            + 1.0 * phase_loss  # Explicit phase preservation
+            + 0.1 * fft_loss  # Spectral preservation
+            + 0.1 * if_loss  # Modulation structure
         )
 
         return total_loss, {
@@ -302,6 +311,7 @@ class MultiScaleFeatureExtractor(nn.Module):
 
         return complex_features
 
+
 class FrequencyDomainProcessor(nn.Module):
     """Process frequency domain features"""
 
@@ -355,6 +365,7 @@ class FrequencyDomainProcessor(nn.Module):
 
         return torch.cat([mag_features, phase_features], dim=1)  # [batch, 64, length]
 
+
 class RFEncoder(nn.Module):
     """Enhanced encoder using PyTorch's native transformer directly"""
 
@@ -377,9 +388,9 @@ class RFEncoder(nn.Module):
             nhead=8,  # 128 is divisible by 8
             dim_feedforward=combined_channels * 4,
             dropout=0.1,
-            activation='relu',
+            activation="relu",
             batch_first=False,
-            norm_first=True
+            norm_first=True,
         )
         self.feature_transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
@@ -397,9 +408,9 @@ class RFEncoder(nn.Module):
             nhead=8,  # 256 is divisible by 8
             dim_feedforward=256 * 4,
             dropout=0.2,
-            activation='relu',
+            activation="relu",
             batch_first=False,
-            norm_first=True
+            norm_first=True,
         )
         self.transformer_256 = nn.TransformerEncoder(encoder_layer_256, num_layers=1)
 
@@ -416,9 +427,9 @@ class RFEncoder(nn.Module):
             nhead=8,  # 128 is divisible by 8
             dim_feedforward=128 * 4,
             dropout=0.2,
-            activation='relu',
+            activation="relu",
             batch_first=False,
-            norm_first=True
+            norm_first=True,
         )
         self.transformer_128 = nn.TransformerEncoder(encoder_layer_128, num_layers=1)
 
@@ -530,19 +541,23 @@ class RFDecoderEnhanced(nn.Module):
         # Main decoder layers
         self.decoder_layers = nn.Sequential(
             # First upsampling
-            nn.ConvTranspose1d(256, 512, kernel_size=5, stride=2, padding=2, output_padding=1),
+            nn.ConvTranspose1d(
+                256, 512, kernel_size=5, stride=2, padding=2, output_padding=1
+            ),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             ResidualBlock1D(512, 512),
-
             # Second upsampling
-            nn.ConvTranspose1d(512, 256, kernel_size=5, stride=2, padding=2, output_padding=1),
+            nn.ConvTranspose1d(
+                512, 256, kernel_size=5, stride=2, padding=2, output_padding=1
+            ),
             nn.BatchNorm1d(256),
             nn.ReLU(),
             ResidualBlock1D(256, 256),
-
             # Third upsampling
-            nn.ConvTranspose1d(256, 128, kernel_size=5, stride=2, padding=2, output_padding=1),
+            nn.ConvTranspose1d(
+                256, 128, kernel_size=5, stride=2, padding=2, output_padding=1
+            ),
             nn.BatchNorm1d(128),
             nn.ReLU(),
         )
@@ -553,9 +568,9 @@ class RFDecoderEnhanced(nn.Module):
             nhead=8,
             dim_feedforward=128 * 4,
             dropout=0.1,
-            activation='relu',
+            activation="relu",
             batch_first=False,
-            norm_first=True
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
@@ -576,7 +591,7 @@ class RFDecoderEnhanced(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
-                if hasattr(m, 'out_channels') and m.out_channels == 2:
+                if hasattr(m, "out_channels") and m.out_channels == 2:
                     nn.init.xavier_uniform_(m.weight, gain=1.5)
                 else:
                     nn.init.xavier_uniform_(m.weight, gain=1.0)
@@ -603,7 +618,10 @@ class RFDecoderEnhanced(nn.Module):
 
         if reconstructed.shape[-1] != self.signal_length:
             reconstructed = F.interpolate(
-                reconstructed, size=self.signal_length, mode="linear", align_corners=False
+                reconstructed,
+                size=self.signal_length,
+                mode="linear",
+                align_corners=False,
             )
 
         return reconstructed
@@ -824,8 +842,7 @@ class RFEncoderDecoder(L.LightningModule):
 
         # Combined loss
         total_loss = (
-            self.reconstruction_weight * recon_loss +
-            self.arcface_weight * arcface_loss
+            self.reconstruction_weight * recon_loss + self.arcface_weight * arcface_loss
         )
 
         # Clean logging
@@ -857,10 +874,8 @@ class RFEncoderDecoder(L.LightningModule):
 
         # Combined loss
         total_loss = (
-            self.reconstruction_weight * recon_loss +
-            self.arcface_weight * arcface_loss
+            self.reconstruction_weight * recon_loss + self.arcface_weight * arcface_loss
         )
-
 
         # Logging - clean and focused
         self.log("val_loss", total_loss, prog_bar=True)
@@ -927,12 +942,22 @@ class RFEncoderDecoder(L.LightningModule):
             time_axis = np.arange(len(orig_i))
 
             # 1. I/Q Time Domain
-            axes[0, 0].plot(time_axis, orig_i.numpy(), "b-", label="Original I", alpha=0.8)
-            axes[0, 0].plot(time_axis, recon_i.numpy(), "r--", label="Reconstructed I", alpha=0.8)
-            axes[0, 0].plot(time_axis, orig_q.numpy(), "c-", label="Original Q", alpha=0.8)
-            axes[0, 0].plot(time_axis, recon_q.numpy(), "m--", label="Reconstructed Q", alpha=0.8)
+            axes[0, 0].plot(
+                time_axis, orig_i.numpy(), "b-", label="Original I", alpha=0.8
+            )
+            axes[0, 0].plot(
+                time_axis, recon_i.numpy(), "r--", label="Reconstructed I", alpha=0.8
+            )
+            axes[0, 0].plot(
+                time_axis, orig_q.numpy(), "c-", label="Original Q", alpha=0.8
+            )
+            axes[0, 0].plot(
+                time_axis, recon_q.numpy(), "m--", label="Reconstructed Q", alpha=0.8
+            )
 
-            complex_mse = torch.mean(torch.abs(orig_complex - recon_complex) ** 2).item()
+            complex_mse = torch.mean(
+                torch.abs(orig_complex - recon_complex) ** 2
+            ).item()
             axes[0, 0].set_title(f"I/Q Reconstruction\nComplex MSE: {complex_mse:.6f}")
             axes[0, 0].set_xlabel("Time Sample")
             axes[0, 0].set_ylabel("Amplitude")
@@ -947,13 +972,23 @@ class RFEncoderDecoder(L.LightningModule):
             orig_phase_unwrapped = np.unwrap(orig_phase)
             recon_phase_unwrapped = np.unwrap(recon_phase)
 
-            axes[0, 1].plot(time_axis, orig_phase_unwrapped, "b-", label="Original Phase", alpha=0.8)
-            axes[0, 1].plot(time_axis, recon_phase_unwrapped, "r--", label="Reconstructed Phase", alpha=0.8)
+            axes[0, 1].plot(
+                time_axis, orig_phase_unwrapped, "b-", label="Original Phase", alpha=0.8
+            )
+            axes[0, 1].plot(
+                time_axis,
+                recon_phase_unwrapped,
+                "r--",
+                label="Reconstructed Phase",
+                alpha=0.8,
+            )
 
             # Calculate phase loss
-            phase_diff = torch.atan2(torch.sin(torch.angle(orig_complex) - torch.angle(recon_complex)),
-                                    torch.cos(torch.angle(orig_complex) - torch.angle(recon_complex)))
-            phase_mse = torch.mean(phase_diff ** 2).item()
+            phase_diff = torch.atan2(
+                torch.sin(torch.angle(orig_complex) - torch.angle(recon_complex)),
+                torch.cos(torch.angle(orig_complex) - torch.angle(recon_complex)),
+            )
+            phase_mse = torch.mean(phase_diff**2).item()
 
             axes[0, 1].set_title(f"Phase Comparison\nPhase MSE: {phase_mse:.6f} rad²")
             axes[0, 1].set_xlabel("Time Sample")
@@ -964,17 +999,31 @@ class RFEncoderDecoder(L.LightningModule):
             # 3. Phase Error (NEW!)
             phase_error = phase_diff.numpy()
             axes[0, 2].plot(time_axis, phase_error, "r-", alpha=0.8)
-            axes[0, 2].axhline(y=0, color='k', linestyle='--', alpha=0.3)
-            axes[0, 2].set_title(f"Phase Error\nMean: {np.mean(phase_error):.4f}, Std: {np.std(phase_error):.4f}")
+            axes[0, 2].axhline(y=0, color="k", linestyle="--", alpha=0.3)
+            axes[0, 2].set_title(
+                f"Phase Error\nMean: {np.mean(phase_error):.4f}, Std: {np.std(phase_error):.4f}"
+            )
             axes[0, 2].set_xlabel("Time Sample")
             axes[0, 2].set_ylabel("Phase Error (radians)")
             axes[0, 2].grid(True, alpha=0.3)
 
             # 4. Constellation Diagram
-            axes[1, 0].scatter(orig_complex.real.numpy(), orig_complex.imag.numpy(),
-                            alpha=0.6, s=20, c="blue", label="Original")
-            axes[1, 0].scatter(recon_complex.real.numpy(), recon_complex.imag.numpy(),
-                            alpha=0.6, s=20, c="red", label="Reconstructed")
+            axes[1, 0].scatter(
+                orig_complex.real.numpy(),
+                orig_complex.imag.numpy(),
+                alpha=0.6,
+                s=20,
+                c="blue",
+                label="Original",
+            )
+            axes[1, 0].scatter(
+                recon_complex.real.numpy(),
+                recon_complex.imag.numpy(),
+                alpha=0.6,
+                s=20,
+                c="red",
+                label="Reconstructed",
+            )
             axes[1, 0].set_title("Constellation Diagram")
             axes[1, 0].set_xlabel("I (Real)")
             axes[1, 0].set_ylabel("Q (Imaginary)")
@@ -987,10 +1036,20 @@ class RFEncoderDecoder(L.LightningModule):
             recon_fft = torch.fft.fft(recon_complex)
             freqs = np.arange(len(orig_fft))
 
-            fft_loss = torch.mean((torch.abs(orig_fft) - torch.abs(recon_fft)) ** 2).item()
+            fft_loss = torch.mean(
+                (torch.abs(orig_fft) - torch.abs(recon_fft)) ** 2
+            ).item()
 
-            axes[1, 1].plot(freqs, torch.abs(orig_fft).numpy(), "b-", label="Original", alpha=0.8)
-            axes[1, 1].plot(freqs, torch.abs(recon_fft).numpy(), "r--", label="Reconstructed", alpha=0.8)
+            axes[1, 1].plot(
+                freqs, torch.abs(orig_fft).numpy(), "b-", label="Original", alpha=0.8
+            )
+            axes[1, 1].plot(
+                freqs,
+                torch.abs(recon_fft).numpy(),
+                "r--",
+                label="Reconstructed",
+                alpha=0.8,
+            )
             axes[1, 1].set_title(f"FFT Magnitude Spectrum\nFFT Loss: {fft_loss:.6f}")
             axes[1, 1].set_xlabel("Frequency Bin")
             axes[1, 1].set_ylabel("FFT Magnitude")
@@ -1002,7 +1061,9 @@ class RFEncoderDecoder(L.LightningModule):
             recon_fft_phase = torch.angle(recon_fft).numpy()
 
             axes[1, 2].plot(freqs, orig_fft_phase, "b-", label="Original", alpha=0.8)
-            axes[1, 2].plot(freqs, recon_fft_phase, "r--", label="Reconstructed", alpha=0.8)
+            axes[1, 2].plot(
+                freqs, recon_fft_phase, "r--", label="Reconstructed", alpha=0.8
+            )
             axes[1, 2].set_title("FFT Phase Spectrum")
             axes[1, 2].set_xlabel("Frequency Bin")
             axes[1, 2].set_ylabel("Phase (radians)")
@@ -1015,8 +1076,16 @@ class RFEncoderDecoder(L.LightningModule):
 
             if_loss = torch.mean((orig_inst_freq - recon_inst_freq) ** 2).item()
 
-            axes[2, 0].plot(time_axis, orig_inst_freq.numpy(), "b-", label="Original", alpha=0.8)
-            axes[2, 0].plot(time_axis, recon_inst_freq.numpy(), "r--", label="Reconstructed", alpha=0.8)
+            axes[2, 0].plot(
+                time_axis, orig_inst_freq.numpy(), "b-", label="Original", alpha=0.8
+            )
+            axes[2, 0].plot(
+                time_axis,
+                recon_inst_freq.numpy(),
+                "r--",
+                label="Reconstructed",
+                alpha=0.8,
+            )
             axes[2, 0].set_title(f"Instantaneous Frequency\nIF Loss: {if_loss:.6f}")
             axes[2, 0].set_xlabel("Time Sample")
             axes[2, 0].set_ylabel("Frequency (rad/sample)")
@@ -1027,10 +1096,20 @@ class RFEncoderDecoder(L.LightningModule):
             orig_psd = torch.abs(orig_fft) ** 2
             recon_psd = torch.abs(recon_fft) ** 2
 
-            axes[2, 1].plot(freqs, 10 * torch.log10(orig_psd + 1e-10).numpy(),
-                        "b-", label="Original", alpha=0.8)
-            axes[2, 1].plot(freqs, 10 * torch.log10(recon_psd + 1e-10).numpy(),
-                        "r--", label="Reconstructed", alpha=0.8)
+            axes[2, 1].plot(
+                freqs,
+                10 * torch.log10(orig_psd + 1e-10).numpy(),
+                "b-",
+                label="Original",
+                alpha=0.8,
+            )
+            axes[2, 1].plot(
+                freqs,
+                10 * torch.log10(recon_psd + 1e-10).numpy(),
+                "r--",
+                label="Reconstructed",
+                alpha=0.8,
+            )
             axes[2, 1].set_title("Power Spectral Density")
             axes[2, 1].set_xlabel("Frequency Bin")
             axes[2, 1].set_ylabel("Power (dB)")
@@ -1039,31 +1118,45 @@ class RFEncoderDecoder(L.LightningModule):
 
             # 9. Loss Component Breakdown
             with torch.no_grad():
-                sample_orig = self.val_original[sample_idx:sample_idx+1]
-                sample_recon = self.val_reconstructed[sample_idx:sample_idx+1]
+                sample_orig = self.val_original[sample_idx : sample_idx + 1]
+                sample_recon = self.val_reconstructed[sample_idx : sample_idx + 1]
 
                 loss_fn = EnhancedReconstructionLoss(self.hparams.signal_length)
                 _, loss_breakdown = loss_fn(sample_recon, sample_orig)
 
-                loss_names = ['Complex MSE', 'Phase Loss', 'FFT Loss', 'Inst. Freq']  # Updated
+                loss_names = [
+                    "Complex MSE",
+                    "Phase Loss",
+                    "FFT Loss",
+                    "Inst. Freq",
+                ]  # Updated
                 loss_values = [
-                    loss_breakdown['complex_mse'].item(),
-                    loss_breakdown['phase_loss'].item(),      # NEW!
-                    loss_breakdown['fft_loss'].item(),
-                    loss_breakdown['instantaneous_frequency'].item()
+                    loss_breakdown["complex_mse"].item(),
+                    loss_breakdown["phase_loss"].item(),  # NEW!
+                    loss_breakdown["fft_loss"].item(),
+                    loss_breakdown["instantaneous_frequency"].item(),
                 ]
 
-                bars = axes[2, 2].bar(loss_names, loss_values,
-                                    color=['blue', 'red', 'orange', 'green'], alpha=0.7)
+                bars = axes[2, 2].bar(
+                    loss_names,
+                    loss_values,
+                    color=["blue", "red", "orange", "green"],
+                    alpha=0.7,
+                )
                 axes[2, 2].set_title("Loss Component Breakdown")
                 axes[2, 2].set_ylabel("Loss Value")
-                axes[2, 2].tick_params(axis='x', rotation=45)
+                axes[2, 2].tick_params(axis="x", rotation=45)
 
                 # Add value labels on bars
                 for bar, value in zip(bars, loss_values):
                     height = bar.get_height()
-                    axes[2, 2].text(bar.get_x() + bar.get_width()/2., height,
-                                f'{value:.4f}', ha='center', va='bottom')
+                    axes[2, 2].text(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        height,
+                        f"{value:.4f}",
+                        ha="center",
+                        va="bottom",
+                    )
 
             plt.tight_layout()
 
@@ -1224,15 +1317,15 @@ class RFEncoderDecoder(L.LightningModule):
         scheduler = {
             "scheduler": torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 optimizer,
-                T_0=10,        # Initial restart period (epochs)
-                T_mult=2,      # Multiply restart period by this after each restart
+                T_0=10,  # Initial restart period (epochs)
+                T_mult=2,  # Multiply restart period by this after each restart
                 eta_min=1e-6,  # Minimum learning rate
-                last_epoch=-1
+                last_epoch=-1,
             ),
             "monitor": "val_loss",
             "interval": "epoch",
             "frequency": 1,
-            "name": "cosine_warm_restarts"
+            "name": "cosine_warm_restarts",
         }
 
         return {"optimizer": optimizer, "lr_scheduler": scheduler}

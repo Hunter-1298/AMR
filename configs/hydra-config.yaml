@@ -1,16 +1,16 @@
 # Global configurations
 project_name: arcface
-run_name: Diffusion_Classifier_RFNET
+run_name: Diffusion_Condition_Classifier_Free_Validation
 train_encoder: False
 linear_probe_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: True
-train_diffusion: False
-conditon: False
+train_diffusion: True
+conditon: True
 diffusion_contrastive: "bottleneck" #"output"
 vis_diffusion: False
 # Classifier Settings #
-train_classifier: True
+train_classifier: False
 classifier_free: True
 fine_tune_diffusion: False
 # Checkpoints to load #
@@ -36,7 +36,7 @@ hyperparams:
     # Training
     epochs: 200
     classifier_epochs: 100
-    learning_rate: .001
+    learning_rate: .0001
     batch_size: 512
     contrastive_batch_size: 4096 # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
@@ -58,7 +58,7 @@ data_dir: data/
 
 Encoder:
     _target_: models.latent_encoder_models.arcface.RFEncoderDecoder
-    learning_rate: .0001
+    learning_rate: .0005
     arcface_margin: 0.17
     arcface_scale: 16
 
@@ -78,7 +78,7 @@ Diffusion:
             ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
         up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
         mid_block_type: "UNetMidBlock1D"
-        block_out_channels: [32, 64, 128]
+        block_out_channels: [64, 128, 256]
         layers_per_block: 3
         condition: ${conditon}
         conditional: 11 # Class conditioning

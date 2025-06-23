@@ -16,7 +16,7 @@ from callbacks import (
     DiffusionVisualizationCallback,
     DiffusionTSNEVisualizationCallback,
     DecisionBoundaryVisualizationCallback,
-    ClassifierTSNECallback
+    ClassifierTSNECallback,
 )
 from utils.latent_scaling import calculate_latent_scaling_factor
 import os
@@ -111,10 +111,9 @@ def main(cfg: DictConfig):
         checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
         encoder.load_state_dict(checkpoint["state_dict"])
         encoder.eval()
-
         # encoder = torch.compile(encoder)
-        # for param in encoder.parameters():
-        #     param.requires_grad = False
+        for param in encoder.parameters():
+            param.requires_grad = False
     if cfg.linear_probe_encoder:
         print("Testing encoder with linear probe...")
 
@@ -179,7 +178,7 @@ def main(cfg: DictConfig):
             precision="16-mixed",
             callbacks=[
                 ModelCheckpoint(
-                    monitor="val_loss",
+                    monitor="val/loss",
                     filename="diffusion_{epoch:02d}_{val_loss:.4f}",
                     dirpath=checkpoint_dir,
                     save_top_k=3,
@@ -263,8 +262,8 @@ def main(cfg: DictConfig):
                 LearningRateMonitor(logging_interval="step"),
                 ClassifierTSNECallback(
                     every_n_epochs=2,  # Visualize every 2 epochs
-                    label_names=label_names
-                )
+                    label_names=label_names,
+                ),
             ],
         )
 

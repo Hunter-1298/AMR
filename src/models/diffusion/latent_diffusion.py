@@ -56,7 +56,7 @@ class ArcFaceCenters(nn.Module):
                 arcface_loss = self.encoder_decoder.model.arcface_loss
                 print("Found ArcFace loss at encoder_decoder.model.arcface_loss")
 
-            # Location 3: Look through named modules
+            # Location 2: Look through named modules
             else:
                 for name, module in self.encoder_decoder.named_modules():
                     if "arcface" in name.lower() and hasattr(module, "weight"):
@@ -437,8 +437,8 @@ class LatentDiffusion(L.LightningModule):
         arc_base: float = 0.1,
         class_base: float = 0.1,
         # Curriculum learning
-        curriculum_epochs: int = 75,
-        high_snr_start: float = 10.0,
+        curriculum_epochs: int = 100,
+        high_snr_start: float = 16.0,
         low_snr_end: float = -20.0,
         # Training strategy
         predict_noise: bool = True,  # Whether to predict noise or clean latent
@@ -545,7 +545,7 @@ class LatentDiffusion(L.LightningModule):
             t: Timestep [batch]
             class_embedding: Class conditioning [batch, embedding_dim]
         """
-        return self.unet(z_noisy, t)
+        return self.unet(z_noisy, t, class_embedding)
 
     def compute_reconstruction_losses(
         self,
@@ -664,7 +664,7 @@ class LatentDiffusion(L.LightningModule):
         class_embedding = self.arcface_centers[class_labels]
 
         # Predict using UNet in latent space
-        predicted = self.forward(z_noisy, t)
+        predicted = self.forward(z_noisy, t, class_labels)
 
         # Primary latent denoising loss
         if self.predict_noise:
@@ -692,7 +692,9 @@ class LatentDiffusion(L.LightningModule):
 
         # Classification loss using RFNet on denoised signal
         class_logits, class_features = self.rfnet(z_denoised, return_features=True)
-        classification_loss = F.cross_entropy(class_logits, class_labels)
+        classification_loss = F.cross_entropy(
+            class_logits, class_labels, reduction="none"
+        )  # , reduction="none"
 
         snr_factor = torch.sigmoid((original_snr - snr_threshold) / 5.0)  # [B]
 
@@ -704,16 +706,13 @@ class LatentDiffusion(L.LightningModule):
         # 3. Compute per-sample losses (you might already have these)
         recon_losses = reconstruction_losses["total_reconstruction"]  # [B]
         arc_losses = arcface_loss  # compute per-sample
-        class_losses = F.cross_entropy(
-            class_logits, class_labels, reduction="none"
-        )  # [B]
 
-        # 4. Apply weights and aggregate
+        # total_loss = classification_loss
         total_loss = (
             self.latent_denoise_weight * latent_denoise_loss  # scalar
             + (r_w * recon_losses).mean()
             + (a_w * arc_losses).mean()
-            # + (c_w * class_losses).mean()
+            + (classification_loss).mean()
         )
 
         # Backprop
@@ -727,7 +726,7 @@ class LatentDiffusion(L.LightningModule):
             "train/reconstruction_loss", reconstruction_losses["total_reconstruction"]
         )
         self.log("train/arcface_alignment_loss", arcface_loss)
-        self.log("train/classification_loss", classification_loss)
+        self.log("train/classification_loss", classification_loss.mean())
         self.log("train/total_loss", total_loss, prog_bar=True)
         self.log("train/snr_threshold", snr_threshold)
         self.log("train/avg_target_snr", current_snr.mean())
@@ -786,12 +785,14 @@ class LatentDiffusion(L.LightningModule):
         # Denoise using the UNet
         if self.predict_noise:
             # Predict the noise in latent space
-            predicted_noise = self.forward(z_noisy, t)
+            cond = torch.full_like(class_labels, 11)
+            predicted_noise = self.forward(z_noisy, t, cond)
             # Remove predicted noise to get clean latent
             z_denoised = z_noisy - predicted_noise
         else:
             # Directly predict clean latent
-            z_denoised = self.forward(z_noisy, t)
+            cond = torch.full_like(class_labels, 11)
+            z_denoised = self.forward(z_noisy, t, cond)
 
         # Classification on denoised latent
         logits, _ = self.rfnet(z_denoised, return_features=True)
