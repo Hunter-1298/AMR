@@ -1,6 +1,6 @@
 # Global configurations
 project_name: arcface
-run_name: Diffusion_Condition_Classifier_Free_Validation
+run_name: Diffusion_Condition_Classifier_Free_Validation_0.5Dropout_ClassLossOnly
 train_encoder: False
 linear_probe_encoder: False
 # Latent Diffusion Settings #

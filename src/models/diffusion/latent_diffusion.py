@@ -437,7 +437,7 @@ class LatentDiffusion(L.LightningModule):
         arc_base: float = 0.1,
         class_base: float = 0.1,
         # Curriculum learning
-        curriculum_epochs: int = 100,
+        curriculum_epochs: int = 1,
         high_snr_start: float = 16.0,
         low_snr_end: float = -20.0,
         # Training strategy
@@ -691,10 +691,11 @@ class LatentDiffusion(L.LightningModule):
         arcface_loss = self.compute_arcface_alignment_loss(z_denoised, class_labels)
 
         # Classification loss using RFNet on denoised signal
-        class_logits, class_features = self.rfnet(z_denoised, return_features=True)
+        # class_logits, class_features = self.rfnet(z_denoised, return_features=True)
+        class_logits, class_features = self.rfnet(x_denoised, return_features=True)
         classification_loss = F.cross_entropy(
-            class_logits, class_labels, reduction="none"
-        )  # , reduction="none"
+            class_logits, class_labels)#, reduction="none"
+        # , reduction="none"
 
         snr_factor = torch.sigmoid((original_snr - snr_threshold) / 5.0)  # [B]
 
@@ -707,13 +708,13 @@ class LatentDiffusion(L.LightningModule):
         recon_losses = reconstruction_losses["total_reconstruction"]  # [B]
         arc_losses = arcface_loss  # compute per-sample
 
-        # total_loss = classification_loss
-        total_loss = (
-            self.latent_denoise_weight * latent_denoise_loss  # scalar
-            + (r_w * recon_losses).mean()
-            + (a_w * arc_losses).mean()
-            + (classification_loss).mean()
-        )
+        total_loss = classification_loss
+        # total_loss = (
+        #     self.latent_denoise_weight * latent_denoise_loss  # scalar
+        #     + (r_w * recon_losses).mean()
+        #     + (a_w * arc_losses).mean()
+        #     + (classification_loss).mean()
+        # )
 
         # Backprop
         optimizer.zero_grad()
@@ -795,12 +796,13 @@ class LatentDiffusion(L.LightningModule):
             z_denoised = self.forward(z_noisy, t, cond)
 
         # Classification on denoised latent
-        logits, _ = self.rfnet(z_denoised, return_features=True)
+        x_denoised = self.decode(z_denoised)
+        logits, _ = self.rfnet(x_denoised, return_features=True)
         preds = torch.argmax(logits, dim=1)
         acc = (preds == class_labels).float().mean()
 
         # Also get classification on original noisy signal for comparison
-        logits_original, _ = self.rfnet(z_noisy, return_features=True)
+        logits_original, _ = self.rfnet(x_noisy, return_features=True)
         preds_original = torch.argmax(logits_original, dim=1)
         acc_original = (preds_original == class_labels).float().mean()
 
@@ -808,9 +810,6 @@ class LatentDiffusion(L.LightningModule):
         arcface_loss = self.compute_arcface_alignment_loss(z_denoised, class_labels)
         classification_loss = F.cross_entropy(logits, class_labels)
         classification_loss_original = F.cross_entropy(logits_original, class_labels)
-
-        # Decode denoised signal
-        x_denoised = self.decode(z_denoised)
 
         # Try to compute reconstruction losses, but handle gracefully
         try:
@@ -930,7 +929,7 @@ class LatentDiffusion(L.LightningModule):
                 self.val_latents = latents_tensor
                 # Create comprehensive analysis plots
                 self._plot_validation_analysis(
-                    original_preds, denoised_preds, all_labels, all_snrs
+                    denoised_preds, denoised_preds, all_labels, all_snrs
                 )
                 # Create denoising visualizations if we have collected examples
                 self._create_denoising_visualizations()
