@@ -1,1696 +1,1030 @@
-import matplotlib
-
-matplotlib.use("Agg")  # Use non-GUI backend
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 import lightning as L
 from torch.optim import AdamW
-import numpy as np
+from typing import Dict, Tuple, Optional, List
 import wandb
+import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
+from collections import defaultdict
+import math
 
 
-def check_and_handle_nan(tensor, name="tensor", replace_with_zero=True):
-    """Check for NaN values and optionally replace them"""
-    if torch.isnan(tensor).any():
-        print(f"Warning: NaN detected in {name}")
-        if replace_with_zero:
-            tensor = torch.where(torch.isnan(tensor), torch.zeros_like(tensor), tensor)
-        return tensor, True
-    return tensor, False
-
-
-def compute_instantaneous_frequency_shared(complex_signal):
-    """Shared method to compute instantaneous frequency consistently with NaN protection"""
-    try:
-        # Handle both single sample and batch inputs
-        if complex_signal.dim() == 1:
-            # Single sample case
-            if isinstance(complex_signal, torch.Tensor):
-                complex_numpy = complex_signal.detach().cpu().numpy()
-            else:
-                complex_numpy = complex_signal
-
-            # Check for NaN/inf in input
-            if not np.isfinite(complex_numpy).all():
-                print("Warning: Non-finite values in complex signal for IF computation")
-                return (
-                    torch.zeros_like(complex_signal.real)
-                    if isinstance(complex_signal, torch.Tensor)
-                    else np.zeros_like(np.real(complex_numpy))
-                )
-
-            # Add small epsilon to avoid zero magnitude
-            magnitude = np.abs(complex_numpy)
-            if np.any(magnitude < 1e-12):
-                complex_numpy = complex_numpy + 1e-12 * (1 + 1j)
-
-            # Compute phase and unwrap
-            phase = np.angle(complex_numpy)
-
-            # Check for valid phase values
-            if not np.isfinite(phase).all():
-                print("Warning: Non-finite phase values")
-                return (
-                    torch.zeros_like(complex_signal.real)
-                    if isinstance(complex_signal, torch.Tensor)
-                    else np.zeros_like(np.real(complex_numpy))
-                )
-
-            phase_unwrapped = np.unwrap(phase)
-
-            # Compute derivative using gradient with edge handling
-            if len(phase_unwrapped) > 1:
-                inst_freq = np.gradient(phase_unwrapped)
-            else:
-                inst_freq = np.array([0.0])
-
-            # Clip extreme values
-            inst_freq = np.clip(inst_freq, -np.pi, np.pi)
-
-            # Convert back to tensor if needed
-            if isinstance(complex_signal, torch.Tensor):
-                return torch.tensor(
-                    inst_freq,
-                    device=complex_signal.device,
-                    dtype=complex_signal.real.dtype,
-                )
-            else:
-                return inst_freq
-
-        else:
-            # Batch case
-            batch_size = complex_signal.shape[0]
-            inst_freqs = []
-
-            for i in range(batch_size):
-                # Get single sample
-                signal_sample = complex_signal[i].detach().cpu().numpy()
-
-                # Check for NaN/inf
-                if not np.isfinite(signal_sample).all():
-                    inst_freq_tensor = torch.zeros(
-                        signal_sample.shape[0],
-                        device=complex_signal.device,
-                        dtype=complex_signal.real.dtype,
-                    )
-                    inst_freqs.append(inst_freq_tensor)
-                    continue
-
-                # Add small epsilon to avoid zero magnitude
-                magnitude = np.abs(signal_sample)
-                if np.any(magnitude < 1e-12):
-                    signal_sample = signal_sample + 1e-12 * (1 + 1j)
-
-                # Compute phase and unwrap
-                phase = np.angle(signal_sample)
-                if not np.isfinite(phase).all():
-                    inst_freq_tensor = torch.zeros(
-                        signal_sample.shape[0],
-                        device=complex_signal.device,
-                        dtype=complex_signal.real.dtype,
-                    )
-                    inst_freqs.append(inst_freq_tensor)
-                    continue
-
-                phase_unwrapped = np.unwrap(phase)
-
-                # Compute derivative
-                if len(phase_unwrapped) > 1:
-                    inst_freq = np.gradient(phase_unwrapped)
-                else:
-                    inst_freq = np.array([0.0])
-
-                # Clip extreme values
-                inst_freq = np.clip(inst_freq, -np.pi, np.pi)
-
-                # Convert back to tensor
-                inst_freq_tensor = torch.tensor(
-                    inst_freq,
-                    device=complex_signal.device,
-                    dtype=complex_signal.real.dtype,
-                )
-                inst_freqs.append(inst_freq_tensor)
-
-            return torch.stack(inst_freqs, dim=0)
-
-    except Exception as e:
-        print(f"Error in shared instantaneous frequency computation: {e}")
-        # Fallback: return zeros
-        if isinstance(complex_signal, torch.Tensor):
-            if complex_signal.dim() == 1:
-                return torch.zeros_like(complex_signal.real)
-            else:
-                return torch.zeros_like(complex_signal.real)
-        else:
-            return np.zeros_like(np.real(complex_signal))
-
-
-class ResidualBlock1D(nn.Module):
-    """1D Residual block for better gradient flow"""
-
-    def __init__(self, in_channels, out_channels):
+class RoPEPositionalEncoding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) for 1D sequences.
+    """
+    def __init__(self, d_model: int, max_seq_len: int = 1024):
         super().__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.d_model = d_model
 
-        # Skip connection
-        self.skip = (
-            nn.Identity()
-            if in_channels == out_channels
-            else nn.Conv1d(in_channels, out_channels, 1)
-        )
+        # Create frequency tensor
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
+        self.register_buffer('inv_freq', inv_freq)
 
-    def forward(self, x):
-        identity = self.skip(x)
+        # Cache for efficiency
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
 
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+    def _update_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        """Update cached cos/sin values."""
+        if seq_len > self._seq_len_cached:
+            self._seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=device, dtype=dtype)
+            freqs = torch.outer(t, self.inv_freq)
+            emb = torch.cat([freqs, freqs], dim=-1)
+            self._cos_cached = emb.cos()[None, :, :]
+            self._sin_cached = emb.sin()[None, :, :]
+        return self._cos_cached[:, :seq_len, :], self._sin_cached[:, :seq_len, :]
 
-        return F.relu(out + identity)
+    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotate half the dimensions."""
+        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        return torch.cat([-x2, x1], dim=-1)
+
+    def apply_rotary_pos_emb(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply rotary positional embedding."""
+        seq_len = x.shape[1]
+        cos, sin = self._update_cos_sin_cache(seq_len, x.device, x.dtype)
+
+        # Ensure cos and sin have the right shape
+        if cos.shape[-1] != x.shape[-1]:
+            # Repeat or truncate to match x dimensions
+            cos = cos.repeat(1, 1, x.shape[-1] // cos.shape[-1])[:, :, :x.shape[-1]]
+            sin = sin.repeat(1, 1, x.shape[-1] // sin.shape[-1])[:, :, :x.shape[-1]]
+
+        return x * cos + self.rotate_half(x) * sin
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        return self.apply_rotary_pos_emb(x)
 
 
-class ComplexConv1d(nn.Module):
-    """Complex-valued 1D convolution with numerical stability"""
+class RFViCMAEEncoder(nn.Module):
+    """
+    Vision Contrastive MAE (ViC-MAE) style encoder for RF signals.
+    Combines masked autoencoding with contrastive learning for RF waveforms.
+    """
 
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+    def __init__(
+        self,
+        signal_length: int = 128,
+        patch_size: int = 16,
+        d_model: int = 64,
+        nhead: int = 8,
+        num_encoder_layers: int = 8,
+        num_decoder_layers: int = 4,
+        dim_feedforward: int = 1536,
+        mask_ratio: float = 0.75,
+        projection_dim: int = 256,
+        temperature: float = 0.07,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.conv_real = nn.Conv1d(
-            in_channels, out_channels, kernel_size, stride, padding
-        )
-        self.conv_imag = nn.Conv1d(
-            in_channels, out_channels, kernel_size, stride, padding
-        )
 
-        # Initialize with smaller weights for stability
-        self._init_weights()
-
-    def _init_weights(self):
-        # Use Xavier initialization with smaller gain
-        for conv in [self.conv_real, self.conv_imag]:
-            nn.init.xavier_uniform_(conv.weight, gain=0.5)  # Reduced gain
-            if conv.bias is not None:
-                nn.init.zeros_(conv.bias)
-
-    def forward(self, x):
-        batch_size, channels, length = x.shape
-        in_channels = channels // 2
-
-        # Split I and Q channels
-        i_channels = x[:, :in_channels]
-        q_channels = x[:, in_channels:]
-
-        # Add small epsilon for numerical stability
-        eps = 1e-8
-        i_channels = i_channels + eps * torch.randn_like(i_channels)
-        q_channels = q_channels + eps * torch.randn_like(q_channels)
-
-        # Complex multiplication with clamping
-        real_part = self.conv_real(i_channels) - self.conv_imag(q_channels)
-        imag_part = self.conv_real(q_channels) + self.conv_imag(i_channels)
-
-        # Clamp to prevent extreme values
-        real_part = torch.clamp(real_part, -10.0, 10.0)
-        imag_part = torch.clamp(imag_part, -10.0, 10.0)
-
-        return torch.cat([real_part, imag_part], dim=1)
-
-
-class EnhancedReconstructionLoss(nn.Module):
-    def __init__(self, signal_length=1024, normalize_fft=True):  # Updated default
-        super().__init__()
         self.signal_length = signal_length
-        self.normalize_fft = normalize_fft
+        self.patch_size = patch_size
+        self.d_model = d_model
+        self.mask_ratio = mask_ratio
+        self.temperature = temperature
 
-    def complex_mse_loss(self, pred_signal, target_signal):
-        """Complex MSE Loss: L_ComplexMSE = (1/N) * Σ|s_t - ŝ_t|²"""
-        pred_i, pred_q = pred_signal[:, 0], pred_signal[:, 1]
-        target_i, target_q = target_signal[:, 0], target_signal[:, 1]
+        # Number of patches
+        self.num_patches = signal_length // patch_size
+        assert signal_length % patch_size == 0, f"Signal length {signal_length} must be divisible by patch size {patch_size}"
 
-        pred_complex = torch.complex(pred_i.float(), pred_q.float())
-        target_complex = torch.complex(target_i.float(), target_q.float())
+        # Patch embedding: Conv1d to create tokens from IQ signals
+        self.patch_embed = nn.Conv1d(2, d_model, kernel_size=patch_size, stride=patch_size, bias=False)
 
-        complex_diff = pred_complex - target_complex
-        complex_mse = torch.mean(torch.abs(complex_diff) ** 2)
-        return complex_mse
+        # Layer norm after patch embedding (applied to the correct dimension)
+        self.patch_norm = nn.LayerNorm(d_model)
 
-    def phase_loss(self, pred_signal, target_signal):
-        """
-        Time-Domain Phase Loss with NaN protection
-        """
-        pred_i, pred_q = pred_signal[:, 0], pred_signal[:, 1]
-        target_i, target_q = target_signal[:, 0], target_signal[:, 1]
+        # RoPE positional encoding
+        self.rope = RoPEPositionalEncoding(d_model, max_seq_len=self.num_patches)
 
-        pred_complex = torch.complex(pred_i.float(), pred_q.float())
-        target_complex = torch.complex(target_i.float(), target_q.float())
+        # Mask token for decoder
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
-        # Add small epsilon to avoid zero magnitude
-        pred_magnitude = torch.abs(pred_complex) + 1e-12
-        target_magnitude = torch.abs(target_complex) + 1e-12
-
-        pred_complex = pred_complex + 1e-12 * torch.exp(
-            1j * torch.randn_like(pred_complex.real)
+        # Shared transformer encoder (processes only visible tokens)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
         )
-        target_complex = target_complex + 1e-12 * torch.exp(
-            1j * torch.randn_like(target_complex.real)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+
+        # Lightweight decoder for reconstruction
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward // 2,  # Smaller decoder
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=num_decoder_layers)
+
+        # Improved decoder prediction head
+        self.decoder_pred = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, patch_size * 2),
         )
 
-        # Compute phases
-        pred_phase = torch.angle(pred_complex)
-        target_phase = torch.angle(target_complex)
+        # Projection head for contrastive learning (3-layer MLP)
+        self.projection_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.BatchNorm1d(d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, d_model),
+            nn.BatchNorm1d(d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_model, projection_dim),
+            nn.BatchNorm1d(projection_dim, affine=False),  # No affine for L2 norm
+        )
 
-        # Check for NaN values
-        pred_phase, _ = check_and_handle_nan(pred_phase, "pred_phase")
-        target_phase, _ = check_and_handle_nan(target_phase, "target_phase")
+    def patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert RF signal to patches - embedding version."""
+        # x: [batch, 2, signal_length]
+        patches = self.patch_embed(x)  # [batch, d_model, num_patches]
+        patches = patches.transpose(1, 2)  # [batch, num_patches, d_model]
+        patches = self.patch_norm(patches)  # Apply layer norm
+        return patches
+
+    def create_patch_targets(self, x: torch.Tensor) -> torch.Tensor:
+        """Create patch targets without going through embedding."""
+        batch_size, channels, signal_length = x.shape
+        # Reshape to patches: [batch, num_patches, patch_size * channels]
+        x_patches = x.reshape(batch_size, channels, self.num_patches, self.patch_size)
+        x_patches = x_patches.permute(0, 2, 3, 1)  # [batch, num_patches, patch_size, 2]
+        x_patches = x_patches.reshape(batch_size, self.num_patches, -1)  # [batch, num_patches, patch_size * 2]
+        return x_patches
+
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert patches back to RF signal format."""
+        batch_size, num_patches, patch_dim = x.shape
+        # Reshape: [batch, num_patches, patch_size * 2] -> [batch, 2, signal_length]
+        x = x.reshape(batch_size, num_patches, self.patch_size, 2)
+        x = x.permute(0, 3, 1, 2)  # [batch, 2, num_patches, patch_size]
+        x = x.reshape(batch_size, 2, -1)  # [batch, 2, signal_length]
+        return x
+
+    def forward_single_decode(self, latent: torch.Tensor) -> torch.Tensor:
+        """
+        Decode from a single latent vector (for diffusion sampling).
+
+        Args:
+            latent: [batch, d_model] latent representation
+
+        Returns:
+            reconstructed: [batch, 2, signal_length] RF signal
+        """
+        batch_size = latent.shape[0]
+
+        # Expand latent to sequence
+        latent_seq = latent.unsqueeze(1).repeat(1, self.num_patches, 1)  # [batch, num_patches, d_model]
+
+        # Apply RoPE
+        latent_seq = self.rope(latent_seq)
+
+        # Decode
+        decoded = self.decoder(latent_seq)
+
+        # Project to IQ
+        pred = self.decoder_pred(decoded)  # [batch, num_patches, patch_size * 2]
+
+        # Unpatchify
+        reconstructed = self.unpatchify(pred)
+
+        return reconstructed
+
+    def random_masking(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Perform random masking on input tokens.
+
+        Args:
+            x: [batch, num_patches, d_model]
+
+        Returns:
+            x_masked: visible tokens [batch, num_visible, d_model]
+            mask: binary mask [batch, num_patches] (1 = masked, 0 = visible)
+            ids_restore: indices to restore original order [batch, num_patches]
+        """
+        batch_size, num_patches, D = x.shape
+        len_keep = int(num_patches * (1 - self.mask_ratio))
+
+        # Generate random noise for each sample
+        noise = torch.rand(batch_size, num_patches, device=x.device)
+
+        # Sort noise for each sample
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # Keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        # Generate binary mask: 0 is keep, 1 is remove (for loss computation)
+        mask = torch.ones([batch_size, num_patches], device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_masked, mask, ids_restore
+
+    def forward_encoder(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through encoder with RoPE.
+
+        Args:
+            x: input tokens [batch, num_patches, d_model] (only visible if masked)
+
+        Returns:
+            latent: encoder output [batch, num_patches, d_model]
+        """
+        # Apply RoPE positional encoding
+        x = self.rope(x)
+
+        # Apply transformer encoder
+        latent = self.encoder(x)
+
+        return latent
+
+    def forward_decoder(self, x: torch.Tensor, ids_restore: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through decoder with proper RoPE handling.
+
+        Args:
+            x: visible tokens from encoder [batch, num_visible, d_model]
+            ids_restore: indices to restore full sequence [batch, num_patches]
+
+        Returns:
+            pred: reconstructed patches [batch, num_patches, patch_size * 2]
+        """
+        batch_size, num_visible, D = x.shape
+
+        # Create mask tokens
+        num_mask = ids_restore.shape[1] - num_visible
+        mask_tokens = self.mask_token.repeat(batch_size, num_mask, 1)
+
+        # Concatenate visible and mask tokens
+        x_full = torch.cat([x, mask_tokens], dim=1)  # [batch, num_patches, d_model]
+
+        # Unshuffle to restore original order
+        x_full = torch.gather(x_full, dim=1,
+                             index=ids_restore.unsqueeze(-1).repeat(1, 1, D))
+
+        # Apply RoPE to full sequence
+        x_full = self.rope(x_full)
+
+        # Apply decoder
+        decoded = self.decoder(x_full)
+
+        # Predict patches
+        pred = self.decoder_pred(decoded)
+
+        return pred
+
+    def compute_reconstruction_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Enhanced reconstruction loss for RF signals.
+
+        Args:
+            pred: predicted patches [batch, num_patches, patch_size * 2]
+            target: original patches [batch, num_patches, patch_size * 2]
+            mask: binary mask (1 = masked, 0 = visible) [batch, num_patches]
+
+        Returns:
+            loss: scalar reconstruction loss
+        """
+        # 1. MSE on IQ components
+        mse_loss = F.mse_loss(pred, target, reduction='none').mean(dim=-1)  # [batch, num_patches]
+
+        # 2. Complex magnitude loss
+        pred_reshaped = pred.reshape(pred.shape[0], pred.shape[1], self.patch_size, 2)
+        target_reshaped = target.reshape(target.shape[0], target.shape[1], self.patch_size, 2)
+
+        pred_mag = torch.sqrt(pred_reshaped[..., 0]**2 + pred_reshaped[..., 1]**2 + 1e-8)
+        target_mag = torch.sqrt(target_reshaped[..., 0]**2 + target_reshaped[..., 1]**2 + 1e-8)
+        mag_loss = F.mse_loss(pred_mag, target_mag, reduction='none').mean(dim=-1)  # [batch, num_patches]
+
+        # 3. Phase consistency loss
+        pred_phase = torch.atan2(pred_reshaped[..., 1], pred_reshaped[..., 0] + 1e-8)
+        target_phase = torch.atan2(target_reshaped[..., 1], target_reshaped[..., 0] + 1e-8)
 
         # Handle phase wrapping
         phase_diff = pred_phase - target_phase
         phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
+        phase_loss = (phase_diff**2).mean(dim=-1)  # [batch, num_patches]
 
-        # Check final result
-        phase_diff, _ = check_and_handle_nan(phase_diff, "phase_diff")
+        # Combine losses
+        total_loss = mse_loss + 0.5 * mag_loss + 0.3 * phase_loss
 
-        # MSE of phase differences
-        phase_mse = torch.mean(phase_diff**2)
+        # Apply mask (only compute loss on masked patches)
+        masked_loss = (total_loss * mask).sum() / (mask.sum() + 1e-8)
 
-        # Final NaN check
-        if torch.isnan(phase_mse):
-            print("Warning: NaN in phase loss, returning zero")
-            return torch.tensor(0.0, device=pred_signal.device, dtype=pred_signal.dtype)
+        return masked_loss
 
-        return phase_mse
+    def compute_contrastive_loss(
+        self,
+        z_i: torch.Tensor,
+        z_j: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute InfoNCE contrastive loss between two views.
 
-    def spectral_fft_loss(self, pred_signal, target_signal):
-        """Spectral FFT Loss with NaN protection"""
-        pred_i, pred_q = pred_signal[:, 0], pred_signal[:, 1]
-        target_i, target_q = target_signal[:, 0], target_signal[:, 1]
+        Args:
+            z_i: L2-normalized embeddings from view i [batch, projection_dim]
+            z_j: L2-normalized embeddings from view j [batch, projection_dim]
 
-        pred_complex = torch.complex(pred_i.float(), pred_q.float())
-        target_complex = torch.complex(target_i.float(), target_q.float())
+        Returns:
+            loss: InfoNCE loss
+        """
+        batch_size = z_i.shape[0]
 
-        # Check input for NaN
-        pred_complex, _ = check_and_handle_nan(pred_complex, "pred_complex_fft")
-        target_complex, _ = check_and_handle_nan(target_complex, "target_complex_fft")
+        # Compute similarity matrix
+        sim_i_j = torch.mm(z_i, z_j.t()) / self.temperature  # [batch, batch]
+        sim_j_i = torch.mm(z_j, z_i.t()) / self.temperature  # [batch, batch]
 
-        # Compute FFT magnitudes
+        # Create positive mask (diagonal elements)
+        pos_mask = torch.eye(batch_size, device=z_i.device, dtype=torch.bool)
+
+        # InfoNCE loss for i->j
+        exp_sim_i_j = torch.exp(sim_i_j)
+        log_prob_i_j = sim_i_j[pos_mask] - torch.log(exp_sim_i_j.sum(dim=1))
+
+        # InfoNCE loss for j->i
+        exp_sim_j_i = torch.exp(sim_j_i)
+        log_prob_j_i = sim_j_i[pos_mask] - torch.log(exp_sim_j_i.sum(dim=1))
+
+        # Average both directions
+        loss = -(log_prob_i_j + log_prob_j_i).mean() / 2
+
+        return loss
+
+    def forward(self, x_i: torch.Tensor, x_j: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for ViC-MAE.
+
+        Args:
+            x_i: first view [batch, 2, signal_length]
+            x_j: second view (same modulation, different SNR) [batch, 2, signal_length]
+
+        Returns:
+            Dictionary containing reconstruction and contrastive outputs
+        """
+        # Patchify inputs (embedding version)
+        patches_i = self.patchify(x_i)  # [batch, num_patches, d_model]
+        patches_j = self.patchify(x_j)  # [batch, num_patches, d_model]
+
+        # Create proper targets (raw patch version)
+        target_i = self.create_patch_targets(x_i)  # [batch, num_patches, patch_size * 2]
+        target_j = self.create_patch_targets(x_j)
+
+        # Random masking
+        patches_i_vis, mask_i, ids_restore_i = self.random_masking(patches_i)
+        patches_j_vis, mask_j, ids_restore_j = self.random_masking(patches_j)
+
+        # Encode visible patches
+        latent_i_vis = self.forward_encoder(patches_i_vis)  # [batch, num_visible, d_model]
+        latent_j_vis = self.forward_encoder(patches_j_vis)
+
+        # Decode to reconstruct full signal
+        pred_i = self.forward_decoder(latent_i_vis, ids_restore_i)  # [batch, num_patches, patch_size * 2]
+        pred_j = self.forward_decoder(latent_j_vis, ids_restore_j)
+
+        # Compute reconstruction loss on masked patches only
+        loss_recon_i = self.compute_reconstruction_loss(pred_i, target_i, mask_i)
+        loss_recon_j = self.compute_reconstruction_loss(pred_j, target_j, mask_j)
+        loss_recon = (loss_recon_i + loss_recon_j) / 2
+
+        # Unpatchify for visualization
+        recon_xi = self.unpatchify(pred_i)  # [batch, 2, signal_length]
+        recon_xj = self.unpatchify(pred_j)
+
+        # Global pooling over visible tokens for contrastive learning
+        global_i = latent_i_vis.mean(dim=1)  # [batch, d_model]
+        global_j = latent_j_vis.mean(dim=1)  # [batch, d_model]
+
+        # Project to contrastive space
+        z_i = self.projection_head(global_i)  # [batch, projection_dim]
+        z_j = self.projection_head(global_j)
+
+        # L2 normalize
+        emb_i = F.normalize(z_i, p=2, dim=1)
+        emb_j = F.normalize(z_j, p=2, dim=1)
+
+        # Compute contrastive loss
+        loss_contrast = self.compute_contrastive_loss(emb_i, emb_j)
+
+        return {
+            'recon_xi': recon_xi,
+            'recon_xj': recon_xj,
+            'emb_i': emb_i,
+            'emb_j': emb_j,
+            'latent_i': global_i,  # For downstream tasks
+            'latent_j': global_j,
+            'loss_recon': loss_recon,
+            'loss_contrast': loss_contrast,
+            'mask_i': mask_i,  # For visualization
+            'mask_j': mask_j,
+        }
+
+    def forward_single(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for single input (inference mode).
+
+        Args:
+            x: input signal [batch, 2, signal_length]
+
+        Returns:
+            latent: global latent representation [batch, d_model]
+        """
+        patches = self.patchify(x)
+        patches = self.rope(patches)
+        latent = self.encoder(patches)
+        global_feat = latent.mean(dim=1)
+        return global_feat
+
+
+class RFSpecificReconstructionLoss(nn.Module):
+    """Enhanced reconstruction loss for RF signals"""
+
+    def __init__(self, signal_length=128):
+        super().__init__()
+        self.signal_length = signal_length
+
+    def complex_mse(self, pred, target):
+        """MSE on complex representation"""
+        pred_complex = torch.complex(pred[:, 0], pred[:, 1])
+        target_complex = torch.complex(target[:, 0], target[:, 1])
+        return torch.mean(torch.abs(pred_complex - target_complex) ** 2)
+
+    def magnitude_loss(self, pred, target):
+        """Loss on signal magnitude"""
+        pred_mag = torch.sqrt(pred[:, 0]**2 + pred[:, 1]**2 + 1e-8)
+        target_mag = torch.sqrt(target[:, 0]**2 + target[:, 1]**2 + 1e-8)
+        return F.mse_loss(pred_mag, target_mag)
+
+    def phase_loss(self, pred, target):
+        """Loss on signal phase"""
+        pred_phase = torch.atan2(pred[:, 1], pred[:, 0] + 1e-8)
+        target_phase = torch.atan2(target[:, 1], target[:, 0] + 1e-8)
+
+        # Handle phase wrapping
+        phase_diff = pred_phase - target_phase
+        phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
+        return torch.mean(phase_diff**2)
+
+    def spectral_loss(self, pred, target):
+        """Loss on frequency domain"""
+        pred_complex = torch.complex(pred[:, 0], pred[:, 1])
+        target_complex = torch.complex(target[:, 0], target[:, 1])
+
         pred_fft = torch.fft.fft(pred_complex, dim=-1)
         target_fft = torch.fft.fft(target_complex, dim=-1)
 
-        pred_fft_mag = torch.abs(pred_fft)
-        target_fft_mag = torch.abs(target_fft)
+        # Magnitude spectrum loss
+        pred_mag_spec = torch.abs(pred_fft)
+        target_mag_spec = torch.abs(target_fft)
 
-        # Check FFT results
-        pred_fft_mag, _ = check_and_handle_nan(pred_fft_mag, "pred_fft_mag")
-        target_fft_mag, _ = check_and_handle_nan(target_fft_mag, "target_fft_mag")
+        return F.mse_loss(pred_mag_spec, target_mag_spec)
 
-        # Optional: Normalize FFT magnitudes with safe division
-        if self.normalize_fft:
-            pred_mean = torch.mean(pred_fft_mag, dim=-1, keepdim=True)
-            target_mean = torch.mean(target_fft_mag, dim=-1, keepdim=True)
-
-            pred_fft_mag = pred_fft_mag / (pred_mean + 1e-8)
-            target_fft_mag = target_fft_mag / (target_mean + 1e-8)
-
-        fft_loss = torch.mean((pred_fft_mag - target_fft_mag) ** 2)
-
-        # Final NaN check
-        if torch.isnan(fft_loss):
-            print("Warning: NaN in FFT loss, returning zero")
-            return torch.tensor(0.0, device=pred_signal.device, dtype=pred_signal.dtype)
-
-        return fft_loss
-
-    def instantaneous_frequency_loss(self, pred_signal, target_signal):
-        """Instantaneous Frequency Loss with NaN protection"""
-        pred_i, pred_q = pred_signal[:, 0], pred_signal[:, 1]
-        target_i, target_q = target_signal[:, 0], target_signal[:, 1]
-
-        pred_complex = torch.complex(pred_i.float(), pred_q.float())
-        target_complex = torch.complex(target_i.float(), target_q.float())
-
-        # Check input for NaN
-        pred_complex, _ = check_and_handle_nan(pred_complex, "pred_complex_if")
-        target_complex, _ = check_and_handle_nan(target_complex, "target_complex_if")
-
-        # Compute instantaneous frequencies with protection
-        try:
-            pred_inst_freq = compute_instantaneous_frequency_shared(pred_complex)
-            target_inst_freq = compute_instantaneous_frequency_shared(target_complex)
-
-            # Check results
-            pred_inst_freq, _ = check_and_handle_nan(pred_inst_freq, "pred_inst_freq")
-            target_inst_freq, _ = check_and_handle_nan(
-                target_inst_freq, "target_inst_freq"
-            )
-
-            if_loss = torch.mean((pred_inst_freq - target_inst_freq) ** 2)
-
-            # Final check
-            if torch.isnan(if_loss):
-                print("Warning: NaN in IF loss, returning zero")
-                return torch.tensor(
-                    0.0, device=pred_signal.device, dtype=pred_signal.dtype
-                )
-
-            return if_loss
-
-        except Exception as e:
-            print(f"Error in IF loss computation: {e}")
-            return torch.tensor(0.0, device=pred_signal.device, dtype=pred_signal.dtype)
-
-    def forward(self, decoder_output, target_signal, labels=None):
-        pred_signal = (
-            decoder_output["signal"]
-            if isinstance(decoder_output, dict)
-            else decoder_output
-        )
-
-        # Four focused losses including explicit phase
-        complex_mse = self.complex_mse_loss(pred_signal, target_signal)
-        phase_loss = self.phase_loss(pred_signal, target_signal)  # NEW!
-        fft_loss = self.spectral_fft_loss(pred_signal, target_signal)
-        if_loss = self.instantaneous_frequency_loss(pred_signal, target_signal)
+    def forward(self, pred, target, mask=None):
+        """Combined RF reconstruction loss"""
+        # Component losses
+        complex_loss = self.complex_mse(pred, target)
+        mag_loss = self.magnitude_loss(pred, target)
+        phase_loss = self.phase_loss(pred, target)
+        spectral_loss = self.spectral_loss(pred, target)
 
         # Weighted combination
         total_loss = (
-            10.0 * complex_mse  # Primary: Complex MSE
-            + 1.0 * phase_loss  # Explicit phase preservation
-            + 0.1 * fft_loss  # Spectral preservation
-            + 0.1 * if_loss  # Modulation structure
+            1.0 * complex_loss +      # Primary reconstruction
+            0.5 * mag_loss +          # Magnitude preservation
+            0.3 * phase_loss +        # Phase preservation
+            0.2 * spectral_loss       # Spectral characteristics
         )
 
         return total_loss, {
-            "complex_mse": complex_mse,
-            "phase_loss": phase_loss,
-            "fft_loss": fft_loss,
-            "instantaneous_frequency": if_loss,
+            'complex_mse': complex_loss,
+            'magnitude_loss': mag_loss,
+            'phase_loss': phase_loss,
+            'spectral_loss': spectral_loss
         }
 
 
-class MultiScaleFeatureExtractor(nn.Module):
-    """Extract features at multiple scales with gradient stability"""
-
-    def __init__(self, in_channels=1):
-        super().__init__()
-
-        # Reduced kernel sizes to prevent extreme gradients
-        kernel_sizes = [3, 7, 15, 31]  # Removed the largest kernel (63)
-
-        self.conv_blocks = nn.ModuleList()
-
-        for i, kernel_size in enumerate(kernel_sizes):
-            block = self._make_stable_conv_block(
-                in_channels, 16, kernel_size, f"scale_{i}"
-            )
-            self.conv_blocks.append(block)
-
-        # Learnable attention weights for each scale
-        self.scale_weights = nn.Parameter(torch.ones(len(kernel_sizes)) * 0.25)
-
-        # Complex processing with reduced channels
-        # Input will be 16*4 = 64 channels for I and Q each, so 128 total
-        self.complex_conv = self._make_stable_complex_conv(64, 32)
-
-        # Final stabilization
-        self.output_norm = nn.LayerNorm(64)  # 32*2 channels from complex conv
-
-    def _make_stable_conv_block(self, in_ch, out_ch, kernel_size, name):
-        padding = kernel_size // 2
-
-        # Gradient scaling factor based on kernel size
-        # Larger kernels get smaller initialization to prevent gradient explosion
-        scale_factor = 1.0 / np.sqrt(kernel_size)
-
-        block = nn.Sequential(
-            nn.Conv1d(in_ch, out_ch, kernel_size, padding=padding, bias=False),
-            nn.BatchNorm1d(out_ch, eps=1e-3, momentum=0.01),  # Conservative BN
-            nn.ReLU(inplace=False),
-            nn.Dropout(0.2),
-        )
-
-        # Custom initialization for stability
-        with torch.no_grad():
-            nn.init.xavier_uniform_(block[0].weight, gain=scale_factor)
-
-        return block
-
-    def _make_stable_complex_conv(self, in_channels, out_channels):
-        """Stable complex convolution"""
-        return nn.Sequential(
-            nn.Conv1d(in_channels * 2, out_channels * 2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(out_channels * 2, eps=1e-3, momentum=0.01),
-            nn.ReLU(inplace=False),
-            nn.Dropout(0.1),
-        )
-
-    def forward(self, x):
-        # x shape: [batch, 2, length] where dim=1 is [I, Q]
-        batch_size, _, length = x.shape
-
-        # Process I and Q channels separately
-        i_channel = x[:, 0:1]  # [batch, 1, length]
-        q_channel = x[:, 1:2]  # [batch, 1, length]
-
-        # Extract multi-scale features with weighted combination
-        i_features = []
-        q_features = []
-
-        for idx, block in enumerate(self.conv_blocks):
-            # Apply block
-            i_feat = block(i_channel)
-            q_feat = block(q_channel)
-
-            # Apply learnable scale weights
-            scale_weight = torch.sigmoid(self.scale_weights[idx])  # Ensure positive
-            i_feat = i_feat * scale_weight
-            q_feat = q_feat * scale_weight
-
-            # Gradient checkpointing for memory efficiency (optional)
-            # i_feat = torch.utils.checkpoint.checkpoint(lambda x: x, i_feat)
-            # q_feat = torch.utils.checkpoint.checkpoint(lambda x: x, q_feat)
-
-            i_features.append(i_feat)
-            q_features.append(q_feat)
-
-        # Concatenate features
-        i_concat = torch.cat(i_features, dim=1)  # [batch, 64, length]
-        q_concat = torch.cat(q_features, dim=1)  # [batch, 64, length]
-
-        # Combine I and Q for complex processing
-        combined = torch.cat([i_concat, q_concat], dim=1)  # [batch, 128, length]
-
-        # Clamp before complex processing
-        combined = torch.clamp(combined, -10, 10)
-
-        # Apply stable complex convolution
-        complex_features = self.complex_conv(combined)  # [batch, 64, length]
-
-        # Apply layer normalization for stability
-        # Reshape for LayerNorm: [batch, length, channels]
-        complex_features = complex_features.permute(0, 2, 1)
-        complex_features = self.output_norm(complex_features)
-        complex_features = complex_features.permute(0, 2, 1)  # Back to [batch, channels, length]
-
-        # Final clamping
-        complex_features = torch.clamp(complex_features, -5, 5)
-
-        return complex_features
-
-class FrequencyDomainProcessor(nn.Module):
-    """Process frequency domain features with numerical stability"""
-
-    def __init__(self, signal_length=1024):
-        super().__init__()
-        self.signal_length = signal_length
-
-        self.mag_processor = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32, eps=1e-5),  # Increase BatchNorm epsilon
-            nn.ReLU(),
-            nn.Dropout(0.1),  # Add dropout for regularization
-            nn.Conv1d(32, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32, eps=1e-5),
-            nn.ReLU(),
-        )
-
-        self.phase_processor = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32, eps=1e-5),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Conv1d(32, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32, eps=1e-5),
-            nn.ReLU(),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv1d):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def forward(self, x):
-        batch_size = x.shape[0]
-
-        # Convert to float32 for stability
-        i_channel = x[:, 0].float()
-        q_channel = x[:, 1].float()
-
-        # Add small noise for numerical stability
-        eps = 1e-8
-        i_channel = i_channel + eps * torch.randn_like(i_channel)
-        q_channel = q_channel + eps * torch.randn_like(q_channel)
-
-        # Convert to complex tensor
-        complex_signal = torch.complex(i_channel, q_channel)
-
-        # Add minimum magnitude to avoid zero division
-        magnitude = torch.abs(complex_signal)
-        min_mag = 1e-12
-        complex_signal = complex_signal + min_mag * torch.exp(
-            1j * torch.angle(complex_signal + min_mag)
-        )
-
-        # FFT with window to reduce spectral leakage
-        # Apply Hann window
-        window = torch.hann_window(complex_signal.shape[-1], device=x.device)
-        windowed_signal = complex_signal * window
-
-        # FFT
-        fft_signal = torch.fft.fft(windowed_signal, dim=-1)
-
-        # Extract magnitude and phase with stability
-        magnitude = torch.abs(fft_signal) + 1e-12
-        phase = torch.angle(fft_signal)
-
-        # Clamp extreme values
-        magnitude = torch.clamp(magnitude, 1e-12, 100.0)
-        phase = torch.clamp(phase, -np.pi, np.pi)
-
-        # Log-scale magnitude for better numerical properties
-        log_magnitude = torch.log(magnitude + 1e-12).unsqueeze(1)
-        phase = phase.unsqueeze(1)
-
-        # Convert back to original dtype
-        log_magnitude = log_magnitude.to(x.dtype)
-        phase = phase.to(x.dtype)
-
-        # Process features
-        mag_features = self.mag_processor(log_magnitude)
-        phase_features = self.phase_processor(phase)
-
-        return torch.cat([mag_features, phase_features], dim=1)
-
-
-class RFEncoder(nn.Module):
-    """Enhanced encoder with numerical stability"""
-
-    def __init__(self, signal_length=1024, latent_dim=256):
-        super().__init__()
-        self.signal_length = signal_length
-        self.latent_dim = latent_dim
-
-        # Multi-scale time domain features
-        self.time_features = MultiScaleFeatureExtractor(in_channels=1)
-        # Frequency domain features
-        self.freq_features = FrequencyDomainProcessor(signal_length)
-
-        combined_channels = 128
-
-        # Feature-level transformer with stability improvements
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=combined_channels,
-            nhead=8,
-            dim_feedforward=combined_channels * 2,  # Reduced from 4x
-            dropout=0.2,  # Increased dropout
-            activation="gelu",  # GELU is more stable than ReLU
-            batch_first=False,
-            norm_first=True,
-        )
-        self.feature_transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-
-        # Encoder layers with batch normalization and stability
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(combined_channels, 256, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(256, eps=1e-5),
-            nn.GELU(),  # More stable than ReLU
-            nn.Dropout(0.2),
-        )
-
-        # Reduced transformer complexity
-        encoder_layer_256 = nn.TransformerEncoderLayer(
-            d_model=256,
-            nhead=8,
-            dim_feedforward=512,  # Reduced
-            dropout=0.3,
-            activation="gelu",
-            batch_first=False,
-            norm_first=True,
-        )
-        self.transformer_256 = nn.TransformerEncoder(encoder_layer_256, num_layers=1)
-
-        self.conv2 = nn.Sequential(
-            nn.Conv1d(256, 128, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(128, eps=1e-5),
-            nn.GELU(),
-            nn.Dropout(0.2),
-        )
-
-        encoder_layer_128 = nn.TransformerEncoderLayer(
-            d_model=128,
-            nhead=8,
-            dim_feedforward=256,  # Reduced
-            dropout=0.3,
-            activation="gelu",
-            batch_first=False,
-            norm_first=True,
-        )
-        self.transformer_128 = nn.TransformerEncoder(encoder_layer_128, num_layers=1)
-
-        self.conv3 = nn.Sequential(
-            nn.Conv1d(128, 64, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(64, eps=1e-5),
-            nn.GELU(),
-            nn.Dropout(0.2),
-        )
-
-        self.conv4 = nn.Sequential(
-            nn.Conv1d(64, 64, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(64, eps=1e-5),
-            nn.GELU(),
-            nn.Dropout(0.2),
-        )
-
-        # Stable final mapping with layer normalization
-        self.to_latent = nn.Sequential(
-            nn.Linear(4096, latent_dim * 2),
-            nn.LayerNorm(latent_dim * 2, eps=1e-5),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(latent_dim * 2, latent_dim),
-            nn.LayerNorm(latent_dim, eps=1e-5),  # Final normalization
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights for numerical stability"""
-        for module in self.modules():
-            if isinstance(module, nn.Conv1d):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.5)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def forward(self, x):
-        # Add input noise for regularization
-        if self.training:
-            x = x + 1e-6 * torch.randn_like(x)
-
-        # Extract features with stability checks
-        time_features = self.time_features(x)
-        freq_features = self.freq_features(x)
-
-        # Check for NaN after feature extraction
-        time_features = torch.where(
-            torch.isnan(time_features), torch.zeros_like(time_features), time_features
-        )
-        freq_features = torch.where(
-            torch.isnan(freq_features), torch.zeros_like(freq_features), freq_features
-        )
-
-        # Combine features
-        combined_features = torch.cat([time_features, freq_features], dim=1)
-
-        # Clamp combined features
-        combined_features = torch.clamp(combined_features, -10.0, 10.0)
-
-        # Apply feature transformer with stability
-        x = combined_features.permute(2, 0, 1)
-        x = self.feature_transformer(x)
-        x = x.permute(1, 2, 0)
-
-        # Progressive encoding with stability checks
-        x = self.conv1(x)
-        x = torch.clamp(x, -10.0, 10.0)  # Clamp after each major operation
-
-        x = x.permute(2, 0, 1)
-        x = self.transformer_256(x)
-        x = x.permute(1, 2, 0)
-        x = torch.clamp(x, -10.0, 10.0)
-
-        x = self.conv2(x)
-        x = torch.clamp(x, -10.0, 10.0)
-
-        x = x.permute(2, 0, 1)
-        x = self.transformer_128(x)
-        x = x.permute(1, 2, 0)
-        x = torch.clamp(x, -10.0, 10.0)
-
-        x = self.conv3(x)
-        x = torch.clamp(x, -10.0, 10.0)
-
-        x = self.conv4(x)
-        x = torch.clamp(x, -10.0, 10.0)
-
-        # Flatten and get latent representation
-        encoded_flat = x.view(x.shape[0], -1)
-        encoded_flat = torch.clamp(encoded_flat, -10.0, 10.0)
-
-        latent = self.to_latent(encoded_flat)
-        latent = torch.clamp(latent, -5.0, 5.0)  # Final clamping
-
-        return latent
-
-
-class RFDecoderEnhanced(nn.Module):
-    """Decoder with numerical stability"""
-
-    def __init__(self, latent_dim=256, signal_length=1024):
-        super().__init__()
-        self.signal_length = signal_length
-        self.init_size = signal_length // 16
-
-        # Initial mapping with layer normalization
-        self.from_latent = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.LayerNorm(512, eps=1e-5),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256 * self.init_size),
-            nn.LayerNorm(256 * self.init_size, eps=1e-5),
-            nn.GELU(),
-            nn.Dropout(0.1),
-        )
-
-        # Main decoder layers with stability
-        self.decoder_layers = nn.Sequential(
-            nn.ConvTranspose1d(
-                256, 512, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(512, eps=1e-5),
-            nn.GELU(),
-            ResidualBlock1D(512, 512),
-            nn.ConvTranspose1d(
-                512, 256, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(256, eps=1e-5),
-            nn.GELU(),
-            ResidualBlock1D(256, 256),
-            nn.ConvTranspose1d(
-                256, 128, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(128, eps=1e-5),
-            nn.GELU(),
-            ResidualBlock1D(128, 128),
-            nn.ConvTranspose1d(
-                128, 128, kernel_size=5, stride=2, padding=2, output_padding=1
-            ),
-            nn.BatchNorm1d(128, eps=1e-5),
-            nn.GELU(),
-        )
-
-        # Transformer with reduced complexity
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=128,
-            nhead=8,
-            dim_feedforward=256,  # Reduced from 512
-            dropout=0.2,
-            activation="gelu",
-            batch_first=False,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=1
-        )  # Reduced layers
-
-        # Final refinement layers
-        self.final_layers = nn.Sequential(
-            nn.Conv1d(128, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64, eps=1e-5),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Conv1d(64, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32, eps=1e-5),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Conv1d(32, 2, kernel_size=7, padding=3),
-            nn.Tanh(),  # Bound output to [-1, 1]
-        )
-
-        # Learnable but bounded scale
-        self.output_scale = nn.Parameter(torch.tensor(0.5))  # Start smaller
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d)):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)  # Smaller gain
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, latent):
-        # Clamp input latent
-        latent = torch.clamp(latent, -5.0, 5.0)
-
-        x = self.from_latent(latent)
-        x = torch.clamp(x, -10.0, 10.0)
-
-        x = x.view(x.shape[0], 256, self.init_size)
-
-        # Apply decoder layers with stability checks
-        x = self.decoder_layers(x)
-        x = torch.clamp(x, -10.0, 10.0)
-
-        # Apply transformer
-        x = x.permute(2, 0, 1)
-        x = self.transformer(x)
-        x = x.permute(1, 2, 0)
-        x = torch.clamp(x, -10.0, 10.0)
-
-        # Final processing
-        x = self.final_layers(x)
-
-        # Clamp scale parameter
-        scale = torch.clamp(self.output_scale, 0.1, 2.0)
-        reconstructed = x * scale
-
-        # Ensure correct length
-        if reconstructed.shape[-1] != self.signal_length:
-            reconstructed = F.interpolate(
-                reconstructed,
-                size=self.signal_length,
-                mode="linear",
-                align_corners=False,
-            )
-
-        # Final output clamping
-        reconstructed = torch.clamp(reconstructed, -5.0, 5.0)
-
-        return reconstructed
-
-
-class AdaptiveArcFaceLoss(nn.Module):
-    """ArcFace loss with SNR-adaptive margins"""
-
-    def __init__(self, embedding_dim, num_classes, base_margin=0.5, scale=64):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_classes = num_classes
-        self.base_margin = base_margin
-        self.scale = scale
-
-        self.weight = nn.Parameter(torch.FloatTensor(num_classes, embedding_dim))
-        nn.init.xavier_uniform_(self.weight)
-
-    def get_adaptive_margin(self, snrs):
-        """Compute adaptive margin based on SNR"""
-        # Higher margin for high SNR (easier to separate)
-        # Lower margin for low SNR (harder to separate)
-        normalized_snr = torch.clamp(
-            (snrs + 20) / 38, 0, 1
-        )  # Normalize -20 to 18 dB to [0,1]
-        adaptive_margin = self.base_margin * (
-            0.2 + 0.8 * normalized_snr
-        )  # Range: 0.2 to 1.0
-        return adaptive_margin
-
-    def forward(self, embeddings, labels, snrs):
-        embeddings = embeddings.float()
-        device = embeddings.device
-
-        # Check for NaN in embeddings
-        embeddings, had_nan = check_and_handle_nan(embeddings, "arcface_embeddings")
-        if had_nan:
-            print("Warning: NaN values found in ArcFace embeddings")
-
-        # Normalize embeddings and weights with safe normalization
-        embeddings_norm = torch.norm(embeddings, p=2, dim=1, keepdim=True)
-        embeddings = embeddings / (embeddings_norm + 1e-8)
-
-        weight = F.normalize(self.weight.float(), p=2, dim=1)
-
-        # Compute cosine similarity
-        cosine = F.linear(embeddings, weight)
-
-        # Clamp cosine values to prevent NaN in acos
-        cosine = torch.clamp(cosine, -1 + 1e-7, 1 - 1e-7)
-
-        # Get target cosine values
-        target_cosine = cosine[torch.arange(len(labels), device=device), labels]
-
-        # Get adaptive margins
-        adaptive_margins = self.get_adaptive_margin(snrs.squeeze())
-
-        # Add adaptive margin to target with safe acos/cos operations
-        target_theta = torch.acos(torch.clamp(target_cosine, -1 + 1e-7, 1 - 1e-7))
-        target_theta_margin = target_theta + adaptive_margins
-        target_cosine_margin = torch.cos(target_theta_margin)
-
-        # Replace target values with margin-adjusted values
-        logits = cosine.clone()
-        target_cosine_margin = target_cosine_margin.to(logits.dtype)
-        logits[torch.arange(len(labels), device=device), labels] = target_cosine_margin
-
-        # Scale logits
-        logits *= self.scale
-
-        # Check for NaN in final logits
-        logits, had_nan = check_and_handle_nan(logits, "arcface_logits")
-        if had_nan:
-            print("Warning: NaN in ArcFace logits")
-
-        return F.cross_entropy(logits, labels)
-
-
 class RFEncoderDecoder(L.LightningModule):
-    """Enhanced Phase and frequency aware encoder-decoder"""
+    """
+    Lightning module for ViC-MAE training on RF signals.
+    """
 
     def __init__(
         self,
-        label_names,
-        signal_length=1024,
-        latent_dim=256,
-        learning_rate=1e-3,
-        arcface_margin=0.4,
-        arcface_scale=32,
-        reconstruction_weight=1.0,
-        arcface_weight=0.1,
-        curriculum_learning=False,
-        initial_snr_threshold=10,
-        final_snr_threshold=-20,
-        curriculum_epochs=20,
-        use_enhanced_decoder=True,
+        label_names: List[str],
+        signal_length: int = 1024,
+        patch_size: int = 32,
+        d_model: int = 384,
+        mask_ratio: float = 0.50,
+        nhead: int = 12,
+        temperature: float = 0.07,
+        learning_rate: float = 3e-4,
+        warmup_epochs: int = 10,
+        max_epochs: int = 100,
+        reconstruction_weight: float = 3.0,
+        contrastive_weight: float = 1.0,
+        num_classes: Optional[int] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
 
         self.label_names = label_names
-        self.num_classes = len(label_names)
-        self.learning_rate = learning_rate
-        self.reconstruction_weight = reconstruction_weight
-        self.arcface_weight = arcface_weight
-        self.use_enhanced_decoder = use_enhanced_decoder
+        self.num_classes = num_classes or len(label_names)
 
-        # Curriculum learning parameters
-        self.curriculum_learning = curriculum_learning
-        self.initial_snr_threshold = initial_snr_threshold
-        self.final_snr_threshold = final_snr_threshold
-        self.curriculum_epochs = curriculum_epochs
-
-        # Networks - choose encoder type
-        self.encoder = RFEncoder(signal_length, latent_dim)
-
-        # Choose decoder type
-        self.decoder = RFDecoderEnhanced(latent_dim, signal_length)  # Single decoder
-
-        # Loss functions
-        self.arcface_loss = AdaptiveArcFaceLoss(
-            latent_dim, self.num_classes, arcface_margin, arcface_scale
+        # ViC-MAE encoder
+        self.encoder = RFViCMAEEncoder(
+            signal_length=signal_length,
+            patch_size=patch_size,
+            d_model=d_model,
+            mask_ratio=mask_ratio,
+            temperature=temperature,
+            nhead = nhead,
         )
 
-        self.reconstruction_loss = EnhancedReconstructionLoss(signal_length)
-
-    def get_current_snr_threshold(self):
-        """Calculate current SNR threshold based on training progress"""
-        if not self.curriculum_learning:
-            return self.final_snr_threshold
-
-        # Linear decay from initial to final threshold
-        progress = min(self.current_epoch / self.curriculum_epochs, 1.0)
-        current_threshold = (
-            self.initial_snr_threshold * (1 - progress)
-            + self.final_snr_threshold * progress
-        )
-
-        return current_threshold
-
-    def get_arcface_embeddings(self, x):
-        """Get the normalized embeddings used by ArcFace (before classification)"""
-        with torch.no_grad():
-            encoder_output = self.encode(x)
-
-            if isinstance(encoder_output, dict):
-                # For SNR-aware encoder, use signal features or full embedding
-                if "signal_features" in encoder_output:
-                    embeddings = encoder_output["signal_features"]
-                else:
-                    embeddings = encoder_output["full_embedding"]
-            else:
-                # For regular encoder
-                embeddings = encoder_output
-
-            # Normalize embeddings the same way ArcFace does
-            normalized_embeddings = F.normalize(embeddings, p=2, dim=1)
-
-            return normalized_embeddings
-
-    def get_raw_embeddings(self, x):
-        """Get the raw (unnormalized) embeddings"""
-        with torch.no_grad():
-            encoder_output = self.encode(x)
-
-            if isinstance(encoder_output, dict):
-                if "signal_features" in encoder_output:
-                    return encoder_output["signal_features"]
-                else:
-                    return encoder_output["full_embedding"]
-            else:
-                return encoder_output
-
-    def create_curriculum_mask(self, snrs, current_threshold):
-        """Create mask for samples that should participate in training"""
-        # Only train on samples with SNR >= current_threshold
-        mask = snrs >= current_threshold
-        return mask
-
-    def encode(self, x):
-        """Get latent representation"""
-        return self.encoder(x)
-
-    def decode(self, latent):
-        """Reconstruct from latent"""
-        if isinstance(latent, dict):
-            # If using SNR-aware encoder, use full embedding for reconstruction
-            return self.decoder(latent["full_embedding"])
-        else:
-            # Original encoder returns tensor directly
-            return self.decoder(latent)
-
-    def forward(self, x):
-        """Full forward pass"""
-        encoder_output = self.encode(x)
-        decoder_output = self.decode(encoder_output)
-        return encoder_output, decoder_output
+        # Optional classification head for finetuning
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(d_model // 2, self.num_classes),
+        ) if num_classes else None
 
     def training_step(self, batch, batch_idx):
-        try:
-            import ipdb
+        # Unpack batch - assuming dataloader provides (x_i, x_j, labels, snrs)
+        if len(batch) == 4:
+            x_i, x_j, labels, snrs = batch
+        elif len(batch) == 3:
+            (x_i, x_j), labels, snrs = batch
+        else:
+            raise ValueError(f"Expected batch with 3 or 4 elements, got {len(batch)}")
 
-            ipdb.set_trace()
-            x, labels, snrs = batch
-            batch_size = x.shape[0]
+        # Forward pass through ViC-MAE
+        outputs = self.encoder(x_i, x_j)
 
-            # Check input for NaN
-            x, had_nan = check_and_handle_nan(x, "input_signals")
-            if had_nan:
-                print(f"Warning: NaN in input signals at batch {batch_idx}")
+        # Compute total loss
+        loss_recon = outputs['loss_recon']
+        loss_contrast = outputs['loss_contrast']
 
-            # Get current SNR threshold for curriculum learning
-            current_threshold = self.get_current_snr_threshold()
+        # Scale reconstruction loss if it's too small
+        if loss_recon < 0.1:
+            loss_recon = loss_recon * 10
 
-            # Create curriculum mask
-            # curriculum_mask = self.create_curriculum_mask(
-            #     snrs.squeeze(), current_threshold
-            # )
-
-            # Check if any samples in batch meet the curriculum criteria
-            # if not curriculum_mask.any():
-            #     self.log("curriculum_snr_threshold", current_threshold, prog_bar=True)
-            #     self.log("curriculum_batch_skipped", 1.0)
-            #     self.log("curriculum_samples_used", 0.0)
-            #     return None
-
-            # Filter batch to only include curriculum samples
-            # x_curriculum = x[curriculum_mask]
-            # labels_curriculum = labels[curriculum_mask]
-            # snrs_curriculum = snrs[curriculum_mask]
-
-            # Forward pass
-            encoder_output, decoder_output = self.forward(x)
-
-            # Check encoder/decoder outputs
-            encoder_output, _ = check_and_handle_nan(encoder_output, "encoder_output")
-            decoder_output, _ = check_and_handle_nan(decoder_output, "decoder_output")
-
-            # Reconstruction loss
-            recon_loss, loss_components = self.reconstruction_loss(
-                decoder_output, x, labels
-            )
-
-            # Check reconstruction loss
-            if torch.isnan(recon_loss):
-                print(f"Warning: NaN in reconstruction loss at batch {batch_idx}")
-                recon_loss = torch.tensor(0.0, device=x.device, requires_grad=True)
-
-            # ArcFace loss
-            try:
-                arcface_loss = self.arcface_loss(
-                    encoder_output, labels.squeeze(), snrs
-                )
-
-                if torch.isnan(arcface_loss):
-                    print(f"Warning: NaN in ArcFace loss at batch {batch_idx}")
-                    arcface_loss = torch.tensor(
-                        0.0, device=x.device, requires_grad=True
-                    )
-
-            except Exception as e:
-                print(f"Error in ArcFace loss computation: {e}")
-                arcface_loss = torch.tensor(0.0, device=x.device, requires_grad=True)
-
-            # Combined loss
-            total_loss = (
-                self.reconstruction_weight * recon_loss
-                + self.arcface_weight * arcface_loss
-            )
-
-            # Final NaN check
-            if torch.isnan(total_loss):
-                print(
-                    f"Warning: NaN in total loss at batch {batch_idx}, skipping batch"
-                )
-                return None
-
-            # Clean logging
-            self.log("train_loss", total_loss, prog_bar=True)
-            self.log("train_recon_loss", recon_loss)
-            self.log("train_arcface_loss", arcface_loss)
-
-            return total_loss
-
-        except Exception as e:
-            print(f"Error in training step: {e}")
-            return None
-
-    def validation_step(self, batch, batch_idx):
-        try:
-            x, labels, snrs = batch
-
-            # Check input
-            x, had_nan = check_and_handle_nan(x, "val_input_signals")
-            if had_nan:
-                print(f"Warning: NaN in validation input at batch {batch_idx}")
-
-            # Forward pass
-            encoder_output, decoder_output = self.forward(x)
-
-            # Check outputs
-            encoder_output, _ = check_and_handle_nan(
-                encoder_output, "val_encoder_output"
-            )
-            decoder_output, _ = check_and_handle_nan(
-                decoder_output, "val_decoder_output"
-            )
-
-            # Losses
-            try:
-                arcface_loss = self.arcface_loss(encoder_output, labels.squeeze(), snrs)
-                if torch.isnan(arcface_loss):
-                    arcface_loss = torch.tensor(0.0, device=x.device)
-            except:
-                arcface_loss = torch.tensor(0.0, device=x.device)
-
-            recon_loss, loss_components = self.reconstruction_loss(
-                decoder_output, x, labels
-            )
-
-            if torch.isnan(recon_loss):
-                recon_loss = torch.tensor(0.0, device=x.device)
-
-            # Combined loss
-            total_loss = (
-                self.reconstruction_weight * recon_loss
-                + self.arcface_weight * arcface_loss
-            )
-
-            if torch.isnan(total_loss):
-                print(f"Warning: NaN in validation loss at batch {batch_idx}")
-                return torch.tensor(0.0, device=x.device)
-
-            # Logging
-            self.log("val_loss", total_loss, prog_bar=True)
-            self.log("val_recon_loss", recon_loss)
-            self.log("val_arcface_loss", arcface_loss)
-
-            for key, value in loss_components.items():
-                if not torch.isnan(value):
-                    self.log(f"val_{key}", value)
-
-            # Save for visualization (first batch only)
-            if batch_idx == 0:
-                self.val_latents = encoder_output.detach().cpu()
-                self.val_labels = labels.detach().cpu()
-                self.val_snrs = snrs.detach().cpu()
-                self.val_original = x.detach().cpu()
-                self.val_reconstructed = decoder_output.detach().cpu()
-
-            return total_loss
-
-        except Exception as e:
-            print(f"Error in validation step: {e}")
-            return torch.tensor(0.0, device=batch[0].device)
-
-    def on_train_epoch_end(self):
-        """Log curriculum progress at end of each epoch"""
-        current_threshold = self.get_current_snr_threshold()
-        progress = min(self.current_epoch / self.curriculum_epochs, 1.0) * 100
-
-        # Calculate approximate data coverage
-        total_snr_range = 30 - (-20)  # 38 dB range
-        included_range = 30 - current_threshold
-        data_coverage = min(included_range / total_snr_range * 100, 100)
-
-        print(
-            f"Epoch {self.current_epoch}: SNR threshold = {current_threshold:.1f} dB "
-            f"(~{data_coverage:.0f}% of data, Progress: {progress:.1f}%)"
+        total_loss = (
+            self.hparams.reconstruction_weight * loss_recon +
+            self.hparams.contrastive_weight * loss_contrast
         )
 
-        if self.current_epoch >= self.curriculum_epochs:
-            print("Curriculum learning completed - training on all SNR levels")
+        # Optional classification loss if classifier exists
+        if self.classifier is not None:
+            logits_i = self.classifier(outputs['latent_i'])
+            logits_j = self.classifier(outputs['latent_j'])
 
-    def _plot_reconstruction_quality(self):
-        """Enhanced visualization including phase analysis"""
-        if not hasattr(self, "val_original") or not hasattr(self, "val_reconstructed"):
+            # Handle labels - make sure they're the right shape
+            target_labels = labels.squeeze() if labels.dim() > 1 else labels
+
+            class_loss_i = F.cross_entropy(logits_i, target_labels)
+            class_loss_j = F.cross_entropy(logits_j, target_labels)
+            class_loss = (class_loss_i + class_loss_j) / 2
+
+            total_loss = total_loss + 0.1 * class_loss
+            self.log('train_class_loss', class_loss, prog_bar=True)
+
+            # Log accuracy
+            acc_i = (logits_i.argmax(dim=1) == target_labels).float().mean()
+            acc_j = (logits_j.argmax(dim=1) == target_labels).float().mean()
+            acc = (acc_i + acc_j) / 2
+            self.log('train_acc', acc, prog_bar=True)
+
+        # Logging
+        self.log('train_loss', total_loss, prog_bar=True)
+        self.log('train_recon_loss', loss_recon)
+        self.log('train_contrast_loss', loss_contrast)
+
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        # Unpack batch
+        if len(batch) == 4:
+            x_i, x_j, labels, snrs = batch
+        elif len(batch) == 3:
+            (x_i, x_j), labels, snrs = batch
+        else:
+            raise ValueError(f"Expected batch with 3 or 4 elements, got {len(batch)}")
+
+        # Forward pass
+        outputs = self.encoder(x_i, x_j)
+
+        # Compute losses
+        loss_recon = outputs['loss_recon']
+        loss_contrast = outputs['loss_contrast']
+
+        # Scale reconstruction loss if it's too small
+        if loss_recon < 0.1:
+            loss_recon = loss_recon * 10
+
+        total_loss = (
+            self.hparams.reconstruction_weight * loss_recon +
+            self.hparams.contrastive_weight * loss_contrast
+        )
+
+        # Optional classification
+        if self.classifier is not None:
+            logits_i = self.classifier(outputs['latent_i'])
+            logits_j = self.classifier(outputs['latent_j'])
+
+            target_labels = labels.squeeze() if labels.dim() > 1 else labels
+
+            class_loss_i = F.cross_entropy(logits_i, target_labels)
+            class_loss_j = F.cross_entropy(logits_j, target_labels)
+            class_loss = (class_loss_i + class_loss_j) / 2
+
+            # Accuracy
+            acc_i = (logits_i.argmax(dim=1) == target_labels).float().mean()
+            acc_j = (logits_j.argmax(dim=1) == target_labels).float().mean()
+            acc = (acc_i + acc_j) / 2
+
+            total_loss = total_loss + 0.1 * class_loss
+            self.log('val_class_loss', class_loss)
+            self.log('val_acc', acc, prog_bar=True)
+
+        # Logging
+        self.log('val_loss', total_loss, prog_bar=True)
+        self.log('val_recon_loss', loss_recon)
+        self.log('val_contrast_loss', loss_contrast)
+
+        # Store for visualization (first batch only)
+        if batch_idx == 0:
+            self.val_outputs = outputs
+            self.val_x_i = x_i.detach().cpu()
+            self.val_x_j = x_j.detach().cpu()
+            self.val_labels = labels.detach().cpu()
+            if len(batch) == 4:
+                self.val_snrs = snrs.detach().cpu()
+
+        return total_loss
+
+    def on_validation_epoch_end(self):
+        """Visualize reconstruction and embeddings."""
+        if hasattr(self, 'val_outputs'):
+            self._visualize_reconstruction()
+            self._visualize_embeddings()
+            self._visualize_rf_metrics()
+            self._visualize_frequency_domain()
+
+    def _visualize_reconstruction(self):
+        """Visualize masked reconstruction."""
+        if not hasattr(self, 'val_outputs'):
             return
 
         try:
-            fig, axes = plt.subplots(3, 3, figsize=(20, 15))  # 3x3 grid now
+            fig, axes = plt.subplots(2, 4, figsize=(16, 8))
 
-            # Use first sample for detailed analysis
-            sample_idx = 0
-            orig_i = self.val_original[sample_idx, 0].float()
-            orig_q = self.val_original[sample_idx, 1].float()
-            recon_i = self.val_reconstructed[sample_idx, 0].float()
-            recon_q = self.val_reconstructed[sample_idx, 1].float()
+            # Select first sample
+            idx = 0
 
-            # Create complex signals
-            orig_complex = torch.complex(orig_i, orig_q)
-            recon_complex = torch.complex(recon_i, recon_q)
-            time_axis = np.arange(len(orig_i))
+            # Original signals
+            orig_i = self.val_x_i[idx].numpy()
+            orig_j = self.val_x_j[idx].numpy()
 
-            # 1. I/Q Time Domain
-            axes[0, 0].plot(
-                time_axis, orig_i.numpy(), "b-", label="Original I", alpha=0.8
-            )
-            axes[0, 0].plot(
-                time_axis, recon_i.numpy(), "r--", label="Reconstructed I", alpha=0.8
-            )
-            axes[0, 0].plot(
-                time_axis, orig_q.numpy(), "c-", label="Original Q", alpha=0.8
-            )
-            axes[0, 0].plot(
-                time_axis, recon_q.numpy(), "m--", label="Reconstructed Q", alpha=0.8
-            )
+            # Reconstructed signals
+            recon_i = self.val_outputs['recon_xi'][idx].detach().cpu().numpy()
+            recon_j = self.val_outputs['recon_xj'][idx].detach().cpu().numpy()
 
-            complex_mse = torch.mean(
-                torch.abs(orig_complex - recon_complex) ** 2
-            ).item()
-            axes[0, 0].set_title(f"I/Q Reconstruction\nComplex MSE: {complex_mse:.6f}")
-            axes[0, 0].set_xlabel("Time Sample")
-            axes[0, 0].set_ylabel("Amplitude")
+            # Plot view i
+            time = np.arange(orig_i.shape[1])
+
+            axes[0, 0].plot(time, orig_i[0], label='Original I', alpha=0.8)
+            axes[0, 0].plot(time, recon_i[0], label='Reconstructed I', alpha=0.8)
+            axes[0, 0].set_title('View i - I channel')
             axes[0, 0].legend()
             axes[0, 0].grid(True, alpha=0.3)
 
-            # 2. Phase Comparison (NEW!)
-            orig_phase = torch.angle(orig_complex).numpy()
-            recon_phase = torch.angle(recon_complex).numpy()
-
-            # Unwrap phases for better visualization
-            orig_phase_unwrapped = np.unwrap(orig_phase)
-            recon_phase_unwrapped = np.unwrap(recon_phase)
-
-            axes[0, 1].plot(
-                time_axis, orig_phase_unwrapped, "b-", label="Original Phase", alpha=0.8
-            )
-            axes[0, 1].plot(
-                time_axis,
-                recon_phase_unwrapped,
-                "r--",
-                label="Reconstructed Phase",
-                alpha=0.8,
-            )
-
-            # Calculate phase loss
-            phase_diff = torch.atan2(
-                torch.sin(torch.angle(orig_complex) - torch.angle(recon_complex)),
-                torch.cos(torch.angle(orig_complex) - torch.angle(recon_complex)),
-            )
-            phase_mse = torch.mean(phase_diff**2).item()
-
-            axes[0, 1].set_title(f"Phase Comparison\nPhase MSE: {phase_mse:.6f} rad²")
-            axes[0, 1].set_xlabel("Time Sample")
-            axes[0, 1].set_ylabel("Phase (radians)")
+            axes[0, 1].plot(time, orig_i[1], label='Original Q', alpha=0.8)
+            axes[0, 1].plot(time, recon_i[1], label='Reconstructed Q', alpha=0.8)
+            axes[0, 1].set_title('View i - Q channel')
             axes[0, 1].legend()
             axes[0, 1].grid(True, alpha=0.3)
 
-            # 3. Phase Error (NEW!)
-            phase_error = phase_diff.numpy()
-            axes[0, 2].plot(time_axis, phase_error, "r-", alpha=0.8)
-            axes[0, 2].axhline(y=0, color="k", linestyle="--", alpha=0.3)
-            axes[0, 2].set_title(
-                f"Phase Error\nMean: {np.mean(phase_error):.4f}, Std: {np.std(phase_error):.4f}"
-            )
-            axes[0, 2].set_xlabel("Time Sample")
-            axes[0, 2].set_ylabel("Phase Error (radians)")
-            axes[0, 2].grid(True, alpha=0.3)
-
-            # 4. Constellation Diagram
-            axes[1, 0].scatter(
-                orig_complex.real.numpy(),
-                orig_complex.imag.numpy(),
-                alpha=0.6,
-                s=20,
-                c="blue",
-                label="Original",
-            )
-            axes[1, 0].scatter(
-                recon_complex.real.numpy(),
-                recon_complex.imag.numpy(),
-                alpha=0.6,
-                s=20,
-                c="red",
-                label="Reconstructed",
-            )
-            axes[1, 0].set_title("Constellation Diagram")
-            axes[1, 0].set_xlabel("I (Real)")
-            axes[1, 0].set_ylabel("Q (Imaginary)")
+            # Plot view j
+            axes[1, 0].plot(time, orig_j[0], label='Original I', alpha=0.8)
+            axes[1, 0].plot(time, recon_j[0], label='Reconstructed I', alpha=0.8)
+            axes[1, 0].set_title('View j - I channel')
             axes[1, 0].legend()
             axes[1, 0].grid(True, alpha=0.3)
-            axes[1, 0].axis("equal")
 
-            # 5. FFT Magnitude Spectrum
-            orig_fft = torch.fft.fft(orig_complex)
-            recon_fft = torch.fft.fft(recon_complex)
-            freqs = np.arange(len(orig_fft))
-
-            fft_loss = torch.mean(
-                (torch.abs(orig_fft) - torch.abs(recon_fft)) ** 2
-            ).item()
-
-            axes[1, 1].plot(
-                freqs, torch.abs(orig_fft).numpy(), "b-", label="Original", alpha=0.8
-            )
-            axes[1, 1].plot(
-                freqs,
-                torch.abs(recon_fft).numpy(),
-                "r--",
-                label="Reconstructed",
-                alpha=0.8,
-            )
-            axes[1, 1].set_title(f"FFT Magnitude Spectrum\nFFT Loss: {fft_loss:.6f}")
-            axes[1, 1].set_xlabel("Frequency Bin")
-            axes[1, 1].set_ylabel("FFT Magnitude")
+            axes[1, 1].plot(time, orig_j[1], label='Original Q', alpha=0.8)
+            axes[1, 1].plot(time, recon_j[1], label='Reconstructed Q', alpha=0.8)
+            axes[1, 1].set_title('View j - Q channel')
             axes[1, 1].legend()
             axes[1, 1].grid(True, alpha=0.3)
 
-            # 6. FFT Phase Spectrum (NEW!)
-            orig_fft_phase = torch.angle(orig_fft).numpy()
-            recon_fft_phase = torch.angle(recon_fft).numpy()
+            # Constellation diagrams
+            axes[0, 2].scatter(orig_i[0], orig_i[1], alpha=0.5, s=10, label='Original')
+            axes[0, 2].scatter(recon_i[0], recon_i[1], alpha=0.5, s=10, label='Reconstructed')
+            axes[0, 2].set_title('View i - Constellation')
+            axes[0, 2].set_xlabel('I')
+            axes[0, 2].set_ylabel('Q')
+            axes[0, 2].legend()
+            axes[0, 2].grid(True, alpha=0.3)
 
-            axes[1, 2].plot(freqs, orig_fft_phase, "b-", label="Original", alpha=0.8)
-            axes[1, 2].plot(
-                freqs, recon_fft_phase, "r--", label="Reconstructed", alpha=0.8
-            )
-            axes[1, 2].set_title("FFT Phase Spectrum")
-            axes[1, 2].set_xlabel("Frequency Bin")
-            axes[1, 2].set_ylabel("Phase (radians)")
+            axes[1, 2].scatter(orig_j[0], orig_j[1], alpha=0.5, s=10, label='Original')
+            axes[1, 2].scatter(recon_j[0], recon_j[1], alpha=0.5, s=10, label='Reconstructed')
+            axes[1, 2].set_title('View j - Constellation')
+            axes[1, 2].set_xlabel('I')
+            axes[1, 2].set_ylabel('Q')
             axes[1, 2].legend()
             axes[1, 2].grid(True, alpha=0.3)
 
-            # 7. Instantaneous Frequency
-            orig_inst_freq = self._compute_instantaneous_frequency(orig_complex)
-            recon_inst_freq = self._compute_instantaneous_frequency(recon_complex)
+            # Mask visualization
+            mask_i = self.val_outputs['mask_i'][idx].detach().cpu().numpy()
+            mask_j = self.val_outputs['mask_j'][idx].detach().cpu().numpy()
 
-            if_loss = torch.mean((orig_inst_freq - recon_inst_freq) ** 2).item()
+            axes[0, 3].imshow(mask_i.reshape(1, -1), aspect='auto', cmap='binary')
+            axes[0, 3].set_title(f'Mask i (ratio: {mask_i.mean():.2f})')
+            axes[0, 3].set_yticks([])
 
-            axes[2, 0].plot(
-                time_axis, orig_inst_freq.numpy(), "b-", label="Original", alpha=0.8
-            )
-            axes[2, 0].plot(
-                time_axis,
-                recon_inst_freq.numpy(),
-                "r--",
-                label="Reconstructed",
-                alpha=0.8,
-            )
-            axes[2, 0].set_title(f"Instantaneous Frequency\nIF Loss: {if_loss:.6f}")
-            axes[2, 0].set_xlabel("Time Sample")
-            axes[2, 0].set_ylabel("Frequency (rad/sample)")
-            axes[2, 0].legend()
-            axes[2, 0].grid(True, alpha=0.3)
-
-            # 8. Power Spectral Density
-            orig_psd = torch.abs(orig_fft) ** 2
-            recon_psd = torch.abs(recon_fft) ** 2
-
-            axes[2, 1].plot(
-                freqs,
-                10 * torch.log10(orig_psd + 1e-10).numpy(),
-                "b-",
-                label="Original",
-                alpha=0.8,
-            )
-            axes[2, 1].plot(
-                freqs,
-                10 * torch.log10(recon_psd + 1e-10).numpy(),
-                "r--",
-                label="Reconstructed",
-                alpha=0.8,
-            )
-            axes[2, 1].set_title("Power Spectral Density")
-            axes[2, 1].set_xlabel("Frequency Bin")
-            axes[2, 1].set_ylabel("Power (dB)")
-            axes[2, 1].legend()
-            axes[2, 1].grid(True, alpha=0.3)
-
-            # 9. Loss Component Breakdown
-            with torch.no_grad():
-                sample_orig = self.val_original[sample_idx : sample_idx + 1]
-                sample_recon = self.val_reconstructed[sample_idx : sample_idx + 1]
-
-                loss_fn = EnhancedReconstructionLoss(self.hparams.signal_length)
-                _, loss_breakdown = loss_fn(sample_recon, sample_orig)
-
-                loss_names = [
-                    "Complex MSE",
-                    "Phase Loss",
-                    "FFT Loss",
-                    "Inst. Freq",
-                ]  # Updated
-                loss_values = [
-                    loss_breakdown["complex_mse"].item(),
-                    loss_breakdown["phase_loss"].item(),  # NEW!
-                    loss_breakdown["fft_loss"].item(),
-                    loss_breakdown["instantaneous_frequency"].item(),
-                ]
-
-                bars = axes[2, 2].bar(
-                    loss_names,
-                    loss_values,
-                    color=["blue", "red", "orange", "green"],
-                    alpha=0.7,
-                )
-                axes[2, 2].set_title("Loss Component Breakdown")
-                axes[2, 2].set_ylabel("Loss Value")
-                axes[2, 2].tick_params(axis="x", rotation=45)
-
-                # Add value labels on bars
-                for bar, value in zip(bars, loss_values):
-                    height = bar.get_height()
-                    axes[2, 2].text(
-                        bar.get_x() + bar.get_width() / 2.0,
-                        height,
-                        f"{value:.4f}",
-                        ha="center",
-                        va="bottom",
-                    )
+            axes[1, 3].imshow(mask_j.reshape(1, -1), aspect='auto', cmap='binary')
+            axes[1, 3].set_title(f'Mask j (ratio: {mask_j.mean():.2f})')
+            axes[1, 3].set_yticks([])
 
             plt.tight_layout()
 
-            if self.logger and hasattr(self.logger, "experiment"):
+            if self.logger and hasattr(self.logger, 'experiment'):
                 self.logger.experiment.log({"reconstruction_quality": wandb.Image(fig)})
 
             plt.close(fig)
 
         except Exception as e:
-            print(f"Error in reconstruction quality visualization: {e}")
-            plt.close("all")
+            print(f"Error in reconstruction visualization: {e}")
+            plt.close('all')
 
-    def _plot_arcface_embeddings(self):
-        """Core ArcFace embedding analysis: class separation and angular distances"""
-        if not hasattr(self, "val_latents") or not hasattr(self, "val_labels"):
+    def _visualize_embeddings(self):
+        """Visualize contrastive embeddings."""
+        if not hasattr(self, 'val_outputs'):
             return
 
         try:
-            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-            # Normalize embeddings (should already be normalized by ArcFace)
-            embeddings_norm = F.normalize(self.val_latents, p=2, dim=1).numpy()
+            # Get embeddings
+            emb_i = self.val_outputs['emb_i'].detach().cpu().numpy()
+            emb_j = self.val_outputs['emb_j'].detach().cpu().numpy()
+            labels = self.val_labels.numpy()
 
-            # Check for NaN values and remove them
-            nan_mask = np.isnan(embeddings_norm).any(axis=1)
-            if nan_mask.any():
-                print(
-                    f"Warning: Found {nan_mask.sum()} samples with NaN values in embeddings. Removing them for visualization."
-                )
-                embeddings_norm = embeddings_norm[~nan_mask]
-                val_labels_clean = self.val_labels[~nan_mask]
-            else:
-                val_labels_clean = self.val_labels
+            # t-SNE visualization
+            embeddings_all = np.vstack([emb_i, emb_j])
+            labels_all = np.hstack([labels, labels])
 
-            # Check if we have enough samples left
-            if len(embeddings_norm) < 2:
-                print(
-                    "Warning: Not enough valid samples for t-SNE visualization after NaN removal."
-                )
-                return
+            if len(embeddings_all) > 2:
+                perplexity = min(30, len(embeddings_all) - 1)
+                tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42)
+                embeddings_2d = tsne.fit_transform(embeddings_all)
 
-            unique_labels = torch.unique(val_labels_clean).numpy()
-            colors = plt.cm.tab20(np.linspace(0, 1, len(unique_labels)))
+                # Plot t-SNE
+                unique_labels = np.unique(labels_all)
+                colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
 
-            # 1. t-SNE visualization
-            tsne = TSNE(
-                n_components=2,
-                random_state=42,
-                perplexity=min(30, len(embeddings_norm) // 4),
-            )
-            embeddings_2d = tsne.fit_transform(embeddings_norm)
-
-            for i, label in enumerate(unique_labels):
-                mask = val_labels_clean.squeeze().numpy() == label
-                if mask.sum() > 0:
+                for i, label in enumerate(unique_labels):
+                    mask = labels_all == label
                     axes[0].scatter(
                         embeddings_2d[mask, 0],
                         embeddings_2d[mask, 1],
                         c=[colors[i]],
-                        label=self.label_names[int(label)],
+                        label=self.label_names[int(label)] if int(label) < len(self.label_names) else f'Class {int(label)}',
                         alpha=0.7,
+                        s=20
                     )
 
-            axes[0].set_title("t-SNE: Class Separation")
-            axes[0].legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-            axes[0].grid(True, alpha=0.3)
+                axes[0].set_title('t-SNE of Contrastive Embeddings')
+                axes[0].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                axes[0].grid(True, alpha=0.3)
 
-            # 2. Angular distances on unit circle (first 2 dims)
-            embeddings_2d_circle = embeddings_norm[:, :2]
-            # Add small epsilon to avoid division by zero
-            norms = np.linalg.norm(embeddings_2d_circle, axis=1, keepdims=True)
-            embeddings_2d_circle = embeddings_2d_circle / (norms + 1e-8)
+            # Similarity matrix
+            similarity = np.dot(emb_i, emb_j.T)
+            im = axes[1].imshow(similarity, cmap='viridis', aspect='auto')
+            axes[1].set_title('Cosine Similarity Matrix')
+            axes[1].set_xlabel('View j samples')
+            axes[1].set_ylabel('View i samples')
+            plt.colorbar(im, ax=axes[1])
 
-            for i, label in enumerate(unique_labels):
-                mask = val_labels_clean.squeeze().numpy() == label
-                if mask.sum() > 0:
-                    axes[1].scatter(
-                        embeddings_2d_circle[mask, 0],
-                        embeddings_2d_circle[mask, 1],
-                        c=[colors[i]],
-                        label=self.label_names[int(label)],
-                        alpha=0.7,
-                    )
-
-            # Draw unit circle
-            circle = plt.Circle(
-                (0, 0), 1, fill=False, color="gray", linestyle="--", alpha=0.8
-            )
-            axes[1].add_artist(circle)
-            axes[1].set_xlim(-1.2, 1.2)
-            axes[1].set_ylim(-1.2, 1.2)
-            axes[1].set_aspect("equal")
-            axes[1].set_title("Unit Circle Projection")
-            axes[1].grid(True, alpha=0.3)
-
-            # 3. Inter-class angular distance matrix
-            n_classes = len(unique_labels)
-            distance_matrix = np.zeros((n_classes, n_classes))
-            class_names = []
-
-            # Calculate class centroids
-            for i, label in enumerate(unique_labels):
-                mask = val_labels_clean.squeeze().numpy() == label
-                if mask.sum() > 0:
-                    centroid_i = embeddings_norm[mask].mean(axis=0)
-                    # Add small epsilon to avoid division by zero
-                    centroid_i = centroid_i / (np.linalg.norm(centroid_i) + 1e-8)
-                    class_names.append(self.label_names[int(label)])
-
-                    for j, label_j in enumerate(unique_labels):
-                        mask_j = val_labels_clean.squeeze().numpy() == label_j
-                        if mask_j.sum() > 0:
-                            centroid_j = embeddings_norm[mask_j].mean(axis=0)
-                            centroid_j = centroid_j / (
-                                np.linalg.norm(centroid_j) + 1e-8
-                            )
-
-                            # Angular distance in degrees
-                            cos_sim = np.clip(np.dot(centroid_i, centroid_j), -1.0, 1.0)
-                            angular_dist = np.arccos(cos_sim) * 180 / np.pi
-                            distance_matrix[i, j] = angular_dist
-
-            im = axes[2].imshow(distance_matrix, cmap="viridis")
-            axes[2].set_xticks(range(len(class_names)))
-            axes[2].set_yticks(range(len(class_names)))
-            axes[2].set_xticklabels(class_names, rotation=45, ha="right")
-            axes[2].set_yticklabels(class_names)
-            axes[2].set_title("Angular Distances (degrees)")
-
-            # Add text annotations
-            for i in range(len(class_names)):
-                for j in range(len(class_names)):
-                    axes[2].text(
-                        j,
-                        i,
-                        f"{distance_matrix[i, j]:.1f}°",
-                        ha="center",
-                        va="center",
-                        color="white"
-                        if distance_matrix[i, j] > distance_matrix.max() / 2
-                        else "black",
-                        fontsize=8,
-                    )
-
-            plt.colorbar(im, ax=axes[2])
             plt.tight_layout()
 
-            if self.logger and hasattr(self.logger, "experiment"):
-                self.logger.experiment.log({"arcface_analysis": wandb.Image(fig)})
+            if self.logger and hasattr(self.logger, 'experiment'):
+                self.logger.experiment.log({"contrastive_embeddings": wandb.Image(fig)})
 
             plt.close(fig)
 
         except Exception as e:
-            print(f"Error in ArcFace visualization: {e}")
-            plt.close("all")
+            print(f"Error in embedding visualization: {e}")
+            plt.close('all')
 
-    def on_validation_epoch_end(self):
-        """Simplified validation visualization - only core metrics"""
-        if not hasattr(self, "val_latents"):
+    def _visualize_rf_metrics(self):
+        """Visualize RF-specific metrics: magnitude, phase, and error analysis."""
+        if not hasattr(self, 'val_outputs'):
             return
 
-        # Only plot the essential visualizations
-        self._plot_reconstruction_quality()  # I/Q, constellation, frequency/phase
-        self._plot_arcface_embeddings()  # Class separation and angular distances
+        try:
+            fig, axes = plt.subplots(3, 4, figsize=(20, 12))
+
+            # Select first few samples for visualization
+            n_samples = min(4, self.val_x_i.shape[0])
+
+            for sample_idx in range(n_samples):
+                # Get original and reconstructed signals
+                orig_i = self.val_x_i[sample_idx].numpy()
+                recon_i = self.val_outputs['recon_xi'][sample_idx].detach().cpu().numpy()
+
+                # Convert to complex
+                orig_complex = orig_i[0] + 1j * orig_i[1]
+                recon_complex = recon_i[0] + 1j * recon_i[1]
+
+                # Compute magnitude and phase
+                orig_mag = np.abs(orig_complex)
+                recon_mag = np.abs(recon_complex)
+                orig_phase = np.angle(orig_complex)
+                recon_phase = np.angle(recon_complex)
+
+                time = np.arange(len(orig_complex))
+
+                # Row 1: Magnitude comparison
+                axes[0, sample_idx].plot(time, orig_mag, label='Original', alpha=0.8, linewidth=2)
+                axes[0, sample_idx].plot(time, recon_mag, label='Reconstructed', alpha=0.8, linewidth=2)
+                axes[0, sample_idx].set_title(f'Sample {sample_idx+1} - Magnitude')
+                axes[0, sample_idx].set_ylabel('Magnitude')
+                axes[0, sample_idx].legend()
+                axes[0, sample_idx].grid(True, alpha=0.3)
+
+                # Row 2: Phase comparison
+                axes[1, sample_idx].plot(time, orig_phase, label='Original', alpha=0.8, linewidth=2)
+                axes[1, sample_idx].plot(time, recon_phase, label='Reconstructed', alpha=0.8, linewidth=2)
+                axes[1, sample_idx].set_title(f'Sample {sample_idx+1} - Phase')
+                axes[1, sample_idx].set_ylabel('Phase (radians)')
+                axes[1, sample_idx].legend()
+                axes[1, sample_idx].grid(True, alpha=0.3)
+
+                # Row 3: Error analysis
+                mag_error = np.abs(orig_mag - recon_mag)
+                phase_error = np.abs(np.angle(np.exp(1j * (orig_phase - recon_phase))))  # Wrapped phase error
+
+                ax_error = axes[2, sample_idx]
+                ax_error2 = ax_error.twinx()
+
+                line1 = ax_error.plot(time, mag_error, 'r-', label='Magnitude Error', alpha=0.8)
+                line2 = ax_error2.plot(time, phase_error, 'b-', label='Phase Error', alpha=0.8)
+
+                ax_error.set_xlabel('Time')
+                ax_error.set_ylabel('Magnitude Error', color='r')
+                ax_error2.set_ylabel('Phase Error (rad)', color='b')
+                ax_error.set_title(f'Sample {sample_idx+1} - Reconstruction Errors')
+
+                # Combine legends
+                lines = line1 + line2
+                labels = [l.get_label() for l in lines]
+                ax_error.legend(lines, labels, loc='upper right')
+
+                ax_error.grid(True, alpha=0.3)
+
+                # Add error statistics as text
+                mag_mse = np.mean(mag_error**2)
+                phase_mse = np.mean(phase_error**2)
+                ax_error.text(0.02, 0.98, f'Mag MSE: {mag_mse:.4f}\nPhase MSE: {phase_mse:.4f}',
+                             transform=ax_error.transAxes, verticalalignment='top',
+                             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+            plt.tight_layout()
+
+            if self.logger and hasattr(self.logger, 'experiment'):
+                self.logger.experiment.log({"rf_metrics_analysis": wandb.Image(fig)})
+
+            plt.close(fig)
+
+        except Exception as e:
+            print(f"Error in RF metrics visualization: {e}")
+            plt.close('all')
+
+    def _visualize_frequency_domain(self):
+        """Visualize frequency domain characteristics and spectral reconstruction quality."""
+        if not hasattr(self, 'val_outputs'):
+            return
+
+        try:
+            fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+
+            # Select first few samples
+            n_samples = min(4, self.val_x_i.shape[0])
+
+            for sample_idx in range(n_samples):
+                # Get signals
+                orig_i = self.val_x_i[sample_idx].numpy()
+                recon_i = self.val_outputs['recon_xi'][sample_idx].detach().cpu().numpy()
+
+                # Convert to complex
+                orig_complex = orig_i[0] + 1j * orig_i[1]
+                recon_complex = recon_i[0] + 1j * recon_i[1]
+
+                # Compute FFT
+                orig_fft = np.fft.fft(orig_complex)
+                recon_fft = np.fft.fft(recon_complex)
+
+                # Frequency bins
+                freqs = np.fft.fftfreq(len(orig_complex), d=1.0)
+                freqs_shifted = np.fft.fftshift(freqs)
+
+                # Shift FFT for visualization
+                orig_fft_shifted = np.fft.fftshift(orig_fft)
+                recon_fft_shifted = np.fft.fftshift(recon_fft)
+
+                # Row 1: Magnitude spectrum
+                axes[0, sample_idx].plot(freqs_shifted, np.abs(orig_fft_shifted),
+                                       label='Original', alpha=0.8, linewidth=2)
+                axes[0, sample_idx].plot(freqs_shifted, np.abs(recon_fft_shifted),
+                                       label='Reconstructed', alpha=0.8, linewidth=2)
+                axes[0, sample_idx].set_title(f'Sample {sample_idx+1} - Magnitude Spectrum')
+                axes[0, sample_idx].set_xlabel('Normalized Frequency')
+                axes[0, sample_idx].set_ylabel('Magnitude')
+                axes[0, sample_idx].legend()
+                axes[0, sample_idx].grid(True, alpha=0.3)
+                axes[0, sample_idx].set_yscale('log')
+
+                # Row 2: Phase spectrum
+                orig_phase_spectrum = np.angle(orig_fft_shifted)
+                recon_phase_spectrum = np.angle(recon_fft_shifted)
+
+                axes[1, sample_idx].plot(freqs_shifted, orig_phase_spectrum,
+                                       label='Original', alpha=0.8, linewidth=2)
+                axes[1, sample_idx].plot(freqs_shifted, recon_phase_spectrum,
+                                       label='Reconstructed', alpha=0.8, linewidth=2)
+                axes[1, sample_idx].set_title(f'Sample {sample_idx+1} - Phase Spectrum')
+                axes[1, sample_idx].set_xlabel('Normalized Frequency')
+                axes[1, sample_idx].set_ylabel('Phase (radians)')
+                axes[1, sample_idx].legend()
+                axes[1, sample_idx].grid(True, alpha=0.3)
+
+                # Add spectral error metrics
+                spectral_mag_error = np.mean(np.abs(np.abs(orig_fft) - np.abs(recon_fft))**2)
+                spectral_phase_error = np.mean(np.abs(np.angle(orig_fft) - np.angle(recon_fft))**2)
+
+                axes[0, sample_idx].text(0.02, 0.98, f'Spectral Mag MSE: {spectral_mag_error:.4f}',
+                                       transform=axes[0, sample_idx].transAxes, verticalalignment='top',
+                                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+                axes[1, sample_idx].text(0.02, 0.98, f'Spectral Phase MSE: {spectral_phase_error:.4f}',
+                                       transform=axes[1, sample_idx].transAxes, verticalalignment='top',
+                                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+            plt.tight_layout()
+
+            if self.logger and hasattr(self.logger, 'experiment'):
+                self.logger.experiment.log({"frequency_domain_analysis": wandb.Image(fig)})
+
+            plt.close(fig)
+
+        except Exception as e:
+            print(f"Error in frequency domain visualization: {e}")
+            plt.close('all')
 
     def configure_optimizers(self):
-        """Using PyTorch's built-in warmup scheduler"""
-
-        # Target learning rates
-        max_lr = 1e-4
-        min_lr = 1e-6
-
+        """Configure optimizer with warmup and cosine annealing."""
         optimizer = AdamW(
             self.parameters(),
-            lr=max_lr,  # This will be the peak LR
+            lr=self.hparams.learning_rate,
             weight_decay=1e-5,
-            betas=(0.9, 0.999),
-            eps=1e-8,
+            betas=(0.9, 0.95),  # Common for vision transformers
         )
 
-        # Warmup scheduler
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=0.01,  # Start at 1% of max_lr
-            end_factor=1.0,  # End at 100% of max_lr
-            total_iters=10,  # 10 epochs of warmup
-        )
+        # Learning rate scheduler with warmup
+        def lr_lambda(epoch):
+            if epoch < self.hparams.warmup_epochs:
+                # Linear warmup
+                return epoch / self.hparams.warmup_epochs
+            else:
+                # Cosine annealing
+                progress = (epoch - self.hparams.warmup_epochs) / (self.hparams.max_epochs - self.hparams.warmup_epochs)
+                return 0.5 * (1 + np.cos(np.pi * progress))
 
-        # Main scheduler (starts after warmup)
-        main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=40,  # 90 epochs of cosine annealing
-            eta_min=min_lr,  # Minimum LR
-        )
-
-        # Sequential scheduler: warmup -> cosine annealing
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, main_scheduler],
-            milestones=[10],  # Switch at epoch 10
-        )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
         return {
             "optimizer": optimizer,
@@ -1698,72 +1032,21 @@ class RFEncoderDecoder(L.LightningModule):
                 "scheduler": scheduler,
                 "interval": "epoch",
                 "frequency": 1,
-                "name": "sequential_warmup_cosine",
-            },
+            }
         }
 
     def on_before_optimizer_step(self, optimizer):
-        """Comprehensive gradient handling for Inf/NaN prevention"""
+        """Gradient clipping for stable training."""
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
-        # Track gradient statistics
-        total_norm = 0
-        param_count = 0
-        problematic_params = []
+    def get_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        """Get embeddings for downstream tasks."""
+        with torch.no_grad():
+            return self.encoder.forward_single(x)
 
-        # First pass: analyze all gradients
-        for name, param in self.named_parameters():
-            if param.grad is not None:
-                param_norm = param.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-                param_count += 1
-
-                # Check for problematic gradients
-                if torch.isinf(param.grad).any():
-                    problematic_params.append(f"{name}:Inf")
-                    param.grad.data.zero_()  # Zero out infinite gradients
-
-                elif torch.isnan(param.grad).any():
-                    problematic_params.append(f"{name}:NaN")
-                    param.grad.data.zero_()  # Zero out NaN gradients
-
-                elif param_norm > 100:  # Very large gradients
-                    problematic_params.append(f"{name}:Large({param_norm:.2f})")
-                    param.grad.data = param.grad.data / max(
-                        param_norm / 10, 1
-                    )  # Scale down
-
-        total_norm = total_norm ** (1.0 / 2)
-
-        if problematic_params:
-            print(
-                f"Epoch {self.current_epoch}, Step: Fixed gradients in: {problematic_params[:10]}..."
-            )  # Limit output
-
-        # Log gradient norm for monitoring
-        if param_count > 0:
-            self.log("grad_norm", total_norm, prog_bar=True)
-
-            # If total norm is still too large, apply aggressive clipping
-            if total_norm > 10.0:
-                print(
-                    f"Large gradient norm: {total_norm:.2f}, applying aggressive clipping"
-                )
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-            elif total_norm > 5.0:
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=2.0)
-            else:
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)
-
-    def on_after_backward(self):
-        """Check gradients immediately after backward pass"""
-        # Check for exploding gradients right after backward
-        for name, param in self.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.norm()
-                if grad_norm > 1000 or torch.isinf(grad_norm) or torch.isnan(grad_norm):
-                    print(f"Extreme gradient in {name}: {grad_norm}")
-                    param.grad.data.clamp_(-10, 10)  # Hard clamp
-
-    def _compute_instantaneous_frequency(self, complex_signal):
-        """Use shared instantaneous frequency method"""
-        return compute_instantaneous_frequency_shared(complex_signal)
+    def get_contrastive_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        """Get normalized contrastive embeddings."""
+        with torch.no_grad():
+            latent = self.encoder.forward_single(x)
+            z = self.encoder.projection_head(latent)
+            return F.normalize(z, p=2, dim=1)

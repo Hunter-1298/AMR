@@ -53,19 +53,19 @@ def main(cfg: DictConfig):
 
     # If we need to train the encoder
     if cfg.train_encoder:
-        print("Training VAE Encoder...")
         # Check to see if we need different train and test dataloaders
         if cfg.contrastive_encoder:
-            # encoder_train_loader, encoder_val_loader, label_names = (
-            #     get_moco_dataloaders(train_loader, val_loader, cfg.dataset)
-            # )
-            encoder_train_loader, encoder_val_loader = train_loader, val_loader
+            encoder_train_loader, encoder_val_loader, label_names = (
+                get_moco_dataloaders(train_loader, val_loader, cfg.dataset)
+            )
+            # encoder_train_loader, encoder_val_loader = train_loader, val_loader
         else:
             encoder_train_loader, encoder_val_loader = train_loader, val_loader
 
+        print("Training VAE Encoder...")
         # Create and train encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
-        # encoder = torch.compile(encoder)
+        encoder = torch.compile(encoder)
 
         # Create checkpoint dir
         dir = "contrastive_encoder" if cfg.contrastive_encoder else "encoder"

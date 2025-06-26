@@ -307,33 +307,28 @@ def get_tokenized_dataloaders(cfg, vqvae, train_loader, val_loader):
 
 
 class MoCoRFMLDataset(Dataset):
-    def __init__(self, dataset):
+    def __init__(self, dataset, high_snr_threshold=20):
         self.dataset = dataset
+        self.n = len(dataset)
 
-        # Create index mapping for efficient retrieval
-        self.mod_snr_indices = defaultdict(list)
-        for idx in range(len(dataset)):
-            _, label, snr = dataset[idx]
-            self.mod_snr_indices[(label, snr)].append(idx)
+        # Build mapping: modulation -> list of high-SNR indices
+        self.high_snr_indices = defaultdict(list)
+        for idx in range(self.n):
+            _, mod, snr = dataset[idx]
+            if snr >= high_snr_threshold:
+                self.high_snr_indices[mod].append(idx)
+
 
     def __len__(self):
-        return len(self.dataset)
+        return self.n
 
     def __getitem__(self, idx):
-        x1, label, snr = self.dataset[idx]
-
-        # Get positive pair (same modulation, different SNR)
-        same_mod_indices = [
-            i
-            for s in range(-20, 19, 2)  # SNR range
-            for i in self.mod_snr_indices.get((label, s), [])
-            if s != snr  # Different SNR
-        ]
-        pos_idx = random.choice(same_mod_indices)
-        x2, _, _ = self.dataset[pos_idx]
-
-        return (x1, x2), label, snr
-
+        x1, mod, snr1 = self.dataset[idx]
+        # Get high-SNR positive sample with same modulation
+        candidates = self.high_snr_indices.get(mod, [])
+        pos_idx = random.choice(candidates)
+        x2, _, snr2 = self.dataset[pos_idx]
+        return (x1, x2), mod, (snr1, snr2)
 
 def get_moco_dataloaders(train_loader, val_loader, config):
     """
