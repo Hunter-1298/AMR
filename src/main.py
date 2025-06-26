@@ -16,7 +16,7 @@ from callbacks import (
     DiffusionVisualizationCallback,
     DiffusionTSNEVisualizationCallback,
     DecisionBoundaryVisualizationCallback,
-    ClassifierTSNECallback
+    ClassifierTSNECallback,
 )
 from utils.latent_scaling import calculate_latent_scaling_factor
 import os
@@ -50,7 +50,6 @@ def main(cfg: DictConfig):
 
     # Get original dataloaders
     train_loader, val_loader, label_names = get_dataloaders(cfg.dataset)
-    import pdb; pdb.set_trace()
 
     # If we need to train the encoder
     if cfg.train_encoder:
@@ -66,7 +65,7 @@ def main(cfg: DictConfig):
 
         # Create and train encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
-        encoder = torch.compile(encoder)
+        # encoder = torch.compile(encoder)
 
         # Create checkpoint dir
         dir = "contrastive_encoder" if cfg.contrastive_encoder else "encoder"
@@ -78,6 +77,7 @@ def main(cfg: DictConfig):
             max_epochs=cfg.hyperparams.epochs,
             logger=wandb_logger,
             default_root_dir=".",
+            check_val_every_n_epoch=1,
             log_every_n_steps=10,
             accelerator="gpu",
             devices=1,
@@ -264,8 +264,8 @@ def main(cfg: DictConfig):
                 LearningRateMonitor(logging_interval="step"),
                 ClassifierTSNECallback(
                     every_n_epochs=2,  # Visualize every 2 epochs
-                    label_names=label_names
-                )
+                    label_names=label_names,
+                ),
             ],
         )
 

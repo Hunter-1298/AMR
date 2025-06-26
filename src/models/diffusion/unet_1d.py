@@ -2,7 +2,12 @@ from typing import Optional, Tuple, Union, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .embeddings import GaussianFourierProjection, LabelEmbedding, TimestepEmbedding, Timesteps
+from .embeddings import (
+    GaussianFourierProjection,
+    LabelEmbedding,
+    TimestepEmbedding,
+    Timesteps,
+)
 from .unet_blocks import get_down_block, get_mid_block, get_up_block
 
 
@@ -83,9 +88,7 @@ class UNet1DModel(nn.Module):
         # class CombinedTimestepLabelEmbeddings(nn.Module):
         self.cond_embeddings = None
         if condition:
-            self.cond_embeddings = (
-                LabelEmbedding(conditional, time_embed_dim, 0.1)
-            )
+            self.cond_embeddings = LabelEmbedding(conditional, time_embed_dim, 0.8)
             self.cond_mlp = TimestepEmbedding(time_embed_dim, time_embed_dim)
 
         ######################################################################################
@@ -107,7 +110,7 @@ class UNet1DModel(nn.Module):
                 in_channels=input_channel,
                 out_channels=output_channel,
                 num_layers=layers_per_block,
-                embed_channels=time_embed_dim, #converts time_embed to channels to broadcast
+                embed_channels=time_embed_dim,  # converts time_embed to channels to broadcast
                 condition=condition,
                 add_downsample=True,
                 # context_dim=conditional_len,
@@ -121,7 +124,7 @@ class UNet1DModel(nn.Module):
             mid_channels=block_out_channels[-1],
             out_channels=block_out_channels[-1],
             condition=condition,
-            embed_channels=time_embed_dim, #converts time_embed to channels to broadcast
+            embed_channels=time_embed_dim,  # converts time_embed to channels to broadcast
             # context_dim=conditional_len,
         )
         # up
@@ -195,19 +198,28 @@ class UNet1DModel(nn.Module):
         # after downsample [64,32,32]
         # before first cross attention [64,32,32]
         for downsample_block in self.down_blocks:
-            sample, res_sample = downsample_block(hidden_states=sample, temb=timestep_embed, context=cond_embeddings)
-            down_block_res_samples+=res_sample
+            sample, res_sample = downsample_block(
+                hidden_states=sample, temb=timestep_embed, context=cond_embeddings
+            )
+            down_block_res_samples += res_sample
 
         # 3. mid
         if self.mid_block:
-            sample = self.mid_block(hidden_states=sample, temb=timestep_embed, context=cond_embeddings)
+            sample = self.mid_block(
+                hidden_states=sample, temb=timestep_embed, context=cond_embeddings
+            )
             self.bottleneck_activations = sample.clone().detach()
 
         # 4. up
         for i, upsample_block in enumerate(self.up_blocks):
             res_samples = down_block_res_samples[-1:]
             down_block_res_samples = down_block_res_samples[:-1]
-            sample = upsample_block(sample, res_hidden_state=res_samples, temb=timestep_embed, context=cond_embeddings)
+            sample = upsample_block(
+                sample,
+                res_hidden_state=res_samples,
+                temb=timestep_embed,
+                context=cond_embeddings,
+            )
 
         # 5. post-process
         if self.out_block:

@@ -68,7 +68,7 @@ def _load_data(dataPath, classes, N_SNR):
     return data
 # Load in the data
 dataPath = '/home/hshayde/Projects/MIT/AMR/Dataset/2018.01/2018_RFML.hdf5'
-selected_classes = ['64QAM']
+selected_classes = ['QPSK']
 data_classes  = [classes.index(cls) for cls in selected_classes]
 snr_value = 1
 data = _load_data(dataPath, data_classes, snr_value)

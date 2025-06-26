@@ -11,7 +11,12 @@ from tqdm import tqdm
 
 
 class RFMLDataset(Dataset):
-    def __init__(self, dataPath = '/home/hshayde/Projects/MIT/AMR/Dataset/RML2016.10a_dict.pkl', data = 2016, iq=False):
+    def __init__(
+        self,
+        dataPath="/home/hshayde/Projects/MIT/AMR/Dataset/RML2016.10a_dict.pkl",
+        data=2018,
+        iq=False,
+    ):
         # Data in the shape of dict[('Mod_type','snr')] = [1000,2,128]
         if data == 2018:
             data = self._load_2018_data()
@@ -25,13 +30,19 @@ class RFMLDataset(Dataset):
         self.encoded_hash = {}
         for (mod_type, snr), signals in data.items():
             if type(signals) == list:
-                signals = torch.from_numpy(np.array(signals)).float()  # signals shape: [1000, 2, 128]
+                signals = torch.from_numpy(
+                    np.array(signals)
+                ).float()  # signals shape: [1000, 2, 128]
             else:
-                signals = torch.from_numpy(signals).float()  # signals shape: [1000, 2, 128]
+                signals = torch.from_numpy(
+                    signals
+                ).float()  # signals shape: [1000, 2, 128]
             mod_label = mod_type
             # Normalize all signals at once
             if iq:
-                processed_signals = self._normalize_data(signals)  # Now shape: [1000, 2, 128]
+                processed_signals = self._normalize_data(
+                    signals
+                )  # Now shape: [1000, 2, 128]
             else:
                 # Convert to amplitude/phase for all signals at once
                 processed_signals = self._process_signals(signals)
@@ -49,53 +60,82 @@ class RFMLDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return self.samples[idx], self.labels[idx],self.snr[idx]
-
+        return self.samples[idx], self.labels[idx], self.snr[idx]
 
     def _load_data(self, dataPath):
-        with open(dataPath, 'rb') as f:
+        with open(dataPath, "rb") as f:
             data = pickle.load(f, encoding="latin")
         return data
 
     def _load_2018_data(self):
         classes = [
-            "OOK", "4ASK", "8ASK", "BPSK", "QPSK", "8PSK", "16PSK", "32PSK",
-            "16APSK", "32APSK", "64APSK", "128APSK", "16QAM", "32QAM", "64QAM",
-            "128QAM", "256QAM", "AM-SSB-WC", "AM-SSB-SC", "AM-DSB-WC", "AM-DSB-SC",
-            "FM", "GMSK", "OQPSK"
+            "OOK",
+            "4ASK",
+            "8ASK",
+            "BPSK",
+            "QPSK",
+            "8PSK",
+            "16PSK",
+            "32PSK",
+            "16APSK",
+            "32APSK",
+            "64APSK",
+            "128APSK",
+            "16QAM",
+            "32QAM",
+            "64QAM",
+            "128QAM",
+            "256QAM",
+            "AM-SSB-WC",
+            "AM-SSB-SC",
+            "AM-DSB-WC",
+            "AM-DSB-SC",
+            "FM",
+            "GMSK",
+            "OQPSK",
         ]
-        data_path = '/home/hshayde/Projects/MIT/AMR/Dataset/2018.01/2018_RFML.hdf5'
+        data_path = "/home/hshayde/Projects/MIT/AMR/Dataset/2018.01/2018_RFML.hdf5"
         data_dict = {}
-        with h5py.File(data_path, 'r') as f:
-            X = f['X'][:]   # [num_samples, 2, signal_length]
-            Y = f['Y'][:]   # [num_samples]
-            Z = f['Z'][:]   # [num_samples]
+        choosen_classes = [
+            "QPSK",
+            "16QAM",
+            "64QAM",
+            "OOK",
+            "8PSK",
+            "16PSK",
+            "AM-SSB-SC",
+            "AM-DSB-WC",
+            "FM",
+            "BPSK",
+            "GMSK",
+        ]
+        with h5py.File(data_path, "r") as f:
+            X = f["X"][:]  # [num_samples, 2, signal_length]
+            Y = f["Y"][:]  # [num_samples]
+            Z = f["Z"][:]  # [num_samples]
             # Decode byte labels to string if necessary
             if isinstance(Y[0], bytes):
-                Y = [y.decode('utf-8') for y in Y]
-
+                Y = [y.decode("utf-8") for y in Y]
             for x, y, z in tqdm(zip(X, Y, Z)):
-                if -20 <= z <= 18:
+                if classes[np.argmax(y)] in choosen_classes:
                     key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
                     if key not in data_dict:
                         data_dict[key] = []
-                    import pdb; pdb.set_trace()
-                    data_dict[key].append(x[:100])
+                    data_dict[key].append(x.T)  # transpose so channels x features
         print(f"Total keys created: {len(data_dict)}")
         total_samples = sum(len(v) for v in data_dict.values())
         print(f"Total signals stored: {total_samples}")
         return data_dict
 
-
-    def _encode_labels(self,label):
+    def _encode_labels(self, label):
         # takes samples and return one hot encoding
         if label not in self.encoded_hash.keys():
             self.encoded_hash[label] = len(self.encoded_hash)
         return self.encoded_hash[label]
 
-    def _decode_labels(self,label):
+    def _decode_labels(self, label):
         # invert the encoding
-        self.decoded_hash = {value:key for key,value in self.encoded_hash.items()}
+        self.decoded_hash = {value: key for key, value in self.encoded_hash.items()}
 
     # def _normalize_data(self, data):
     #     # data shape: [batch_size, 2, 128] or [2, 128]
@@ -127,9 +167,10 @@ class RFMLDataset(Dataset):
             data_max = data.max()
             data_range = data_max - data_min
             return 2 * (data - data_min) / (data_range + 1e-8) - 1
+
     def _process_signals(self, signals):
-        i_data = signals[:,0,:]
-        q_data = signals[:,1,:]
+        i_data = signals[:, 0, :]
+        q_data = signals[:, 1, :]
 
         # First compute amplitude and phase
         amplitude = torch.sqrt(i_data**2 + q_data**2)
@@ -146,10 +187,9 @@ class RFMLDataset(Dataset):
         return self.decoded_hash
 
 
-
 def get_dataloaders(config):
     # Create full dataset
-    full_dataset = RFMLDataset(data=config.data, iq = config.iq)
+    full_dataset = RFMLDataset(data=config.data, iq=config.iq)
 
     # Get parameters from config
     batch_size = config.batch_size
@@ -165,7 +205,7 @@ def get_dataloaders(config):
     train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(random_seed)  # for reproducibility
+        generator=torch.Generator().manual_seed(random_seed),  # for reproducibility
     )
 
     # Create dataloaders
@@ -173,20 +213,21 @@ def get_dataloaders(config):
         train_dataset,
         batch_size=batch_size,
         shuffle=True,  # Shuffle the training data
-        num_workers=num_workers
+        num_workers=num_workers,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,  # No need to shuffle validation data
-        num_workers=num_workers
+        num_workers=num_workers,
     )
 
     # Get the mapping of indices to modulation labels
     mod_names = full_dataset.get_decoded_labels()
 
     return train_loader, val_loader, mod_names
+
 
 class TokenizedRFMLDataset(Dataset):
     def __init__(self, base_dataset, vqvae):
@@ -203,7 +244,7 @@ class TokenizedRFMLDataset(Dataset):
             base_dataset,
             batch_size=64,  # Larger batch size for faster processing
             shuffle=False,
-            num_workers=4
+            num_workers=4,
         )
 
         # Preload all data
@@ -220,13 +261,12 @@ class TokenizedRFMLDataset(Dataset):
             self.labels = torch.tensor(self.labels)
             self.snrs = torch.tensor(self.snrs)
 
-
-
     def __len__(self):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
         return self.tokenized_data[idx], self.labels[idx], self.snrs[idx]
+
 
 def get_tokenized_dataloaders(cfg, vqvae, train_loader, val_loader):
     """Creates new dataloaders with tokenized datasets"""
@@ -253,14 +293,14 @@ def get_tokenized_dataloaders(cfg, vqvae, train_loader, val_loader):
         tokenized_train_dataset,
         batch_size=batch_size,
         shuffle=False,  # No need to shuffle validation data
-        num_workers=num_workers
+        num_workers=num_workers,
     )
 
     tokenized_val_loader = DataLoader(
         tokenized_val_dataset,
         batch_size=batch_size,
         shuffle=False,  # No need to shuffle validation data
-        num_workers=num_workers
+        num_workers=num_workers,
     )
 
     return tokenized_train_loader, tokenized_val_loader
@@ -284,7 +324,8 @@ class MoCoRFMLDataset(Dataset):
 
         # Get positive pair (same modulation, different SNR)
         same_mod_indices = [
-            i for s in range(-20, 19, 2)  # SNR range
+            i
+            for s in range(-20, 19, 2)  # SNR range
             for i in self.mod_snr_indices.get((label, s), [])
             if s != snr  # Different SNR
         ]
@@ -292,6 +333,7 @@ class MoCoRFMLDataset(Dataset):
         x2, _, _ = self.dataset[pos_idx]
 
         return (x1, x2), label, snr
+
 
 def get_moco_dataloaders(train_loader, val_loader, config):
     """
@@ -311,14 +353,14 @@ def get_moco_dataloaders(train_loader, val_loader, config):
         moco_train_dataset,
         batch_size=config.contrastive_batch_size,
         shuffle=True,
-        num_workers=config.num_workers
+        num_workers=config.num_workers,
     )
 
     moco_val_loader = DataLoader(
         moco_val_dataset,
         batch_size=config.contrastive_batch_size,
         shuffle=False,
-        num_workers=config.num_workers
+        num_workers=config.num_workers,
     )
 
     # Get label names from original dataset

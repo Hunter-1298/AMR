@@ -84,42 +84,59 @@ plt.tight_layout()
 plt.show()
 
 
-def mm_timing_sync(samples, sps=64, gain=0.3):
+def mm_timing_sync(samples, sps=8, gain=0.3):
     """
-    Mueller and Müller timing recovery for QPSK signals.
+    Mueller and Müller timing recovery for QPSK signals,
+    operating on an upsampled-by-16 array.
 
     Args:
-        iq_data: ndarray of shape (N, 2), with [I, Q] columns
-        sps: samples per symbol (after interpolation). Typical: 64 if 16x upsampled and true SPS is 4.
+        samples: complex NumPy array, already upsampled (e.g. 16x)
+        sps: original samples-per-symbol (at 1x). E.g. 8.
         gain: loop gain for timing adjustment
 
     Returns:
-        synced: complex NumPy array of aligned samples
+        synced: complex NumPy array of symbol-aligned samples
     """
-    # Convert I/Q to complex baseband
+    mu = 0.0
+    N = len(samples)
+    # Reserve a few extra entries for the delay pipeline
+    out = np.zeros(N + 10, dtype=np.complex64)
+    out_rail = np.zeros_like(out)
 
-    mu = 0  # Initial phase estimate
-    out = np.zeros(len(samples) + 10, dtype=np.complex64)
-    out_rail = np.zeros(len(samples) + 10, dtype=np.complex64)
+    i_in = 0        # pointer in upsampled domain
+    i_out = 2       # output index (start at 2 for delay lines)
+    sps_up = sps * 16  # upsampled samples per symbol
 
-    i_in = 0  # Index in input samples
-    i_out = 2  # Output index (start from 2 due to need for delay)
+    while (i_out < N) and (i_in + sps_up < N):
+        # fractional index in upsampled array
+        idx = int(i_in + mu)
+        frac = mu - int(mu)
 
-    while i_out < len(samples) and i_in + 16 < len(samples):
-        out[i_out] = samples[i_in]
-        out_rail[i_out] = (int(np.real(out[i_out]) > 0) +
-                        1j * int(np.imag(out[i_out]) > 0))
+        # linear interpolation between samples[idx] and samples[idx+1]
+        s0 = samples[idx]
+        s1 = samples[idx + 1]
+        sample = s0 * (1 - frac) + s1 * frac
 
+        out[i_out] = sample
+        # hard decision to nearest QPSK quadrant
+        out_rail[i_out] = (int(sample.real > 0) +
+                           1j * int(sample.imag > 0))
+
+        # Mueller-Müller timing error detector
         x = (out_rail[i_out] - out_rail[i_out - 2]) * np.conj(out[i_out - 1])
-        y = (out[i_out] - out[i_out - 2]) * np.conj(out_rail[i_out - 1])
+        y = (out[i_out] - out[i_out - 2])       * np.conj(out_rail[i_out - 1])
         mm_val = np.real(y - x)
 
-        mu += sps + gain * mm_val
-        i_in += int(np.floor(mu))
-        mu = mu - np.floor(mu)
+        # advance mu by one symbol (in upsampled samples) plus correction
+        mu += sps_up + gain * mm_val
+        # move integer part of mu into i_in
+        i_in += int(mu)
+        # keep only fractional remainder
+        mu = mu - int(mu)
         i_out += 1
 
-    return out[2:i_out]  # Discard initial placeholder samples
+    # discard initial placeholders and any unused tail
+    return out[2:i_out]
 def costas_loop(signal, loop_bandwidth=0.01, damping_factor=0.707, modulation_order=4):
     """
     Costas Loop for carrier phase recovery in QPSK signals.
@@ -165,7 +182,7 @@ def costas_loop(signal, loop_bandwidth=0.01, damping_factor=0.707, modulation_or
 QPSK_COMPLEX = QPSK_18DB[0][0] + 1j *  QPSK_18DB[0][1]
 from scipy import signal
 # Oversample (interpolate) by 16x
-samples_interpolated = signal.resample_poly(QPSK_COMPLEX, up=16, down=1)
+samples_interpolated = signal.resample_poly(QPSK_COMPLEX, up=32, down=1)
 synced_qpsk = mm_timing_sync(samples_interpolated, sps=8)
 synced_qpsk = costas_loop(synced_qpsk)
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))

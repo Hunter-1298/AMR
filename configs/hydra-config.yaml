@@ -1,6 +1,6 @@
 # Global configurations
-project_name: arcface
-run_name: Diffusion_Classifier_RFNET
+project_name: SYNC
+run_name: Encoder_Test
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -27,17 +27,17 @@ encoder_checkpoint_name: arcface_encoder.ckpt
 diffusion_checkpoint_name: arcface_diffusion.ckpt
 # diffusion_checkpoint_name: contrastive_diffusion_denoised_contrastive_noncondition_val_loss=0.3309.ckpt
 mode: online
-debug: True
-log_model: False
+debug: False
+log_model: True
 seed: 42
 
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 200
+    epochs: 50
     classifier_epochs: 100
     learning_rate: .001
-    batch_size: 512
+    batch_size: 256
     contrastive_batch_size: 4096 # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
