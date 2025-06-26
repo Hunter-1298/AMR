@@ -65,7 +65,7 @@ def main(cfg: DictConfig):
         print("Training VAE Encoder...")
         # Create and train encoder
         encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
-        encoder = torch.compile(encoder)
+        # encoder = torch.compile(encoder)
 
         # Create checkpoint dir
         dir = "contrastive_encoder" if cfg.contrastive_encoder else "encoder"

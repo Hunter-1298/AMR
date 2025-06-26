@@ -1,6 +1,6 @@
 # Global configurations
 project_name: SYNC
-run_name: Encoder_Test
+run_name: VQ-Vic-MAE-2018-10M-Params
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -38,7 +38,8 @@ hyperparams:
     classifier_epochs: 100
     learning_rate: .001
     batch_size: 8
-    contrastive_batch_size: 1024 # make this high so we can use all negatives in batch without increase batch for diffusion model
+    contrastive_batch_size: 512
+    # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
     feature_dim: 16
@@ -58,7 +59,7 @@ data_dir: data/
 
 Encoder:
     _target_: models.latent_encoder_models.arcface.RFEncoderDecoder
-    learning_rate: .0003
+    learning_rate: .0001
 
 Diffusion:
     _target_: models.diffusion.latent_diffusion.LatentDiffusion
