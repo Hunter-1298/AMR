@@ -997,7 +997,7 @@ class RFEncoderDecoder(L.LightningModule):
 
                 # Plot t-SNE
                 unique_labels = np.unique(labels_all)
-                colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+                colors = plt.cm.tab20(np.linspace(0, 1, len(unique_labels)))
 
                 for i, label in enumerate(unique_labels):
                     mask = labels_all == label
@@ -1124,7 +1124,7 @@ class RFEncoderDecoder(L.LightningModule):
                 codes_i_batch = codes_i[:batch_size] if len(codes_i) >= batch_size else codes_i
                 codes_j_batch = codes_j[:batch_size] if len(codes_j) >= batch_size else codes_j
 
-                colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+                colors = plt.cm.tab20(np.linspace(0, 1, len(unique_labels)))
 
                 for i, label in enumerate(unique_labels):
                     mask = labels == label
