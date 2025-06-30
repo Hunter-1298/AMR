@@ -96,19 +96,21 @@ class RFMLDataset(Dataset):
         ]
         data_path = "/home/hshayde/Projects/MIT/AMR/Dataset/2018.01/2018_RFML.hdf5"
         data_dict = {}
-        choosen_classes = [
-            "QPSK",
-            "16QAM",
-            "64QAM",
-            "OOK",
-            "8PSK",
-            "16PSK",
-            "AM-SSB-SC",
-            "AM-DSB-WC",
-            "FM",
-            "BPSK",
-            "GMSK",
-        ]
+        # choosen_classes = [
+        #     "QPSK",
+        #     "16QAM",
+        #     "64QAM",
+        #     "OOK",
+        #     "8PSK",
+        #     "16PSK",
+        #     "AM-SSB-SC",
+        #     "AM-DSB-WC",
+        #     "FM",
+        #     "BPSK",
+        #     "GMSK",
+        # ]
+        choosen_classes = ["QPSK", "8PSK", "16PSK"]
+        min_snr_level = 0
         with h5py.File(data_path, "r") as f:
             X = f["X"][:]  # [num_samples, 2, signal_length]
             Y = f["Y"][:]  # [num_samples]
@@ -117,7 +119,7 @@ class RFMLDataset(Dataset):
             if isinstance(Y[0], bytes):
                 Y = [y.decode("utf-8") for y in Y]
             for x, y, z in tqdm(zip(X, Y, Z)):
-                if classes[np.argmax(y)] in choosen_classes:
+                if classes[np.argmax(y)] in choosen_classes and int(z) >= min_snr_level:
                     key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
                     if key not in data_dict:
                         data_dict[key] = []
@@ -318,7 +320,6 @@ class MoCoRFMLDataset(Dataset):
             if snr >= high_snr_threshold:
                 self.high_snr_indices[mod].append(idx)
 
-
     def __len__(self):
         return self.n
 
@@ -329,6 +330,7 @@ class MoCoRFMLDataset(Dataset):
         pos_idx = random.choice(candidates)
         x2, _, snr2 = self.dataset[pos_idx]
         return (x1, x2), mod, (snr1, snr2)
+
 
 def get_moco_dataloaders(train_loader, val_loader, config):
     """

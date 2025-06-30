@@ -1,6 +1,6 @@
 # Global configurations
 project_name: SYNC
-run_name: VQ-Vic-MAE-2018-10M-Params
+run_name: PSK-VQ-Vic-MAE-2018-20M-Params_0.5
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -38,7 +38,7 @@ hyperparams:
     classifier_epochs: 100
     learning_rate: .001
     batch_size: 8
-    contrastive_batch_size: 512
+    contrastive_batch_size: 2048
     # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
@@ -58,7 +58,7 @@ data_dir: data/
 #         _target_: models.latent_encoder_models.decoder.Decoder1D
 
 Encoder:
-    _target_: models.latent_encoder_models.arcface.RFEncoderDecoder
+    _target_: models.latent_encoder_models.psk.PSKDiscriminator
     learning_rate: .0001
 
 Diffusion:

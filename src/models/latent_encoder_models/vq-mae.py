@@ -22,20 +22,23 @@ class RoPEPositionalEncoding(nn.Module):
     """
     Rotary Position Embedding (RoPE) for 1D sequences.
     """
+
     def __init__(self, d_model: int, max_seq_len: int = 1024):
         super().__init__()
         self.d_model = d_model
 
         # Create frequency tensor
         inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
-        self.register_buffer('inv_freq', inv_freq)
+        self.register_buffer("inv_freq", inv_freq)
 
         # Cache for efficiency
         self._seq_len_cached = 0
         self._cos_cached = None
         self._sin_cached = None
 
-    def _update_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+    def _update_cos_sin_cache(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype
+    ):
         """Update cached cos/sin values."""
         if seq_len > self._seq_len_cached:
             self._seq_len_cached = seq_len
@@ -48,7 +51,7 @@ class RoPEPositionalEncoding(nn.Module):
 
     def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """Rotate half the dimensions."""
-        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
         return torch.cat([-x2, x1], dim=-1)
 
     def apply_rotary_pos_emb(self, x: torch.Tensor) -> torch.Tensor:
@@ -59,8 +62,8 @@ class RoPEPositionalEncoding(nn.Module):
         # Ensure cos and sin have the right shape
         if cos.shape[-1] != x.shape[-1]:
             # Repeat or truncate to match x dimensions
-            cos = cos.repeat(1, 1, x.shape[-1] // cos.shape[-1])[:, :, :x.shape[-1]]
-            sin = sin.repeat(1, 1, x.shape[-1] // sin.shape[-1])[:, :, :x.shape[-1]]
+            cos = cos.repeat(1, 1, x.shape[-1] // cos.shape[-1])[:, :, : x.shape[-1]]
+            sin = sin.repeat(1, 1, x.shape[-1] // sin.shape[-1])[:, :, : x.shape[-1]]
 
         return x * cos + self.rotate_half(x) * sin
 
@@ -113,6 +116,7 @@ class RoPEPositionalEncoding(nn.Module):
 
 #         return quantized, vq_loss, encoding_indices.view(input_shape[:-1])
 
+
 class EMAVectorQuantizer(nn.Module):
     def __init__(
         self,
@@ -136,18 +140,20 @@ class EMAVectorQuantizer(nn.Module):
         self.embeddings.data.normal_(0, 0.02)  # Better initialization
 
         # EMA parameters (registered as buffers)
-        self.register_buffer('ema_cluster_size', torch.zeros(num_embeddings))
-        self.register_buffer('ema_embeddings', self.embeddings.data.clone())
-        self.register_buffer('_ema_initialized', torch.tensor(False))
+        self.register_buffer("ema_cluster_size", torch.zeros(num_embeddings))
+        self.register_buffer("ema_embeddings", self.embeddings.data.clone())
+        self.register_buffer("_ema_initialized", torch.tensor(False))
 
     def forward(self, inputs):
         input_shape = inputs.shape
         flat_input = inputs.view(-1, self.embedding_dim)
 
         # Calculate distances
-        distances = (torch.sum(flat_input**2, dim=1, keepdim=True)
-                    + torch.sum(self.embeddings**2, dim=1)
-                    - 2 * torch.matmul(flat_input, self.embeddings.t()))
+        distances = (
+            torch.sum(flat_input**2, dim=1, keepdim=True)
+            + torch.sum(self.embeddings**2, dim=1)
+            - 2 * torch.matmul(flat_input, self.embeddings.t())
+        )
 
         # Encoding
         encoding_indices = torch.argmin(distances, dim=1)
@@ -164,18 +170,25 @@ class EMAVectorQuantizer(nn.Module):
                 self.ema_embeddings.data = torch.matmul(encodings.t(), flat_input)
                 self._ema_initialized.data = torch.tensor(True)
             else:
-                self.ema_cluster_size.data = self.decay * self.ema_cluster_size + (1 - self.decay) * encodings.sum(0)
-                self.ema_embeddings.data = self.decay * self.ema_embeddings + (1 - self.decay) * torch.matmul(encodings.t(), flat_input)
+                self.ema_cluster_size.data = self.decay * self.ema_cluster_size + (
+                    1 - self.decay
+                ) * encodings.sum(0)
+                self.ema_embeddings.data = self.decay * self.ema_embeddings + (
+                    1 - self.decay
+                ) * torch.matmul(encodings.t(), flat_input)
 
             # Laplace smoothing
             n = torch.sum(self.ema_cluster_size)
             self.ema_cluster_size = (
                 (self.ema_cluster_size + self.epsilon)
-                / (n + self.num_embeddings * self.epsilon) * n
+                / (n + self.num_embeddings * self.epsilon)
+                * n
             )
 
             # Update embeddings
-            self.embeddings.data = self.ema_embeddings / self.ema_cluster_size.unsqueeze(1)
+            self.embeddings.data = (
+                self.ema_embeddings / self.ema_cluster_size.unsqueeze(1)
+            )
 
             # Restart unused codes
             if self.restart_unused_codes:
@@ -183,10 +196,18 @@ class EMAVectorQuantizer(nn.Module):
                 num_unused = (1 - usage).sum()
                 if num_unused > 0:
                     # Sample from input batch for restart
-                    random_indices = torch.randperm(flat_input.size(0))[:int(num_unused)]
-                    for i, unused_idx in enumerate((usage == 0).nonzero(as_tuple=True)[0]):
-                        self.embeddings.data[unused_idx] = flat_input[random_indices[i % len(random_indices)]]
-                        self.ema_embeddings.data[unused_idx] = flat_input[random_indices[i % len(random_indices)]]
+                    random_indices = torch.randperm(flat_input.size(0))[
+                        : int(num_unused)
+                    ]
+                    for i, unused_idx in enumerate(
+                        (usage == 0).nonzero(as_tuple=True)[0]
+                    ):
+                        self.embeddings.data[unused_idx] = flat_input[
+                            random_indices[i % len(random_indices)]
+                        ]
+                        self.ema_embeddings.data[unused_idx] = flat_input[
+                            random_indices[i % len(random_indices)]
+                        ]
                         self.ema_cluster_size.data[unused_idx] = 1.0
 
         # Loss calculation
@@ -202,6 +223,7 @@ class EMAVectorQuantizer(nn.Module):
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
         return quantized, vq_loss, encoding_indices.view(input_shape[:-1]), perplexity
+
 
 class VQ_RFViCMAEEncoder(nn.Module):
     """
@@ -237,10 +259,14 @@ class VQ_RFViCMAEEncoder(nn.Module):
 
         # Number of patches
         self.num_patches = signal_length // patch_size
-        assert signal_length % patch_size == 0, f"Signal length {signal_length} must be divisible by patch size {patch_size}"
+        assert signal_length % patch_size == 0, (
+            f"Signal length {signal_length} must be divisible by patch size {patch_size}"
+        )
 
         # Patch embedding: Conv1d to create tokens from IQ signals
-        self.patch_embed = nn.Conv1d(2, d_model, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.patch_embed = nn.Conv1d(
+            2, d_model, kernel_size=patch_size, stride=patch_size, bias=False
+        )
 
         # Layer norm after patch embedding
         self.patch_norm = nn.LayerNorm(d_model)
@@ -257,18 +283,20 @@ class VQ_RFViCMAEEncoder(nn.Module):
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            activation='gelu',
+            activation="gelu",
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_encoder_layers
+        )
 
         # EMA Vector Quantization layer
         self.vq_layer = EMAVectorQuantizer(
             num_embeddings=num_embeddings,
             embedding_dim=d_model,
             commitment_cost=vq_commitment_cost,
-            decay=vq_decay
+            decay=vq_decay,
         )
 
         # Lightweight decoder for reconstruction (works with quantized features only)
@@ -277,11 +305,13 @@ class VQ_RFViCMAEEncoder(nn.Module):
             nhead=nhead,
             dim_feedforward=dim_feedforward // 2,
             dropout=dropout,
-            activation='gelu',
+            activation="gelu",
             batch_first=True,
             norm_first=True,
         )
-        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=num_decoder_layers)
+        self.decoder = nn.TransformerEncoder(
+            decoder_layer, num_layers=num_decoder_layers
+        )
 
         # Decoder prediction head
         self.decoder_pred = nn.Sequential(
@@ -317,7 +347,9 @@ class VQ_RFViCMAEEncoder(nn.Module):
         # Reshape to patches: [batch, num_patches, patch_size * channels]
         x_patches = x.reshape(batch_size, channels, self.num_patches, self.patch_size)
         x_patches = x_patches.permute(0, 2, 3, 1)  # [batch, num_patches, patch_size, 2]
-        x_patches = x_patches.reshape(batch_size, self.num_patches, -1)  # [batch, num_patches, patch_size * 2]
+        x_patches = x_patches.reshape(
+            batch_size, self.num_patches, -1
+        )  # [batch, num_patches, patch_size * 2]
         return x_patches
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
@@ -329,7 +361,9 @@ class VQ_RFViCMAEEncoder(nn.Module):
         x = x.reshape(batch_size, 2, -1)  # [batch, 2, signal_length]
         return x
 
-    def random_masking(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def random_masking(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Perform random masking on input tokens.
         """
@@ -364,7 +398,9 @@ class VQ_RFViCMAEEncoder(nn.Module):
 
         return latent
 
-    def forward_decoder(self, x: torch.Tensor, ids_restore: torch.Tensor) -> torch.Tensor:
+    def forward_decoder(
+        self, x: torch.Tensor, ids_restore: torch.Tensor
+    ) -> torch.Tensor:
         """
         Forward pass through decoder - PURE VQ VERSION.
         Uses only quantized features, no mixing with original features.
@@ -379,8 +415,9 @@ class VQ_RFViCMAEEncoder(nn.Module):
         x_full = torch.cat([x, mask_tokens], dim=1)  # [batch, num_patches, d_model]
 
         # Unshuffle to restore original order
-        x_full = torch.gather(x_full, dim=1,
-                             index=ids_restore.unsqueeze(-1).repeat(1, 1, D))
+        x_full = torch.gather(
+            x_full, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D)
+        )
 
         # Apply RoPE to full sequence
         x_full = self.rope(x_full)
@@ -394,26 +431,35 @@ class VQ_RFViCMAEEncoder(nn.Module):
         return pred
 
     def compute_reconstruction_loss(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor
+        self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:
         """Enhanced reconstruction loss for RF signals."""
         # 1. MSE on IQ components
-        mse_loss = F.mse_loss(pred, target, reduction='none').mean(dim=-1)  # [batch, num_patches]
+        mse_loss = F.mse_loss(pred, target, reduction="none").mean(
+            dim=-1
+        )  # [batch, num_patches]
 
         # 2. Complex magnitude loss
         pred_reshaped = pred.reshape(pred.shape[0], pred.shape[1], self.patch_size, 2)
-        target_reshaped = target.reshape(target.shape[0], target.shape[1], self.patch_size, 2)
+        target_reshaped = target.reshape(
+            target.shape[0], target.shape[1], self.patch_size, 2
+        )
 
-        pred_mag = torch.sqrt(pred_reshaped[..., 0]**2 + pred_reshaped[..., 1]**2 + 1e-8)
-        target_mag = torch.sqrt(target_reshaped[..., 0]**2 + target_reshaped[..., 1]**2 + 1e-8)
-        mag_loss = F.mse_loss(pred_mag, target_mag, reduction='none').mean(dim=-1)  # [batch, num_patches]
+        pred_mag = torch.sqrt(
+            pred_reshaped[..., 0] ** 2 + pred_reshaped[..., 1] ** 2 + 1e-8
+        )
+        target_mag = torch.sqrt(
+            target_reshaped[..., 0] ** 2 + target_reshaped[..., 1] ** 2 + 1e-8
+        )
+        mag_loss = F.mse_loss(pred_mag, target_mag, reduction="none").mean(
+            dim=-1
+        )  # [batch, num_patches]
 
         # 3. Phase consistency loss
         pred_phase = torch.atan2(pred_reshaped[..., 1], pred_reshaped[..., 0] + 1e-8)
-        target_phase = torch.atan2(target_reshaped[..., 1], target_reshaped[..., 0] + 1e-8)
+        target_phase = torch.atan2(
+            target_reshaped[..., 1], target_reshaped[..., 0] + 1e-8
+        )
 
         # Handle phase wrapping
         phase_diff = pred_phase - target_phase
@@ -429,9 +475,7 @@ class VQ_RFViCMAEEncoder(nn.Module):
         return masked_loss
 
     def compute_contrastive_loss(
-        self,
-        z_i: torch.Tensor,
-        z_j: torch.Tensor
+        self, z_i: torch.Tensor, z_j: torch.Tensor
     ) -> torch.Tensor:
         """Compute InfoNCE contrastive loss between two views."""
         batch_size = z_i.shape[0]
@@ -463,19 +507,19 @@ class VQ_RFViCMAEEncoder(nn.Module):
         return usage_fraction
 
     def compute_simple_reconstruction_loss(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor
+        self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:
         """Simplified reconstruction loss for better VQ learning."""
         # Simple MSE loss
-        loss = F.mse_loss(pred, target, reduction='none').mean(dim=-1)  # [batch, num_patches]
+        loss = F.mse_loss(pred, target, reduction="none").mean(
+            dim=-1
+        )  # [batch, num_patches]
 
         # Apply mask (only compute loss on masked patches)
         masked_loss = (loss * mask).sum() / (mask.sum() + 1e-8)
 
         return masked_loss
+
     def forward(self, x_i: torch.Tensor, x_j: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Revised Forward pass for VQ ViC-MAE with better learning dynamics.
@@ -487,7 +531,9 @@ class VQ_RFViCMAEEncoder(nn.Module):
         patches_j = self.patchify(x_j)  # [batch, num_patches, d_model]
 
         # Create proper targets (raw patch version)
-        target_i = self.create_patch_targets(x_i)  # [batch, num_patches, patch_size * 2]
+        target_i = self.create_patch_targets(
+            x_i
+        )  # [batch, num_patches, patch_size * 2]
         target_j = self.create_patch_targets(x_j)
 
         # ===== ENCODE ALL PATCHES FIRST =====
@@ -500,8 +546,12 @@ class VQ_RFViCMAEEncoder(nn.Module):
 
         # ===== VECTOR QUANTIZATION ON ALL PATCHES =====
         # Updated to handle 4 return values (including perplexity)
-        quantized_i_full, vq_loss_i, codes_i_full, perplexity_i = self.vq_layer(latent_i_full)
-        quantized_j_full, vq_loss_j, codes_j_full, perplexity_j = self.vq_layer(latent_j_full)
+        quantized_i_full, vq_loss_i, codes_i_full, perplexity_i = self.vq_layer(
+            latent_i_full
+        )
+        quantized_j_full, vq_loss_j, codes_j_full, perplexity_j = self.vq_layer(
+            latent_j_full
+        )
 
         vq_loss = (vq_loss_i + vq_loss_j) / 2
         avg_perplexity = (perplexity_i + perplexity_j) / 2
@@ -557,28 +607,26 @@ class VQ_RFViCMAEEncoder(nn.Module):
 
         return {
             # Standard outputs
-            'recon_xi': recon_xi,
-            'recon_xj': recon_xj,
-            'emb_i': emb_i,
-            'emb_j': emb_j,
-            'loss_recon': loss_recon,
-            'loss_contrast': loss_contrast,
-            'mask_i': mask_i,
-            'mask_j': mask_j,
-
+            "recon_xi": recon_xi,
+            "recon_xj": recon_xj,
+            "emb_i": emb_i,
+            "emb_j": emb_j,
+            "loss_recon": loss_recon,
+            "loss_contrast": loss_contrast,
+            "mask_i": mask_i,
+            "mask_j": mask_j,
             # VQ-specific outputs
-            'quantized_i': global_i,  # Global quantized features
-            'quantized_j': global_j,
-            'vq_loss': vq_loss,
-            'codes_i': codes_i_flat,
-            'codes_j': codes_j_flat,
-
+            "quantized_i": global_i,  # Global quantized features
+            "quantized_j": global_j,
+            "vq_loss": vq_loss,
+            "codes_i": codes_i_flat,
+            "codes_j": codes_j_flat,
             # Analysis outputs
-            'codebook_usage': codebook_usage,
-            'quantization_error': avg_quantization_error,
-            'perplexity': avg_perplexity,  # Add perplexity to outputs
-            'latent_i': global_i,  # Use quantized features for downstream
-            'latent_j': global_j,
+            "codebook_usage": codebook_usage,
+            "quantization_error": avg_quantization_error,
+            "perplexity": avg_perplexity,  # Add perplexity to outputs
+            "latent_i": global_i,  # Use quantized features for downstream
+            "latent_j": global_j,
         }
 
     def forward_single_decode(self, latent: torch.Tensor) -> torch.Tensor:
@@ -643,8 +691,8 @@ class RFSpecificReconstructionLoss(nn.Module):
 
     def magnitude_loss(self, pred, target):
         """Loss on signal magnitude"""
-        pred_mag = torch.sqrt(pred[:, 0]**2 + pred[:, 1]**2 + 1e-8)
-        target_mag = torch.sqrt(target[:, 0]**2 + target[:, 1]**2 + 1e-8)
+        pred_mag = torch.sqrt(pred[:, 0] ** 2 + pred[:, 1] ** 2 + 1e-8)
+        target_mag = torch.sqrt(target[:, 0] ** 2 + target[:, 1] ** 2 + 1e-8)
         return F.mse_loss(pred_mag, target_mag)
 
     def phase_loss(self, pred, target):
@@ -681,17 +729,17 @@ class RFSpecificReconstructionLoss(nn.Module):
 
         # Weighted combination
         total_loss = (
-            1.0 * complex_loss +      # Primary reconstruction
-            0.5 * mag_loss +          # Magnitude preservation
-            0.3 * phase_loss +        # Phase preservation
-            0.2 * spectral_loss       # Spectral characteristics
+            1.0 * complex_loss  # Primary reconstruction
+            + 0.5 * mag_loss  # Magnitude preservation
+            + 0.3 * phase_loss  # Phase preservation
+            + 0.2 * spectral_loss  # Spectral characteristics
         )
 
         return total_loss, {
-            'complex_mse': complex_loss,
-            'magnitude_loss': mag_loss,
-            'phase_loss': phase_loss,
-            'spectral_loss': spectral_loss
+            "complex_mse": complex_loss,
+            "magnitude_loss": mag_loss,
+            "phase_loss": phase_loss,
+            "spectral_loss": spectral_loss,
         }
 
 
@@ -704,19 +752,19 @@ class RFEncoderDecoder(L.LightningModule):
         self,
         label_names: List[str],
         signal_length: int = 1024,
-        patch_size: int = 32,
+        patch_size: int = 16,
         d_model: int = 384,
-        mask_ratio: float = 0.5,
+        mask_ratio: float = 0.50,
         temperature: float = 0.07,
         learning_rate: float = 1e-4,
         warmup_epochs: int = 10,
         max_epochs: int = 100,
-        reconstruction_weight: float = 1.0,
-        contrastive_weight: float = 2.0,
+        reconstruction_weight: float = 0.5,
+        contrastive_weight: float = 3.0,
         vq_weight: float = 0.1,
         classification_weight: float = 1.0,
         num_classes: Optional[int] = None,
-        num_embeddings: int = 512,
+        num_embeddings: int = 12,  # 512,
         vq_commitment_cost: float = 1,
         vq_decay: float = 0.95,
     ):
@@ -739,12 +787,16 @@ class RFEncoderDecoder(L.LightningModule):
         )
 
         # Optional classification head for finetuning
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(d_model // 2, self.num_classes),
-        ) if num_classes else None
+        self.classifier = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.3),
+                nn.Linear(d_model // 2, self.num_classes),
+            )
+            if num_classes
+            else None
+        )
 
         # Track codebook statistics
         self.codebook_stats = defaultdict(int)
@@ -763,50 +815,49 @@ class RFEncoderDecoder(L.LightningModule):
         outputs = self.encoder(x_i, x_j)
 
         # Extract losses
-        loss_recon = outputs['loss_recon']
-        loss_contrast = outputs['loss_contrast']
-        vq_loss = outputs['vq_loss']
+        loss_recon = outputs["loss_recon"]
+        loss_contrast = outputs["loss_contrast"]
+        vq_loss = outputs["vq_loss"]
 
         # Compute total loss
         total_loss = (
-            self.hparams.reconstruction_weight * loss_recon +
-            self.hparams.contrastive_weight * loss_contrast +
-            self.hparams.vq_weight * vq_loss
+            self.hparams.reconstruction_weight * loss_recon
+            + self.hparams.contrastive_weight * loss_contrast
+            + self.hparams.vq_weight * vq_loss
         )
 
         # Optional classification loss if classifier exists
         if self.classifier is not None:
-            # Use quantized features for classification
-            logits_i = self.classifier(outputs['quantized_i'])
-            logits_j = self.classifier(outputs['quantized_j'])
+            # Combine features from both views
+            combined_features = (outputs["quantized_i"] + outputs["quantized_j"]) / 2
 
+            logits = self.classifier(combined_features)
             target_labels = labels.squeeze() if labels.dim() > 1 else labels
-
-            class_loss_i = F.cross_entropy(logits_i, target_labels)
-            class_loss_j = F.cross_entropy(logits_j, target_labels)
-            class_loss = (class_loss_i + class_loss_j) / 2
+            class_loss = F.cross_entropy(logits, target_labels)
 
             total_loss = total_loss + self.hparams.classification_weight * class_loss
-            self.log('train_class_loss', class_loss, prog_bar=True)
+            self.log("train_class_loss", class_loss, prog_bar=True)
 
             # Log accuracy
-            acc_i = (logits_i.argmax(dim=1) == target_labels).float().mean()
-            acc_j = (logits_j.argmax(dim=1) == target_labels).float().mean()
-            acc = (acc_i + acc_j) / 2
-            self.log('train_acc', acc, prog_bar=True)
+            acc = (logits.argmax(dim=1) == target_labels).float().mean()
+            self.log("train_acc", acc, prog_bar=True)
 
         # Logging
-        self.log('train_loss', total_loss, prog_bar=True)
-        self.log('train_recon_loss', loss_recon)
-        self.log('train_contrast_loss', loss_contrast)
-        self.log('train_vq_loss', vq_loss, prog_bar=True)
-        self.log('train_codebook_usage', outputs['codebook_usage'], prog_bar=True)
-        self.log('train_quantization_error', outputs['quantization_error'])
+        self.log("train_loss", total_loss, prog_bar=True)
+        self.log("train_recon_loss", loss_recon)
+        self.log("train_contrast_loss", loss_contrast)
+        self.log("train_vq_loss", vq_loss, prog_bar=True)
+        self.log("train_codebook_usage", outputs["codebook_usage"], prog_bar=True)
+        self.log("train_quantization_error", outputs["quantization_error"])
 
         # Collect codes for analysis (sample to avoid memory issues)
         if batch_idx % 10 == 0:
-            self.epoch_codes.extend(outputs['codes_i'].detach().cpu().numpy().tolist()[:100])  # Sample first 100
-            self.epoch_codes.extend(outputs['codes_j'].detach().cpu().numpy().tolist()[:100])
+            self.epoch_codes.extend(
+                outputs["codes_i"].detach().cpu().numpy().tolist()[:100]
+            )  # Sample first 100
+            self.epoch_codes.extend(
+                outputs["codes_j"].detach().cpu().numpy().tolist()[:100]
+            )
 
         return total_loss
 
@@ -823,20 +874,21 @@ class RFEncoderDecoder(L.LightningModule):
         outputs = self.encoder(x_i, x_j)
 
         # Compute losses
-        loss_recon = outputs['loss_recon']
-        loss_contrast = outputs['loss_contrast']
-        vq_loss = outputs['vq_loss']
+        loss_recon = outputs["loss_recon"]
+        loss_contrast = outputs["loss_contrast"]
+        vq_loss = outputs["vq_loss"]
 
         total_loss = (
-            self.hparams.reconstruction_weight * loss_recon +
-            self.hparams.contrastive_weight * loss_contrast +
-            self.hparams.vq_weight * vq_loss
+            self.hparams.reconstruction_weight * loss_recon
+            + self.hparams.contrastive_weight * loss_contrast
+            + self.hparams.vq_weight * vq_loss
         )
 
         # Optional classification
         if self.classifier is not None:
-            logits_i = self.classifier(outputs['quantized_i'])
-            logits_j = self.classifier(outputs['quantized_j'])
+            # Use quantized features for classification
+            logits_i = self.classifier(outputs["quantized_i"])
+            logits_j = self.classifier(outputs["quantized_j"])
 
             target_labels = labels.squeeze() if labels.dim() > 1 else labels
 
@@ -844,22 +896,22 @@ class RFEncoderDecoder(L.LightningModule):
             class_loss_j = F.cross_entropy(logits_j, target_labels)
             class_loss = (class_loss_i + class_loss_j) / 2
 
-            # Accuracy
+            total_loss = total_loss + self.hparams.classification_weight * class_loss
+            self.log("train_class_loss", class_loss, prog_bar=True)
+
+            # Log accuracy
             acc_i = (logits_i.argmax(dim=1) == target_labels).float().mean()
             acc_j = (logits_j.argmax(dim=1) == target_labels).float().mean()
             acc = (acc_i + acc_j) / 2
-
-            total_loss = total_loss + self.hparams.classification_weight * class_loss
-            self.log('val_class_loss', class_loss)
-            self.log('val_acc', acc, prog_bar=True)
+            self.log("train_acc", acc, prog_bar=True)
 
         # Logging
-        self.log('val_loss', total_loss, prog_bar=True)
-        self.log('val_recon_loss', loss_recon)
-        self.log('val_contrast_loss', loss_contrast)
-        self.log('val_vq_loss', vq_loss)
-        self.log('val_codebook_usage', outputs['codebook_usage'])
-        self.log('val_quantization_error', outputs['quantization_error'])
+        self.log("val_loss", total_loss, prog_bar=True)
+        self.log("val_recon_loss", loss_recon)
+        self.log("val_contrast_loss", loss_contrast)
+        self.log("val_vq_loss", vq_loss)
+        self.log("val_codebook_usage", outputs["codebook_usage"])
+        self.log("val_quantization_error", outputs["quantization_error"])
 
         # Store for visualization (first batch only)
         if batch_idx == 0:
@@ -874,7 +926,7 @@ class RFEncoderDecoder(L.LightningModule):
 
     def on_validation_epoch_end(self):
         """Visualize reconstruction, embeddings, and codebook usage."""
-        if hasattr(self, 'val_outputs'):
+        if hasattr(self, "val_outputs"):
             self._visualize_reconstruction()
             self._visualize_embeddings()
             self._visualize_codebook_analysis()
@@ -884,7 +936,7 @@ class RFEncoderDecoder(L.LightningModule):
 
     def _visualize_reconstruction(self):
         """Visualize pure VQ reconstruction."""
-        if not hasattr(self, 'val_outputs'):
+        if not hasattr(self, "val_outputs"):
             return
 
         try:
@@ -898,92 +950,172 @@ class RFEncoderDecoder(L.LightningModule):
             orig_j = self.val_x_j[idx].numpy()
 
             # Pure VQ reconstructed signals (these exist in pure VQ version)
-            recon_i = self.val_outputs['recon_xi'][idx].detach().cpu().numpy()
-            recon_j = self.val_outputs['recon_xj'][idx].detach().cpu().numpy()
+            recon_i = self.val_outputs["recon_xi"][idx].detach().cpu().numpy()
+            recon_j = self.val_outputs["recon_xj"][idx].detach().cpu().numpy()
 
             # Plot view i
             time = np.arange(orig_i.shape[1])
 
-            axes[0, 0].plot(time, orig_i[0], label='Original I', alpha=0.8, linewidth=2, color='blue')
-            axes[0, 0].plot(time, recon_i[0], label='VQ Reconstructed I', alpha=0.8, linewidth=1.5, color='red')
-            axes[0, 0].set_title('View i - I channel')
+            axes[0, 0].plot(
+                time,
+                orig_i[0],
+                label="Original I",
+                alpha=0.8,
+                linewidth=2,
+                color="blue",
+            )
+            axes[0, 0].plot(
+                time,
+                recon_i[0],
+                label="VQ Reconstructed I",
+                alpha=0.8,
+                linewidth=1.5,
+                color="red",
+            )
+            axes[0, 0].set_title("View i - I channel")
             axes[0, 0].legend()
             axes[0, 0].grid(True, alpha=0.3)
 
-            axes[0, 1].plot(time, orig_i[1], label='Original Q', alpha=0.8, linewidth=2, color='blue')
-            axes[0, 1].plot(time, recon_i[1], label='VQ Reconstructed Q', alpha=0.8, linewidth=1.5, color='red')
-            axes[0, 1].set_title('View i - Q channel')
+            axes[0, 1].plot(
+                time,
+                orig_i[1],
+                label="Original Q",
+                alpha=0.8,
+                linewidth=2,
+                color="blue",
+            )
+            axes[0, 1].plot(
+                time,
+                recon_i[1],
+                label="VQ Reconstructed Q",
+                alpha=0.8,
+                linewidth=1.5,
+                color="red",
+            )
+            axes[0, 1].set_title("View i - Q channel")
             axes[0, 1].legend()
             axes[0, 1].grid(True, alpha=0.3)
 
             # Plot view j
-            axes[1, 0].plot(time, orig_j[0], label='Original I', alpha=0.8, linewidth=2, color='blue')
-            axes[1, 0].plot(time, recon_j[0], label='VQ Reconstructed I', alpha=0.8, linewidth=1.5, color='red')
-            axes[1, 0].set_title('View j - I channel')
+            axes[1, 0].plot(
+                time,
+                orig_j[0],
+                label="Original I",
+                alpha=0.8,
+                linewidth=2,
+                color="blue",
+            )
+            axes[1, 0].plot(
+                time,
+                recon_j[0],
+                label="VQ Reconstructed I",
+                alpha=0.8,
+                linewidth=1.5,
+                color="red",
+            )
+            axes[1, 0].set_title("View j - I channel")
             axes[1, 0].legend()
             axes[1, 0].grid(True, alpha=0.3)
 
-            axes[1, 1].plot(time, orig_j[1], label='Original Q', alpha=0.8, linewidth=2, color='blue')
-            axes[1, 1].plot(time, recon_j[1], label='VQ Reconstructed Q', alpha=0.8, linewidth=1.5, color='red')
-            axes[1, 1].set_title('View j - Q channel')
+            axes[1, 1].plot(
+                time,
+                orig_j[1],
+                label="Original Q",
+                alpha=0.8,
+                linewidth=2,
+                color="blue",
+            )
+            axes[1, 1].plot(
+                time,
+                recon_j[1],
+                label="VQ Reconstructed Q",
+                alpha=0.8,
+                linewidth=1.5,
+                color="red",
+            )
+            axes[1, 1].set_title("View j - Q channel")
             axes[1, 1].legend()
             axes[1, 1].grid(True, alpha=0.3)
 
             # Constellation diagrams
-            axes[0, 2].scatter(orig_i[0], orig_i[1], alpha=0.6, s=15, label='Original', c='blue')
-            axes[0, 2].scatter(recon_i[0], recon_i[1], alpha=0.6, s=10, label='VQ Reconstructed', c='red', marker='x')
-            axes[0, 2].set_title('View i - Constellation')
-            axes[0, 2].set_xlabel('I')
-            axes[0, 2].set_ylabel('Q')
+            axes[0, 2].scatter(
+                orig_i[0], orig_i[1], alpha=0.6, s=15, label="Original", c="blue"
+            )
+            axes[0, 2].scatter(
+                recon_i[0],
+                recon_i[1],
+                alpha=0.6,
+                s=10,
+                label="VQ Reconstructed",
+                c="red",
+                marker="x",
+            )
+            axes[0, 2].set_title("View i - Constellation")
+            axes[0, 2].set_xlabel("I")
+            axes[0, 2].set_ylabel("Q")
             axes[0, 2].legend()
             axes[0, 2].grid(True, alpha=0.3)
 
-            axes[1, 2].scatter(orig_j[0], orig_j[1], alpha=0.6, s=15, label='Original', c='blue')
-            axes[1, 2].scatter(recon_j[0], recon_j[1], alpha=0.6, s=10, label='VQ Reconstructed', c='red', marker='x')
-            axes[1, 2].set_title('View j - Constellation')
-            axes[1, 2].set_xlabel('I')
-            axes[1, 2].set_ylabel('Q')
+            axes[1, 2].scatter(
+                orig_j[0], orig_j[1], alpha=0.6, s=15, label="Original", c="blue"
+            )
+            axes[1, 2].scatter(
+                recon_j[0],
+                recon_j[1],
+                alpha=0.6,
+                s=10,
+                label="VQ Reconstructed",
+                c="red",
+                marker="x",
+            )
+            axes[1, 2].set_title("View j - Constellation")
+            axes[1, 2].set_xlabel("I")
+            axes[1, 2].set_ylabel("Q")
             axes[1, 2].legend()
             axes[1, 2].grid(True, alpha=0.3)
 
             # Mask visualization with sample codes
-            mask_i = self.val_outputs['mask_i'][idx].detach().cpu().numpy()
-            mask_j = self.val_outputs['mask_j'][idx].detach().cpu().numpy()
+            mask_i = self.val_outputs["mask_i"][idx].detach().cpu().numpy()
+            mask_j = self.val_outputs["mask_j"][idx].detach().cpu().numpy()
 
             # Get sample codes (first few from each view)
-            codes_i_sample = self.val_outputs['codes_i'][:5].detach().cpu().numpy()
-            codes_j_sample = self.val_outputs['codes_j'][:5].detach().cpu().numpy()
+            codes_i_sample = self.val_outputs["codes_i"][:5].detach().cpu().numpy()
+            codes_j_sample = self.val_outputs["codes_j"][:5].detach().cpu().numpy()
 
-            axes[0, 3].imshow(mask_i.reshape(1, -1), aspect='auto', cmap='binary')
-            axes[0, 3].set_title(f'Mask i (ratio: {mask_i.mean():.2f})\nSample codes: {codes_i_sample}')
+            axes[0, 3].imshow(mask_i.reshape(1, -1), aspect="auto", cmap="binary")
+            axes[0, 3].set_title(
+                f"Mask i (ratio: {mask_i.mean():.2f})\nSample codes: {codes_i_sample}"
+            )
             axes[0, 3].set_yticks([])
 
-            axes[1, 3].imshow(mask_j.reshape(1, -1), aspect='auto', cmap='binary')
-            axes[1, 3].set_title(f'Mask j (ratio: {mask_j.mean():.2f})\nSample codes: {codes_j_sample}')
+            axes[1, 3].imshow(mask_j.reshape(1, -1), aspect="auto", cmap="binary")
+            axes[1, 3].set_title(
+                f"Mask j (ratio: {mask_j.mean():.2f})\nSample codes: {codes_j_sample}"
+            )
             axes[1, 3].set_yticks([])
 
             plt.tight_layout()
 
-            if self.logger and hasattr(self.logger, 'experiment'):
+            if self.logger and hasattr(self.logger, "experiment"):
                 self.logger.experiment.log({"pure_vq_reconstruction": wandb.Image(fig)})
 
             plt.close(fig)
 
         except Exception as e:
             print(f"Error in reconstruction visualization: {e}")
-            plt.close('all')
+            plt.close("all")
 
     def _visualize_embeddings(self):
         """Visualize contrastive embeddings."""
-        if not hasattr(self, 'val_outputs'):
+        if not hasattr(self, "val_outputs"):
             return
 
         try:
             fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
             # Get embeddings (quantized)
-            emb_i = self.val_outputs['emb_i'].detach().cpu().numpy()
-            emb_j = self.val_outputs['emb_j'].detach().cpu().numpy()
+            emb_i = self.val_outputs["emb_i"].detach().cpu().numpy()
+            emb_j = self.val_outputs["emb_j"].detach().cpu().numpy()
             labels = self.val_labels.numpy()
 
             # t-SNE visualization
@@ -1005,71 +1137,91 @@ class RFEncoderDecoder(L.LightningModule):
                         embeddings_2d[mask, 0],
                         embeddings_2d[mask, 1],
                         c=[colors[i]],
-                        label=self.label_names[int(label)] if int(label) < len(self.label_names) else f'Class {int(label)}',
+                        label=self.label_names[int(label)]
+                        if int(label) < len(self.label_names)
+                        else f"Class {int(label)}",
                         alpha=0.7,
-                        s=30
+                        s=30,
                     )
 
-                axes[0].set_title('t-SNE of Pure VQ Embeddings')
-                axes[0].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                axes[0].set_title("t-SNE of Pure VQ Embeddings")
+                axes[0].legend(bbox_to_anchor=(1.05, 1), loc="upper left")
                 axes[0].grid(True, alpha=0.3)
 
             # Similarity matrix
             similarity = np.dot(emb_i, emb_j.T)
-            im1 = axes[1].imshow(similarity, cmap='viridis', aspect='auto')
-            axes[1].set_title('Cosine Similarity Matrix\n(Quantized Features)')
-            axes[1].set_xlabel('View j samples')
-            axes[1].set_ylabel('View i samples')
+            im1 = axes[1].imshow(similarity, cmap="viridis", aspect="auto")
+            axes[1].set_title("Cosine Similarity Matrix\n(Quantized Features)")
+            axes[1].set_xlabel("View j samples")
+            axes[1].set_ylabel("View i samples")
             plt.colorbar(im1, ax=axes[1])
 
             # Quantization error distribution
-            quant_error = self.val_outputs['quantization_error']
-            if hasattr(quant_error, 'item'):
+            quant_error = self.val_outputs["quantization_error"]
+            if hasattr(quant_error, "item"):
                 quant_error = quant_error.item()
 
             # Create a simple bar plot for quantization error
-            axes[2].bar(['Quantization Error'], [quant_error], color='red', alpha=0.7)
-            axes[2].set_title('Average Quantization Error')
-            axes[2].set_ylabel('MSE Error')
+            axes[2].bar(["Quantization Error"], [quant_error], color="red", alpha=0.7)
+            axes[2].set_title("Average Quantization Error")
+            axes[2].set_ylabel("MSE Error")
             axes[2].grid(True, alpha=0.3)
 
             # Add text with exact value
-            axes[2].text(0, quant_error + quant_error*0.1, f'{quant_error:.4f}',
-                        ha='center', va='bottom', fontweight='bold')
+            axes[2].text(
+                0,
+                quant_error + quant_error * 0.1,
+                f"{quant_error:.4f}",
+                ha="center",
+                va="bottom",
+                fontweight="bold",
+            )
 
             plt.tight_layout()
 
-            if self.logger and hasattr(self.logger, 'experiment'):
+            if self.logger and hasattr(self.logger, "experiment"):
                 self.logger.experiment.log({"pure_vq_embeddings": wandb.Image(fig)})
 
             plt.close(fig)
 
         except Exception as e:
             print(f"Error in embedding visualization: {e}")
-            plt.close('all')
+            plt.close("all")
 
     def _visualize_codebook_analysis(self):
         """Visualize codebook usage and analysis."""
-        if not hasattr(self, 'val_outputs'):
+        if not hasattr(self, "val_outputs"):
             return
 
         try:
             fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
             # Get codebook embeddings - FIXED: use 'embeddings' instead of 'embedding.weight'
-            codebook_embeddings = self.encoder.vq_layer.embeddings.detach().cpu().numpy()
+            codebook_embeddings = (
+                self.encoder.vq_layer.embeddings.detach().cpu().numpy()
+            )
 
             # Get codes from validation batch
-            codes_i = self.val_outputs['codes_i'].detach().cpu().numpy()
-            codes_j = self.val_outputs['codes_j'].detach().cpu().numpy()
+            codes_i = self.val_outputs["codes_i"].detach().cpu().numpy()
+            codes_j = self.val_outputs["codes_j"].detach().cpu().numpy()
             all_val_codes = np.concatenate([codes_i, codes_j])
 
             # 1. Codebook usage histogram
-            axes[0, 0].hist(all_val_codes, bins=min(50, self.hparams.num_embeddings//20),
-                        alpha=0.7, edgecolor='black')
-            axes[0, 0].set_title('Codebook Usage (Current Batch)')
-            axes[0, 0].set_xlabel('Code Index')
-            axes[0, 0].set_ylabel('Frequency')
+            # axes[0, 0].hist(
+            #     all_val_codes,
+            #     bins=min(50, self.hparams.num_embeddings // 20),
+            #     alpha=0.7,
+            #     edgecolor="black",
+            # )
+            axes[0, 0].hist(
+                all_val_codes,
+                bins=min(50, self.hparams.num_embeddings),
+                alpha=0.7,
+                edgecolor="black",
+            )
+            axes[0, 0].set_title("Codebook Usage (Current Batch)")
+            axes[0, 0].set_xlabel("Code Index")
+            axes[0, 0].set_ylabel("Frequency")
             axes[0, 0].grid(True, alpha=0.3)
 
             # 2. Usage statistics
@@ -1077,13 +1229,17 @@ class RFEncoderDecoder(L.LightningModule):
             usage_ratio_val = unique_codes_val / self.hparams.num_embeddings
 
             # Calculate additional statistics
-            code_counts = np.bincount(all_val_codes, minlength=self.hparams.num_embeddings)
+            code_counts = np.bincount(
+                all_val_codes, minlength=self.hparams.num_embeddings
+            )
             unused_codes = np.sum(code_counts == 0)
             most_used_code = np.argmax(code_counts)
             most_used_count = np.max(code_counts)
 
             # Get EMA statistics
-            ema_cluster_size = self.encoder.vq_layer.ema_cluster_size.detach().cpu().numpy()
+            ema_cluster_size = (
+                self.encoder.vq_layer.ema_cluster_size.detach().cpu().numpy()
+            )
             avg_cluster_size = np.mean(ema_cluster_size)
             active_codes_ema = np.sum(ema_cluster_size > 1.0)
 
@@ -1094,9 +1250,9 @@ class RFEncoderDecoder(L.LightningModule):
     Unused codes: {unused_codes}
     Usage ratio: {usage_ratio_val:.3f}
     Most used code: {most_used_code} ({most_used_count} times)
-    Codebook usage: {self.val_outputs['codebook_usage']:.3f}
-    Quantization error: {self.val_outputs['quantization_error']:.4f}
-    Perplexity: {self.val_outputs['perplexity']:.2f}
+    Codebook usage: {self.val_outputs["codebook_usage"]:.3f}
+    Quantization error: {self.val_outputs["quantization_error"]:.4f}
+    Perplexity: {self.val_outputs["perplexity"]:.2f}
 
     EMA Statistics:
     Active codes (EMA > 1.0): {active_codes_ema}
@@ -1106,23 +1262,34 @@ class RFEncoderDecoder(L.LightningModule):
     Decay: {self.encoder.vq_layer.decay}
             """
 
-            axes[0, 1].text(0.05, 0.95, stats_text, transform=axes[0, 1].transAxes,
-                        verticalalignment='top', fontfamily='monospace', fontsize=9,
-                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+            axes[0, 1].text(
+                0.05,
+                0.95,
+                stats_text,
+                transform=axes[0, 1].transAxes,
+                verticalalignment="top",
+                fontfamily="monospace",
+                fontsize=9,
+                bbox=dict(boxstyle="round", facecolor="lightblue", alpha=0.8),
+            )
             axes[0, 1].set_xlim(0, 1)
             axes[0, 1].set_ylim(0, 1)
-            axes[0, 1].axis('off')
-            axes[0, 1].set_title('Codebook Statistics')
+            axes[0, 1].axis("off")
+            axes[0, 1].set_title("Codebook Statistics")
 
             # 3. Code distribution by class (if available)
-            if hasattr(self, 'val_labels'):
+            if hasattr(self, "val_labels"):
                 labels = self.val_labels.numpy()
                 unique_labels = np.unique(labels)
 
                 # Get batch size to properly index codes
                 batch_size = len(labels)
-                codes_i_batch = codes_i[:batch_size] if len(codes_i) >= batch_size else codes_i
-                codes_j_batch = codes_j[:batch_size] if len(codes_j) >= batch_size else codes_j
+                codes_i_batch = (
+                    codes_i[:batch_size] if len(codes_i) >= batch_size else codes_i
+                )
+                codes_j_batch = (
+                    codes_j[:batch_size] if len(codes_j) >= batch_size else codes_j
+                )
 
                 colors = plt.cm.tab20(np.linspace(0, 1, len(unique_labels)))
 
@@ -1131,12 +1298,20 @@ class RFEncoderDecoder(L.LightningModule):
                     if np.any(mask):
                         # Get codes for this class
                         if len(codes_i_batch) > 0:
-                            label_codes_i = codes_i_batch[mask] if len(mask) <= len(codes_i_batch) else codes_i_batch[:np.sum(mask)]
+                            label_codes_i = (
+                                codes_i_batch[mask]
+                                if len(mask) <= len(codes_i_batch)
+                                else codes_i_batch[: np.sum(mask)]
+                            )
                         else:
                             label_codes_i = []
 
                         if len(codes_j_batch) > 0:
-                            label_codes_j = codes_j_batch[mask] if len(mask) <= len(codes_j_batch) else codes_j_batch[:np.sum(mask)]
+                            label_codes_j = (
+                                codes_j_batch[mask]
+                                if len(mask) <= len(codes_j_batch)
+                                else codes_j_batch[: np.sum(mask)]
+                            )
                         else:
                             label_codes_j = []
 
@@ -1148,54 +1323,90 @@ class RFEncoderDecoder(L.LightningModule):
                             label_codes.extend(label_codes_j)
 
                         if len(label_codes) > 0:
-                            axes[0, 2].hist(label_codes, bins=20, alpha=0.6, color=colors[i],
-                                        label=self.label_names[int(label)] if int(label) < len(self.label_names) else f'Class {int(label)}',
-                                        density=True)
+                            axes[0, 2].hist(
+                                label_codes,
+                                bins=20,
+                                alpha=0.6,
+                                color=colors[i],
+                                label=self.label_names[int(label)]
+                                if int(label) < len(self.label_names)
+                                else f"Class {int(label)}",
+                                density=True,
+                            )
 
-                axes[0, 2].set_title('Code Distribution by Class')
-                axes[0, 2].set_xlabel('Code Index')
-                axes[0, 2].set_ylabel('Density')
+                axes[0, 2].set_title("Code Distribution by Class")
+                axes[0, 2].set_xlabel("Code Index")
+                axes[0, 2].set_ylabel("Density")
                 axes[0, 2].legend()
                 axes[0, 2].grid(True, alpha=0.3)
             else:
-                axes[0, 2].text(0.5, 0.5, 'No class labels available',
-                            transform=axes[0, 2].transAxes, ha='center', va='center')
-                axes[0, 2].set_title('Code Distribution by Class')
+                axes[0, 2].text(
+                    0.5,
+                    0.5,
+                    "No class labels available",
+                    transform=axes[0, 2].transAxes,
+                    ha="center",
+                    va="center",
+                )
+                axes[0, 2].set_title("Code Distribution by Class")
 
             # 4. Epoch-wise code usage (if available)
-            if hasattr(self, 'epoch_codes') and len(self.epoch_codes) > 0:
+            if hasattr(self, "epoch_codes") and len(self.epoch_codes) > 0:
                 epoch_codes_array = np.array(self.epoch_codes)
-                axes[1, 0].hist(epoch_codes_array, bins=min(50, self.hparams.num_embeddings//20),
-                            alpha=0.7, edgecolor='black', color='orange')
-                axes[1, 0].set_title('Epoch Code Usage')
-                axes[1, 0].set_xlabel('Code Index')
-                axes[1, 0].set_ylabel('Frequency')
+                axes[1, 0].hist(
+                    epoch_codes_array,
+                    bins=min(50, self.hparams.num_embeddings),
+                    # bins=min(50, self.hparams.num_embeddings // 20),
+                    alpha=0.7,
+                    edgecolor="black",
+                    color="orange",
+                )
+                axes[1, 0].set_title("Epoch Code Usage")
+                axes[1, 0].set_xlabel("Code Index")
+                axes[1, 0].set_ylabel("Frequency")
                 axes[1, 0].grid(True, alpha=0.3)
 
                 # Add usage statistics
                 unique_codes_epoch = len(np.unique(epoch_codes_array))
                 usage_ratio_epoch = unique_codes_epoch / self.hparams.num_embeddings
-                axes[1, 0].text(0.02, 0.98, f'Epoch unique codes: {unique_codes_epoch}/{self.hparams.num_embeddings}\nEpoch usage ratio: {usage_ratio_epoch:.3f}',
-                            transform=axes[1, 0].transAxes, verticalalignment='top',
-                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                axes[1, 0].text(
+                    0.02,
+                    0.98,
+                    f"Epoch unique codes: {unique_codes_epoch}/{self.hparams.num_embeddings}\nEpoch usage ratio: {usage_ratio_epoch:.3f}",
+                    transform=axes[1, 0].transAxes,
+                    verticalalignment="top",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+                )
             else:
-                axes[1, 0].text(0.5, 0.5, 'No epoch codes collected yet',
-                            transform=axes[1, 0].transAxes, ha='center', va='center')
-                axes[1, 0].set_title('Epoch Code Usage')
-                axes[1, 0].axis('off')
+                axes[1, 0].text(
+                    0.5,
+                    0.5,
+                    "No epoch codes collected yet",
+                    transform=axes[1, 0].transAxes,
+                    ha="center",
+                    va="center",
+                )
+                axes[1, 0].set_title("Epoch Code Usage")
+                axes[1, 0].axis("off")
 
             # 5. EMA Cluster Size Analysis
             if len(all_val_codes) > 0:
                 # Plot EMA cluster sizes
-                axes[1, 1].bar(range(len(ema_cluster_size)), ema_cluster_size, alpha=0.7, color='purple')
-                axes[1, 1].set_title('EMA Cluster Sizes')
-                axes[1, 1].set_xlabel('Code Index')
-                axes[1, 1].set_ylabel('EMA Cluster Size')
+                axes[1, 1].bar(
+                    range(len(ema_cluster_size)),
+                    ema_cluster_size,
+                    alpha=0.7,
+                    color="purple",
+                )
+                axes[1, 1].set_title("EMA Cluster Sizes")
+                axes[1, 1].set_xlabel("Code Index")
+                axes[1, 1].set_ylabel("EMA Cluster Size")
                 axes[1, 1].grid(True, alpha=0.3)
 
                 # Add threshold line for active codes
-                axes[1, 1].axhline(y=1.0, color='red', linestyle='--',
-                                label='Active threshold (1.0)')
+                axes[1, 1].axhline(
+                    y=1.0, color="red", linestyle="--", label="Active threshold (1.0)"
+                )
                 axes[1, 1].legend()
 
                 # Set reasonable y-axis limit
@@ -1203,47 +1414,81 @@ class RFEncoderDecoder(L.LightningModule):
                 if max_cluster_size > 0:
                     axes[1, 1].set_ylim(0, max_cluster_size * 1.1)
             else:
-                axes[1, 1].text(0.5, 0.5, 'No codes available',
-                            transform=axes[1, 1].transAxes, ha='center', va='center')
-                axes[1, 1].set_title('EMA Cluster Sizes')
+                axes[1, 1].text(
+                    0.5,
+                    0.5,
+                    "No codes available",
+                    transform=axes[1, 1].transAxes,
+                    ha="center",
+                    va="center",
+                )
+                axes[1, 1].set_title("EMA Cluster Sizes")
 
             # 6. Codebook embedding analysis
             if codebook_embeddings.shape[0] > 1:
                 # Calculate pairwise distances between codebook entries
                 sample_size = min(100, codebook_embeddings.shape[0])
-                sample_indices = np.random.choice(codebook_embeddings.shape[0], sample_size, replace=False)
+                sample_indices = np.random.choice(
+                    codebook_embeddings.shape[0], sample_size, replace=False
+                )
                 sample_embeddings = codebook_embeddings[sample_indices]
 
                 # Calculate distances
                 distances = np.linalg.norm(
-                    sample_embeddings[:, None, :] - sample_embeddings[None, :, :], axis=2
+                    sample_embeddings[:, None, :] - sample_embeddings[None, :, :],
+                    axis=2,
                 )
 
                 # Plot distance distribution
-                upper_tri_distances = distances[np.triu_indices(distances.shape[0], k=1)]
-                axes[1, 2].hist(upper_tri_distances, bins=30, alpha=0.7, color='green', edgecolor='black')
-                axes[1, 2].set_title(f'Codebook Distance Distribution\n(Sample of {sample_size} codes)')
-                axes[1, 2].set_xlabel('L2 Distance')
-                axes[1, 2].set_ylabel('Frequency')
+                upper_tri_distances = distances[
+                    np.triu_indices(distances.shape[0], k=1)
+                ]
+                axes[1, 2].hist(
+                    upper_tri_distances,
+                    bins=30,
+                    alpha=0.7,
+                    color="green",
+                    edgecolor="black",
+                )
+                axes[1, 2].set_title(
+                    f"Codebook Distance Distribution\n(Sample of {sample_size} codes)"
+                )
+                axes[1, 2].set_xlabel("L2 Distance")
+                axes[1, 2].set_ylabel("Frequency")
                 axes[1, 2].grid(True, alpha=0.3)
 
                 # Add statistics
                 mean_dist = np.mean(upper_tri_distances)
                 std_dist = np.std(upper_tri_distances)
-                axes[1, 2].axvline(mean_dist, color='red', linestyle='--',
-                                label=f'Mean: {mean_dist:.3f}')
-                axes[1, 2].text(0.02, 0.98, f'Mean dist: {mean_dist:.3f}\nStd dist: {std_dist:.3f}',
-                            transform=axes[1, 2].transAxes, verticalalignment='top',
-                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                axes[1, 2].axvline(
+                    mean_dist,
+                    color="red",
+                    linestyle="--",
+                    label=f"Mean: {mean_dist:.3f}",
+                )
+                axes[1, 2].text(
+                    0.02,
+                    0.98,
+                    f"Mean dist: {mean_dist:.3f}\nStd dist: {std_dist:.3f}",
+                    transform=axes[1, 2].transAxes,
+                    verticalalignment="top",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+                )
                 axes[1, 2].legend()
             else:
-                axes[1, 2].text(0.5, 0.5, 'Insufficient codebook entries',
-                            transform=axes[1, 2].transAxes, ha='center', va='center')
-                axes[1, 2].set_title('Codebook Distance Distribution')
+                axes[1, 2].text(
+                    0.5,
+                    0.5,
+                    "Insufficient codebook entries",
+                    transform=axes[1, 2].transAxes,
+                    ha="center",
+                    va="center",
+                )
+                axes[1, 2].set_title("Codebook Distance Distribution")
 
             plt.tight_layout()
 
-            if self.logger and hasattr(self.logger, 'experiment'):
+            if self.logger and hasattr(self.logger, "experiment"):
                 self.logger.experiment.log({"codebook_analysis": wandb.Image(fig)})
 
             plt.close(fig)
@@ -1251,8 +1496,9 @@ class RFEncoderDecoder(L.LightningModule):
         except Exception as e:
             print(f"Error in codebook visualization: {e}")
             import traceback
+
             traceback.print_exc()
-            plt.close('all')
+            plt.close("all")
 
     def configure_optimizers(self):
         """Configure optimizer with warmup and cosine annealing."""
@@ -1270,7 +1516,9 @@ class RFEncoderDecoder(L.LightningModule):
                 return epoch / self.hparams.warmup_epochs
             else:
                 # Cosine annealing
-                progress = (epoch - self.hparams.warmup_epochs) / (self.hparams.max_epochs - self.hparams.warmup_epochs)
+                progress = (epoch - self.hparams.warmup_epochs) / (
+                    self.hparams.max_epochs - self.hparams.warmup_epochs
+                )
                 return 0.5 * (1 + np.cos(np.pi * progress))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -1281,7 +1529,7 @@ class RFEncoderDecoder(L.LightningModule):
                 "scheduler": scheduler,
                 "interval": "epoch",
                 "frequency": 1,
-            }
+            },
         }
 
     def on_before_optimizer_step(self, optimizer):

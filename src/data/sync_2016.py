@@ -55,7 +55,7 @@ for (mod_type, snr_val), signals in tqdm(data.items()):
 # Show all of our modulation types
 print(mod_types)
 # we want to look QPSK
-QPSK_18DB = samples[('QPSK', 18)]
+QPSK_18DB = samples[('QAM64', 18)]
 QAM16_18DB = samples[('QAM16', 18)]
 QAM64_18DB = samples[('QAM64', 18)]
 # Lets see how much data we have
@@ -183,7 +183,7 @@ QPSK_COMPLEX = QPSK_18DB[0][0] + 1j *  QPSK_18DB[0][1]
 from scipy import signal
 # Oversample (interpolate) by 16x
 samples_interpolated = signal.resample_poly(QPSK_COMPLEX, up=32, down=1)
-synced_qpsk = mm_timing_sync(samples_interpolated, sps=8)
+synced_qpsk = mm_timing_sync(samples_interpolated, sps=64)
 synced_qpsk = costas_loop(synced_qpsk)
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 # Plot original signal (not interpolated/synced)
