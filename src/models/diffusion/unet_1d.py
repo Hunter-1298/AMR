@@ -8,7 +8,7 @@ from .embeddings import (
     TimestepEmbedding,
     Timesteps,
 )
-from .unet_blocks import get_down_block, get_mid_block, get_up_block
+from .unet_blocks import get_down_block, get_mid_block, get_up_block, get_out_block
 
 
 class UNet1DModel(nn.Module):
@@ -58,8 +58,9 @@ class UNet1DModel(nn.Module):
         up_block_types: List[str] = ["AttnUpBlock1D", "AttnUpBlock1D", "UpBlock1D"],  # pyright: ignore
         mid_block_type: str = "UNetMidBlock1D",  # pyright: ignore
         block_out_channels: List[int] = [32, 32, 32],  # pyright: ignore
-        num_attention_heads: int = 8,
+        num_attention_heads: int = 2,# 8,
         layers_per_block: int = 1,
+        out_block: bool = True,
         condition: bool = False,
         conditional: int = 11,
     ):
@@ -67,6 +68,7 @@ class UNet1DModel(nn.Module):
 
         # size of the input token dimensions
         self.sample_size = sample_size
+        self.out_block = out_block
 
         # Store output of bottleneck -- to visually see how we learn
         self.bottleneck_activations = None
@@ -96,7 +98,6 @@ class UNet1DModel(nn.Module):
         self.down_blocks = nn.ModuleList([])
         self.mid_block = None
         self.up_blocks = nn.ModuleList([])
-        self.out_block = None
 
         # down
         output_channel = in_channels
@@ -151,6 +152,9 @@ class UNet1DModel(nn.Module):
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
+
+            if self.out_block:
+                self.out_blocks = get_out_block
 
     def forward(
         self,
@@ -222,7 +226,7 @@ class UNet1DModel(nn.Module):
             )
 
         # 5. post-process
-        if self.out_block:
-            sample = self.out_block(sample, timestep_embed)
+        # if self.out_block:
+        #     sample = self.out_block(sample, timestep_embed)
 
         return sample

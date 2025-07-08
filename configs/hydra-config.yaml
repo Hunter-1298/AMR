@@ -1,6 +1,6 @@
 # Global configurations
-project_name: SYNC
-run_name: PSK-VQ-Vic-MAE-2018-20M-Params_0.5
+project_name: Diffusion_Sync_PSK
+run_name: TimePhase_2.5MParams
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -34,11 +34,11 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 200
+    epochs: 50
     classifier_epochs: 100
     learning_rate: .001
-    batch_size: 8
-    contrastive_batch_size: 2048
+    batch_size: 128
+    contrastive_batch_size: 64
     # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
@@ -60,6 +60,20 @@ data_dir: data/
 Encoder:
     _target_: models.latent_encoder_models.psk.PSKDiscriminator
     learning_rate: .0001
+    unet:
+        _target_: models.diffusion.unet_1d.UNet1DModel
+        sample_size: 1024
+        in_channels: 2
+        out_channels: 2
+        out_block: False
+        down_block_types:
+            ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
+        up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
+        mid_block_type: "UNetMidBlock1D"
+        block_out_channels: [32, 64, 128]
+        layers_per_block: 3 #3
+        condition: ${conditon}
+        conditional: 3 # Class conditioning
 
 Diffusion:
     _target_: models.diffusion.latent_diffusion.LatentDiffusion

@@ -34,6 +34,8 @@ _kernels = {
     ],
 }
 
+def get_out_block(self, signal, timestep):
+    pass
 
 def get_down_block(
     down_block_type: str,
@@ -139,13 +141,13 @@ class Conv1dBlock(nn.Module):
         inp_channels: int,
         out_channels: int,
         kernel_size: Union[int, Tuple[int, int]],
-        n_groups: int = 8,
+        n_groups: int = 2, #8,
         activation: str = "mish",
     ):
         super().__init__()
 
         self.conv1d = nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2)
-        self.group_norm = nn.GroupNorm(n_groups, out_channels)
+        self.group_norm = nn.GroupNorm(1, out_channels)
         self.mish = get_activation(activation)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -465,7 +467,7 @@ class AttnDownBlock1D(nn.Module):
         mid_channels: Optional[int] = None,
         condition: bool = True,
         add_downsample: bool = True,
-        num_heads: int = 8,
+        num_heads: int = 1, #8
     ):
         super().__init__()
         mid_channels = out_channels if mid_channels is None else mid_channels
@@ -587,7 +589,7 @@ class UNetMidBlock1D(nn.Module):
         embed_channels: int,
         condition: bool = True,
         out_channels: Optional[int] = None,
-        num_heads: int = 8,  # Add number of heads parameter
+        num_heads: int = 1,# 8,  # Add number of heads parameter
     ):
         super().__init__()
 
@@ -711,7 +713,7 @@ class AttnUpBlock1D(nn.Module):
         in_channels: int,
         out_channels: int,
         embed_channels: int,
-        num_heads: int = 8,
+        num_heads: int = 1,# 8,
         condition: bool = True,
         mid_channels: Optional[int] = None,
     ):
@@ -725,9 +727,9 @@ class AttnUpBlock1D(nn.Module):
             ResidualTemporalBlock1D(out_channels, out_channels, embed_channels=embed_channels)
         ]
         self_attentions = [
-            SelfAttention1d(out_channels, out_channels // 32),
-            SelfAttention1d(out_channels, out_channels // 32),
-            SelfAttention1d(out_channels, out_channels // 32),
+            SelfAttention1d(out_channels, out_channels // 4),
+            SelfAttention1d(out_channels, out_channels // 4),
+            SelfAttention1d(out_channels, out_channels // 4),
         ]
 
         # Cross-attention layers for 1D sequences
