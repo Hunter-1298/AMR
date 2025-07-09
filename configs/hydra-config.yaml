@@ -1,10 +1,10 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: TimePhase_2.5MParams
+run_name: PreSynced_Data_Classifier
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
-contrastive_encoder: True
+contrastive_encoder: False
 train_diffusion: False
 conditon: False
 diffusion_contrastive: "bottleneck" #"output"
@@ -37,8 +37,8 @@ hyperparams:
     epochs: 50
     classifier_epochs: 100
     learning_rate: .001
-    batch_size: 128
-    contrastive_batch_size: 64
+    batch_size: 64
+    contrastive_batch_size: 32
     # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
@@ -58,7 +58,7 @@ data_dir: data/
 #         _target_: models.latent_encoder_models.decoder.Decoder1D
 
 Encoder:
-    _target_: models.latent_encoder_models.psk.PSKDiscriminator
+    _target_: models.latent_encoder_models.psk.PSKDenoiser
     learning_rate: .0001
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
@@ -124,6 +124,7 @@ ArcFaceLinearProbe:
 dataset:
     data: 2018
     iq: true #true
+    sync: true
     batch_size: ${hyperparams.batch_size}
     contrastive_batch_size: ${hyperparams.contrastive_batch_size}
     num_workers: 12

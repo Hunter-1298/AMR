@@ -10,220 +10,31 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import math
 
-class ComplexLosses(nn.Module):
-    """Complex signal losses for PSK synchronization"""
+class DDPMScheduler(nn.Module):
+    """Standard DDPM scheduler for AWGN noise"""
 
-    def __init__(self):
-        super().__init__()
-
-    def complex_mse_loss(self, pred_signal, target_signal):
-        """MSE loss in complex domain"""
-        # Convert to complex
-        pred = torch.complex(pred_signal[:, 0], pred_signal[:, 1])
-        target = torch.complex(target_signal[:, 0], target_signal[:, 1])
-
-        pred = pred / (torch.abs(pred) + 1e-8)
-        target = target / (torch.abs(target) + 1e-8)
-
-        return torch.mean(torch.abs(pred - target) ** 2)
-
-    def circular_phase_loss(self, pred_signal, target_signal):
-        """Cosine-based circular phase difference loss"""
-        # Convert to complex
-        pred_complex = torch.complex(pred_signal[:, 0], pred_signal[:, 1])
-        target_complex = torch.complex(target_signal[:, 0], target_signal[:, 1])
-
-        # Get phases
-        pred_phase = torch.angle(pred_complex)
-        target_phase = torch.angle(target_complex)
-
-        # Cosine loss
-        phase_diff = pred_phase - target_phase
-        phase_loss = torch.mean(1 - torch.cos(phase_diff))
-
-        return phase_loss
-
-    def magnitude_loss(self, pred_signal, target_signal):
-        """Magnitude preservation loss"""
-        # Convert to complex
-        pred_complex = torch.complex(pred_signal[:, 0], pred_signal[:, 1])
-        target_complex = torch.complex(target_signal[:, 0], target_signal[:, 1])
-
-        # Get magnitudes
-        pred_mag = torch.abs(pred_complex)
-        target_mag = torch.abs(target_complex)
-
-        # MSE on magnitudes
-        mag_loss = F.mse_loss(pred_mag, target_mag)
-
-        return mag_loss
-class ContrastiveLoss(nn.Module):
-    """Contrastive loss for PSK signal pairs"""
-
-    def __init__(self, temperature=0.5, feature_dim=128):  # Increased temperature
-        super().__init__()
-        self.temperature = temperature
-
-        # Learnable projection head for better features
-        self.projection = nn.Sequential(
-            nn.Linear(9, 64),  # 9 input features
-            nn.ReLU(),
-            nn.Linear(64, feature_dim),
-            nn.BatchNorm1d(feature_dim)
-        )
-
-    def forward(self, synchronized_pairs, labels):
-        """
-        Args:
-            synchronized_pairs: tuple of (sync_signals_i, sync_signals_j)
-            labels: modulation type labels
-        """
-        sync_i, sync_j = synchronized_pairs
-        batch_size = sync_i.shape[0]
-        device = sync_i.device
-
-        # Extract better features
-        features_i = self.extract_psk_specific_features(sync_i, labels)
-        features_j = self.extract_psk_specific_features(sync_j, labels)
-
-        # Project features
-        features_i = self.projection(features_i)
-        features_j = self.projection(features_j)
-
-        # L2 normalize
-        features_i = F.normalize(features_i, dim=1)
-        features_j = F.normalize(features_j, dim=1)
-
-        # Simple NT-Xent loss (SimCLR style)
-        features = torch.cat([features_i, features_j], dim=0)  # [2*batch, dim]
-        labels_doubled = torch.cat([labels, labels], dim=0)    # [2*batch]
-
-        # Compute similarity matrix
-        sim_matrix = torch.mm(features, features.t()) / self.temperature
-
-        # Mask to remove self-similarities
-        mask = torch.eye(2 * batch_size, device=device).bool()
-        sim_matrix.masked_fill_(mask, -float('inf'))
-
-        # For each anchor, find positive and negative pairs
-        loss = 0
-        valid_samples = 0
-
-        for i in range(2 * batch_size):
-            # Positive mask: same label, different sample
-            pos_mask = (labels_doubled == labels_doubled[i]) & ~mask[i]
-            # Negative mask: different label
-            neg_mask = (labels_doubled != labels_doubled[i])
-
-            if pos_mask.sum() > 0 and neg_mask.sum() > 0:
-                # Get positive similarities
-                pos_sim = sim_matrix[i][pos_mask]
-
-                # Get negative similarities
-                neg_sim = sim_matrix[i][neg_mask]
-
-                # Compute loss for this anchor
-                # log(sum(exp(pos)) / (sum(exp(pos)) + sum(exp(neg))))
-                pos_exp_sum = torch.exp(pos_sim).sum()
-                neg_exp_sum = torch.exp(neg_sim).sum()
-
-                loss_i = -torch.log(pos_exp_sum / (pos_exp_sum + neg_exp_sum + 1e-8))
-                loss += loss_i
-                valid_samples += 1
-
-        if valid_samples > 0:
-            loss = loss / valid_samples
-        else:
-            # If no valid samples, return small loss to avoid NaN
-            loss = torch.tensor(0.01, device=device, requires_grad=True)
-
-        return loss
-
-    def extract_psk_specific_features(self, signals, labels):
-        """Extract features that specifically distinguish PSK types"""
-        batch_size = signals.shape[0]
-        device = signals.device
-
-        # Convert to complex
-        complex_signals = torch.complex(signals[:, 0], signals[:, 1])
-
-        features = []
-
-        # 1. Phase histogram features (different for each PSK)
-        phases = torch.angle(complex_signals)
-
-        # QPSK should have 4 phase clusters, 8PSK has 8, 16PSK has 16
-        # Compute phase histogram in different bins
-        phase_bins_4 = torch.histc(phases.view(batch_size, -1), bins=4, min=-np.pi, max=np.pi)
-        phase_bins_8 = torch.histc(phases.view(batch_size, -1), bins=8, min=-np.pi, max=np.pi)
-        phase_bins_16 = torch.histc(phases.view(batch_size, -1), bins=16, min=-np.pi, max=np.pi)
-
-        # Normalize histograms
-        phase_entropy_4 = -torch.sum(phase_bins_4 * torch.log(phase_bins_4 + 1e-8), dim=1)
-        phase_entropy_8 = -torch.sum(phase_bins_8 * torch.log(phase_bins_8 + 1e-8), dim=1)
-        phase_entropy_16 = -torch.sum(phase_bins_16 * torch.log(phase_bins_16 + 1e-8), dim=1)
-
-        features.extend([
-            phase_entropy_4.unsqueeze(1),
-            phase_entropy_8.unsqueeze(1),
-            phase_entropy_16.unsqueeze(1)
-        ])
-
-        # 2. Distance to ideal constellations (should be smallest for correct type)
-        avg_distances = []
-        for n_points in [4, 8, 16]:
-            angles = torch.linspace(0, 2*np.pi, n_points+1, device=device)[:-1]
-
-            if n_points == 4:  # QPSK
-                ideal_points = torch.exp(1j * (angles + np.pi/4))  # 45° offset
-                ideal_points = ideal_points / np.sqrt(2)  # Normalize
-            else:
-                ideal_points = torch.exp(1j * angles)
-
-            # Compute minimum distance to ideal points
-            ideal_points = ideal_points.unsqueeze(0).unsqueeze(0)  # [1, 1, n_points]
-            signal_points = complex_signals.unsqueeze(2)  # [batch, length, 1]
-
-            distances = torch.abs(signal_points - ideal_points)  # [batch, length, n_points]
-            min_distances = torch.min(distances, dim=2)[0]  # [batch, length]
-            avg_distance = torch.mean(min_distances, dim=1)  # [batch]
-
-            avg_distances.append(avg_distance.unsqueeze(1))
-
-        features.extend(avg_distances)
-
-        # 3. Phase transition statistics (different patterns for different PSK)
-        phase_diff = torch.diff(phases, dim=1)
-        # Wrap phase differences to [-pi, pi]
-        phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
-
-        features.extend([
-            torch.mean(torch.abs(phase_diff), dim=1).unsqueeze(1),
-            torch.std(phase_diff, dim=1).unsqueeze(1)
-        ])
-
-        # 4. Magnitude variance (should be low for good PSK)
-        magnitudes = torch.abs(complex_signals)
-        features.append(torch.std(magnitudes, dim=1).unsqueeze(1))
-
-        # Stack all features
-        feature_tensor = torch.cat(features, dim=1)  # [batch, 9]
-
-        return feature_tensor
-class TimeSyncScheduler(nn.Module):
-    """Scheduler for time synchronization errors only"""
-
-    def __init__(self, n_steps: int = 1000, max_timing_shift: int = 16, max_phase_shift_deg: float = 45.0):
+    def __init__(self, n_steps: int = 1000, beta_start: float = 0.0001, beta_end: float = 0.02, schedule: str = 'cosine'):
         super().__init__()
         self.n_steps = n_steps
-        self.max_timing_shift = max_timing_shift
-        self.max_phase_shift_deg = max_phase_shift_deg
 
-        # Create noise schedule
-        betas = torch.linspace(0.0001, 0.02, n_steps)
+        if schedule == 'linear':
+            betas = torch.linspace(beta_start, beta_end, n_steps)
+        elif schedule == 'cosine':
+            # Cosine schedule (typically better)
+            s = 0.008
+            steps = n_steps + 1
+            x = torch.linspace(0, n_steps, steps)
+            alphas_cumprod = torch.cos(((x / n_steps) + s) / (1 + s) * math.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            betas = torch.clamp(betas, 0, 0.999)
+        else:
+            raise ValueError(f"Unknown schedule: {schedule}")
+
         alphas = 1 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
+        # Store as buffers
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
@@ -233,82 +44,375 @@ class TimeSyncScheduler(nn.Module):
     def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.randint(0, self.n_steps, (batch_size,), device=device)
 
-    def add_sync_errors(self, clean_signal: torch.Tensor, timestep: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Add both timing and phase errors.
-        Returns: (corrupted_signal, clean_signal, timing_offsets, phase_offsets)
-        """
-        batch_size = clean_signal.shape[0]
-        device = clean_signal.device
+    def add_noise(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Add AWGN noise according to DDPM schedule"""
+        noise = torch.randn_like(x)
 
-        # Scale by noise level
-        sqrt_one_minus_alpha_t = self.sqrt_one_minus_alphas_cumprod[timestep]
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].view(-1, 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
 
-        # --- Timing Offsets ---
-        max_shift_t = (self.max_timing_shift * sqrt_one_minus_alpha_t).int()
-        timing_offsets = torch.zeros(batch_size, device=device, dtype=torch.int)
+        noisy_signal = sqrt_alphas_cumprod_t * x + sqrt_one_minus_alphas_cumprod_t * noise
 
-        for i in range(batch_size):
-            if max_shift_t[i] > 0:
-                timing_offsets[i] = torch.randint(-max_shift_t[i], max_shift_t[i] + 1, (1,), device=device)
+        return noisy_signal, noise
 
-        # --- Phase Offsets ---
-        max_phase_rad = self.max_phase_shift_deg * (3.14159265 / 180.0)
-        phase_offsets = (2 * torch.rand(batch_size, device=device) - 1) * max_phase_rad * sqrt_one_minus_alpha_t
+class SyncErrorGenerator(nn.Module):
+    """Generate random synchronization errors - vectorized per-sample version"""
 
-        # Apply both corruptions
-        corrupted_signal = self.apply_timing_shifts(clean_signal, timing_offsets)
-        corrupted_signal = self.apply_phase_shifts(corrupted_signal, phase_offsets)
-
-        return corrupted_signal, clean_signal, timing_offsets, phase_offsets
-
-    def apply_timing_shifts(self, signal: torch.Tensor, timing_offsets: torch.Tensor) -> torch.Tensor:
-        batch_size = signal.shape[0]
-        shifted_signal = signal.clone()
-        for i in range(batch_size):
-            shift = timing_offsets[i].item()
-            if shift != 0:
-                shifted_signal[i] = torch.roll(signal[i], shifts=shift, dims=-1)
-        return shifted_signal
-
-    def apply_phase_shifts(self, signal: torch.Tensor, phase_offsets: torch.Tensor) -> torch.Tensor:
-        """
-        Rotate I/Q pairs by a phase offset: z = x + j y → z' = z * exp(jθ)
-        """
-        i, q = signal[:, 0], signal[:, 1]
-        complex_signal = torch.complex(i, q)
-
-        phase_rotations = torch.exp(1j * phase_offsets).unsqueeze(-1)  # [B, 1]
-        rotated_signal = complex_signal * phase_rotations  # [B, L]
-
-        return torch.stack([rotated_signal.real, rotated_signal.imag], dim=1)  # [B, 2,
-
-class TimeSyncDiffusion(nn.Module):
-    """Time synchronization using diffusion model"""
-
-    def __init__(self, unet: nn.Module, signal_length: int = 1024, num_diffusion_steps: int = 500):
+    def __init__(self, signal_length: int = 1024, sample_rate: float = 1e6):
         super().__init__()
         self.signal_length = signal_length
-        self.num_diffusion_steps = num_diffusion_steps
+        self.sample_rate = sample_rate
 
-        # UNet for signal-to-signal correction
-        self.unet = unet
+        # Corruption parameters
+        self.max_timing_offset = 4  # ±0.5 symbols = ±4 samples
+        self.freq_offset_range = [10, 50]  # ±10-50 Hz
 
-        # Time sync scheduler
-        self.scheduler = TimeSyncScheduler(num_diffusion_steps)
+    def apply_sync_errors(self, signals: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """
+        Apply random synchronization errors to signals - vectorized per-sample
 
-    def forward(self, shifted_signal: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-        """Predict the time-synchronized signal"""
-        return self.unet(shifted_signal, timestep)
+        Args:
+            signals: [batch_size, 2, signal_length] I/Q signals
 
-    def get_latent_features(self, signal: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-        """Extract latent features from UNet for visualization"""
-        # This assumes your UNet has a method to get intermediate features
-        # You may need to modify based on your UNet architecture
-        return self.unet.get_features(signal, timestep)
+        Returns:
+            corrupted_signals: [batch_size, 2, signal_length]
+            error_info: Dict containing applied errors for logging
+        """
+        batch_size = signals.shape[0]
+        device = signals.device
+        corrupted_signals = signals.clone()
 
-class PSKDiscriminator(L.LightningModule):
-    """Simplified PSK discriminator focusing only on time synchronization"""
+        # 1. Vectorized timing offsets
+        timing_offsets = torch.randint(
+            -self.max_timing_offset, self.max_timing_offset + 1,
+            (batch_size,), device=device
+        )
+
+        # Apply timing shifts (unavoidable loop due to different shifts per sample)
+        for i in range(batch_size):
+            if timing_offsets[i] != 0:
+                corrupted_signals[i] = torch.roll(corrupted_signals[i], shifts=timing_offsets[i].item(), dims=-1)
+
+        # 2. Vectorized frequency offsets
+        # Generate random frequency offsets for each sample
+        freq_offsets = torch.empty(batch_size, device=device).uniform_(
+            self.freq_offset_range[0], self.freq_offset_range[1]
+        )
+        # Randomly flip sign for each sample
+        freq_signs = torch.randint(0, 2, (batch_size,), device=device) * 2 - 1  # -1 or 1
+        freq_offsets = freq_offsets * freq_signs.float()
+
+        # Create phase ramps for all samples at once
+        n = torch.arange(self.signal_length, device=device, dtype=torch.float32)
+        phase_ramps = 2 * torch.pi * freq_offsets.unsqueeze(1) * n.unsqueeze(0) / self.sample_rate
+        # phase_ramps shape: [batch_size, signal_length]
+
+        # Apply frequency offsets
+        signal_complex = torch.complex(corrupted_signals[:, 0], corrupted_signals[:, 1])
+        freq_rotations = torch.exp(1j * phase_ramps)
+        signal_complex = signal_complex * freq_rotations
+
+        corrupted_signals[:, 0] = signal_complex.real
+        corrupted_signals[:, 1] = signal_complex.imag
+
+        # 3. Vectorized phase offsets
+        phase_offsets = torch.empty(batch_size, device=device).uniform_(0, 2 * torch.pi)
+
+        # Apply phase offsets
+        signal_complex = torch.complex(corrupted_signals[:, 0], corrupted_signals[:, 1])
+        phase_rotations = torch.exp(1j * phase_offsets.unsqueeze(1))
+        signal_complex = signal_complex * phase_rotations
+
+        corrupted_signals[:, 0] = signal_complex.real
+        corrupted_signals[:, 1] = signal_complex.imag
+
+        error_info = {
+            'timing_offsets': timing_offsets.cpu().numpy().tolist(),
+            'phase_offsets': phase_offsets.cpu().numpy().tolist(),
+            'freq_offsets': freq_offsets.cpu().numpy().tolist()
+        }
+
+        return corrupted_signals, error_info
+
+class ComplexSignalLoss(nn.Module):
+    """Multi-component loss for PSK denoising and synchronization"""
+
+    def __init__(self,
+                 mse_weight: float = 1.0,
+                 power_weight: float = 2.0,
+                 constellation_weight: float = 1.0,
+                 envelope_weight: float = 1.0,
+                 psd_weight: float = 0.5,
+                 phase_coherence_weight: float = 0.5):
+        super().__init__()
+        self.mse_weight = mse_weight
+        self.power_weight = power_weight
+        self.constellation_weight = constellation_weight
+        self.envelope_weight = envelope_weight
+        self.psd_weight = psd_weight
+        self.phase_coherence_weight = phase_coherence_weight
+
+        # Pre-compute Hann window for PSD computation
+        self.register_buffer('hann_window', torch.hann_window(1024))
+
+    def forward(self, pred_signal: torch.Tensor, target_signal: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """
+        Compute multi-component loss for PSK signals
+
+        Args:
+            pred_signal: [batch_size, 2, signal_length] predicted I/Q
+            target_signal: [batch_size, 2, signal_length] target I/Q
+        """
+        # Convert to complex
+        pred_complex = torch.complex(pred_signal[:, 0], pred_signal[:, 1])
+        target_complex = torch.complex(target_signal[:, 0], target_signal[:, 1])
+
+        losses = {}
+
+        # 1. Complex MSE (Basic reconstruction)
+        mse_loss = torch.mean(torch.abs(pred_complex - target_complex) ** 2)
+        losses['mse'] = mse_loss
+
+        # 2. Power preservation (Anti-collapse)
+        power_loss = self.power_preservation_loss(pred_complex, target_complex)
+        losses['power'] = power_loss
+
+        # 3. Soft constellation loss (Synchronization quality)
+        constellation_loss = self.soft_constellation_loss(pred_complex, target_complex)
+        losses['constellation'] = constellation_loss
+
+        # 4. Envelope consistency (PSK characteristic)
+        envelope_loss = self.envelope_consistency_loss(pred_complex, target_complex)
+        losses['envelope'] = envelope_loss
+
+        # 5. Power spectral density matching (Frequency domain)
+        psd_loss = self.psd_matching_loss(pred_complex, target_complex)
+        losses['psd'] = psd_loss
+
+        # 6. Phase coherence (Phase synchronization)
+        phase_coherence_loss = self.phase_coherence_loss(pred_complex, target_complex)
+        losses['phase_coherence'] = phase_coherence_loss
+
+        # Combined loss
+        total_loss = (
+            self.mse_weight * mse_loss +
+            self.power_weight * power_loss +
+            self.constellation_weight * constellation_loss +
+            self.envelope_weight * envelope_loss +
+            self.psd_weight * psd_loss +
+            self.phase_coherence_weight * phase_coherence_loss
+        )
+
+        return total_loss, losses
+
+    def power_preservation_loss(self, pred_complex: torch.Tensor, target_complex: torch.Tensor) -> torch.Tensor:
+        """Preserve signal power to prevent collapse"""
+        pred_power = torch.mean(torch.abs(pred_complex) ** 2, dim=1)
+        target_power = torch.mean(torch.abs(target_complex) ** 2, dim=1)
+        return F.mse_loss(pred_power, target_power)
+
+    def soft_constellation_loss(self, pred_complex: torch.Tensor, target_complex: torch.Tensor) -> torch.Tensor:
+        """Soft constellation constraints - modulation agnostic"""
+        # Encourage magnitude consistency (PSK property)
+        pred_magnitude = torch.abs(pred_complex)
+        target_magnitude = torch.abs(target_complex)
+
+        # Mean magnitude should be similar
+        pred_mean_mag = torch.mean(pred_magnitude, dim=1)
+        target_mean_mag = torch.mean(target_magnitude, dim=1)
+        mean_mag_loss = F.mse_loss(pred_mean_mag, target_mean_mag)
+
+        # Encourage clustering in phase space (without specifying number of clusters)
+        pred_phase = torch.angle(pred_complex)
+        target_phase = torch.angle(target_complex)
+
+        # Phase histogram similarity using circular statistics
+        pred_phase_cos = torch.cos(pred_phase)
+        pred_phase_sin = torch.sin(pred_phase)
+        target_phase_cos = torch.cos(target_phase)
+        target_phase_sin = torch.sin(target_phase)
+
+        phase_cos_loss = F.mse_loss(torch.mean(pred_phase_cos, dim=1), torch.mean(target_phase_cos, dim=1))
+        phase_sin_loss = F.mse_loss(torch.mean(pred_phase_sin, dim=1), torch.mean(target_phase_sin, dim=1))
+
+        return mean_mag_loss + phase_cos_loss + phase_sin_loss
+
+    def envelope_consistency_loss(self, pred_complex: torch.Tensor, target_complex: torch.Tensor) -> torch.Tensor:
+        """PSK signals should have constant envelope"""
+        pred_magnitude = torch.abs(pred_complex)
+        target_magnitude = torch.abs(target_complex)
+
+        # Variance of magnitude should be minimal for PSK
+        pred_mag_var = torch.var(pred_magnitude, dim=1)
+        target_mag_var = torch.var(target_magnitude, dim=1)
+
+        return F.mse_loss(pred_mag_var, target_mag_var)
+
+    def psd_matching_loss(self, pred_complex: torch.Tensor, target_complex: torch.Tensor) -> torch.Tensor:
+        """Power spectral density matching for frequency domain characteristics"""
+        batch_size = pred_complex.shape[0]
+
+        # Apply window to reduce spectral leakage
+        window = self.hann_window.unsqueeze(0).expand(batch_size, -1)
+
+        pred_windowed = pred_complex * window
+        target_windowed = target_complex * window
+
+        # Compute FFT
+        pred_fft = torch.fft.fft(pred_windowed, dim=1)
+        target_fft = torch.fft.fft(target_windowed, dim=1)
+
+        # Compute power spectral density
+        pred_psd = torch.abs(pred_fft) ** 2
+        target_psd = torch.abs(target_fft) ** 2
+
+        # Normalize PSDs
+        pred_psd_norm = pred_psd / (torch.sum(pred_psd, dim=1, keepdim=True) + 1e-8)
+        target_psd_norm = target_psd / (torch.sum(target_psd, dim=1, keepdim=True) + 1e-8)
+
+        # MSE between normalized PSDs
+        psd_mse = F.mse_loss(pred_psd_norm, target_psd_norm)
+
+        # Spectral centroid preservation (frequency offset detection)
+        freq_bins = torch.arange(pred_psd.shape[1], device=pred_psd.device).float()
+
+        pred_centroid = torch.sum(pred_psd_norm * freq_bins.unsqueeze(0), dim=1)
+        target_centroid = torch.sum(target_psd_norm * freq_bins.unsqueeze(0), dim=1)
+
+        centroid_loss = F.mse_loss(pred_centroid, target_centroid)
+
+        return psd_mse + 0.5 * centroid_loss
+
+    def phase_coherence_loss(self, pred_complex: torch.Tensor, target_complex: torch.Tensor) -> torch.Tensor:
+        """Phase coherence for synchronization quality"""
+        pred_phase = torch.angle(pred_complex)
+        target_phase = torch.angle(target_complex)
+
+        # Phase derivative (instantaneous frequency)
+        pred_phase_diff = torch.diff(pred_phase, dim=1)
+        target_phase_diff = torch.diff(target_phase, dim=1)
+
+        # Wrap phase differences to [-π, π]
+        pred_phase_diff = torch.atan2(torch.sin(pred_phase_diff), torch.cos(pred_phase_diff))
+        target_phase_diff = torch.atan2(torch.sin(target_phase_diff), torch.cos(target_phase_diff))
+
+        # Phase derivative should be similar
+        phase_diff_loss = F.mse_loss(pred_phase_diff, target_phase_diff)
+
+        # Phase unwrapping smoothness
+        pred_unwrapped = torch.cumsum(pred_phase_diff, dim=1)
+        target_unwrapped = torch.cumsum(target_phase_diff, dim=1)
+
+        unwrapped_loss = F.mse_loss(pred_unwrapped, target_unwrapped)
+
+        return phase_diff_loss + 0.1 * unwrapped_loss
+
+class ResidualBlock(nn.Module):
+    """Basic residual block for 1D convolutions"""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=kernel_size//2)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=kernel_size//2)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        # Shortcut connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = x
+
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        out += self.shortcut(residual)
+        out = F.relu(out)
+
+        return out
+
+class ResidualStack(nn.Module):
+    """Stack of residual blocks with downsampling"""
+
+    def __init__(self, in_channels: int, out_channels: int, num_blocks: int, stride: int = 2):
+        super().__init__()
+
+        layers = []
+        # First block handles dimension change
+        layers.append(ResidualBlock(in_channels, out_channels, stride=stride))
+
+        # Remaining blocks maintain dimensions
+        for _ in range(num_blocks - 1):
+            layers.append(ResidualBlock(out_channels, out_channels))
+
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+class PSKResNetClassifier(nn.Module):
+    """ResNet-based classifier for PSK signals"""
+
+    def __init__(self, input_channels: int = 2, num_classes: int = 3, input_length: int = 1024):
+        super().__init__()
+
+        self.input_length = input_length
+
+        # Initial convolution to get to 32 channels
+        self.initial_conv = nn.Conv1d(input_channels, 32, kernel_size=7, stride=2, padding=3)
+        self.initial_bn = nn.BatchNorm1d(32)
+
+        # Residual stacks following the paper architecture
+        # Input: 2 × 1024 → 32 × 512 (after initial conv)
+        self.stack1 = ResidualStack(32, 32, num_blocks=2, stride=1)   # 32 × 512
+        self.stack2 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 256
+        self.stack3 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 128
+        self.stack4 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 64
+        self.stack5 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 32
+        self.stack6 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 16
+
+        # Global average pooling
+        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
+
+        # Fully connected layers
+        self.fc1 = nn.Linear(32, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, num_classes)
+
+        # Activation function (SeLU as specified in paper)
+        self.selu = nn.SELU()
+
+    def forward(self, x):
+        # Initial convolution
+        x = F.relu(self.initial_bn(self.initial_conv(x)))
+
+        # Residual stacks
+        x = self.stack1(x)
+        x = self.stack2(x)
+        x = self.stack3(x)
+        x = self.stack4(x)
+        x = self.stack5(x)
+        x = self.stack6(x)
+
+        # Global average pooling
+        x = self.global_avg_pool(x)
+        x = x.view(x.size(0), -1)
+
+        # Fully connected layers
+        x = self.selu(self.fc1(x))
+        x = self.selu(self.fc2(x))
+        x = self.fc3(x)  # No activation here, will apply softmax in loss
+
+        return x
+
+class PSKDenoiser(L.LightningModule):
+    """Combined PSK Denoiser and Classifier using end-to-end training"""
 
     def __init__(
         self,
@@ -316,9 +420,17 @@ class PSKDiscriminator(L.LightningModule):
         signal_length: int = 1024,
         learning_rate: float = 1e-3,
         num_diffusion_steps: int = 1000,
-        complex_loss_weight: float = 1.0,
-        phase_loss_weight: float = 2.0,
-        contrastive_weight: float = 0.5,
+        beta_schedule: str = 'cosine',
+        sample_rate: float = 1e6,
+        # Loss weights
+        mse_weight: float = 2.0,
+        power_weight: float = 1.0,
+        constellation_weight: float = 1.0,
+        envelope_weight: float = 1.0,
+        psd_weight: float = 0.001,  # Reduced based on previous discussion
+        phase_coherence_weight: float = 0.01,
+        classification_weight: float = 0.1,  # Start small
+        warmup_epochs: int = 10,  # Epochs before adding classification loss
         **kwargs
     ):
         super().__init__()
@@ -327,115 +439,147 @@ class PSKDiscriminator(L.LightningModule):
 
         self.label_names = ['QPSK', '8PSK', '16PSK']
         self.num_classes = 3
+        self.warmup_epochs = warmup_epochs
 
-        # Time sync diffusion model
-        self.sync_model = TimeSyncDiffusion(unet, signal_length, num_diffusion_steps)
-
-        # Simple classifier for PSK type (for visualization only)
-        self.psk_classifier = nn.Sequential(
-            nn.Conv1d(2, 64, kernel_size=32, stride=8),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(64, 3)
+        # Core components
+        self.unet = unet
+        self.ddpm_scheduler = DDPMScheduler(
+            n_steps=num_diffusion_steps,
+            schedule=beta_schedule
+        )
+        self.sync_error_generator = SyncErrorGenerator(
+            signal_length=signal_length,
+            sample_rate=sample_rate
         )
 
-        # Loss functions
-        self.complex_losses = ComplexLosses()
-        self.contrastive_loss_fn = ContrastiveLoss(temperature=0.1)
+        # Multi-component loss function
+        self.complex_loss = ComplexSignalLoss(
+            mse_weight=mse_weight,
+            power_weight=power_weight,
+            constellation_weight=constellation_weight,
+            envelope_weight=envelope_weight,
+            psd_weight=psd_weight,
+            phase_coherence_weight=phase_coherence_weight
+        )
 
-        # Loss weights
-        self.complex_loss_weight = complex_loss_weight
-        self.phase_loss_weight = phase_loss_weight
-        self.contrastive_weight = contrastive_weight
-    def forward(self, x: torch.Tensor, return_intermediates: bool = False):
-        """Forward pass for time synchronization"""
-        # Progressive synchronization
-        current_signal = x
-        intermediates = [] if return_intermediates else None
+        # ResNet classifier
+        self.classifier = PSKResNetClassifier(
+            input_channels=2,
+            num_classes=self.num_classes,
+            input_length=signal_length
+        )
 
-        # Reverse diffusion process
-        sync_steps = list(reversed(range(0, self.sync_model.num_diffusion_steps, 100)))
+        # Classification loss
+        self.classification_loss = nn.CrossEntropyLoss()
 
-        for i, t in enumerate(sync_steps):
-            t_tensor = torch.full((current_signal.shape[0],), t, device=current_signal.device)
+        # Classification weight schedule
+        self.classification_weight = classification_weight
 
-            # Predict synchronized signal
-            predicted_signal = self.sync_model(current_signal, t_tensor)
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Forward pass: predict clean signal from corrupted signal"""
+        return self.unet(x, t)
 
-            if return_intermediates and i % 2 == 0:  # Save every other step
-                intermediates.append({
-                    'signal': predicted_signal.clone(),
-                    'timestep': t,
-                    'step': i
-                })
+    def denoise_signal(self, corrupted_signal: torch.Tensor, num_steps: int = 10) -> torch.Tensor:
+        """
+        Denoise a signal using progressive denoising steps
 
-            current_signal = predicted_signal
+        Args:
+            corrupted_signal: [batch_size, 2, signal_length] corrupted I/Q signal
+            num_steps: Number of denoising steps
 
-        return current_signal, intermediates
+        Returns:
+            Denoised signal
+        """
+        self.unet.eval()
+
+        # Create timestep schedule for inference
+        timesteps = torch.linspace(
+            self.ddpm_scheduler.n_steps - 1, 0, num_steps,
+            dtype=torch.long, device=corrupted_signal.device
+        )
+
+        current_signal = corrupted_signal
+
+        with torch.no_grad():
+            for t in timesteps:
+                t_batch = t.repeat(corrupted_signal.shape[0])
+
+                # Predict clean signal
+                predicted_clean = self.unet(current_signal, t_batch)
+
+                # Simple update rule
+                alpha = 0.1
+                current_signal = (1 - alpha) * current_signal + alpha * predicted_clean
+
+        return current_signal
+
+    def get_current_classification_weight(self) -> float:
+        """Get current classification weight based on training progress"""
+        if self.current_epoch < self.warmup_epochs:
+            return 0.0
+        else:
+            # Gradually increase classification weight
+            progress = (self.current_epoch - self.warmup_epochs) / max(1, self.trainer.max_epochs - self.warmup_epochs)
+            return self.classification_weight * min(1.0, progress * 2)  # Reach full weight at 50% through remaining epochs
 
     def training_step(self, batch, batch_idx):
         optimizer = self.optimizers()
         scheduler = self.lr_schedulers()
 
-        # Extract BOTH signals from the pair
-        if len(batch) == 4:
-            x_i, x_j, labels, snrs = batch
-        elif len(batch) == 3:
-            (x_i, x_j), labels, snrs = batch
-        elif len(batch) == 2:
-            x_i, labels = batch
-            x_j = x_i  # Fallback if no pairs
-        else:
-            raise ValueError(f"Unexpected batch format with {len(batch)} elements")
+        # Handle the new 4-value batch format
+        synced_signals, original_unsynced_signals, labels, snrs = batch
 
-        labels = labels.long()
-        batch_size = x_i.shape[0]
-        device = x_i.device
+        batch_size = synced_signals.shape[0]
+        device = synced_signals.device
 
-        # Sample timesteps
-        timesteps = self.sync_model.scheduler.sample_timesteps(batch_size, device)
+        # ===================
+        # DENOISING TRAINING
+        # ===================
 
-        # Add timing errors to BOTH signals in the pair
-        shifted_i, clean_i, timing_offsets_i, phase_offsets_i = self.sync_model.scheduler.add_sync_errors(x_i, timesteps)
-        shifted_j, clean_j, timing_offsets_j, phase_offsets_j = self.sync_model.scheduler.add_sync_errors(x_j, timesteps)
+        # Sample timesteps for DDPM (FIXED TYPO)
+        timesteps = self.ddpm_scheduler.sample_timesteps(batch_size, device)
 
-        # Predict synchronized signals for BOTH
-        predicted_i = self.sync_model(shifted_i, timesteps)
-        predicted_j = self.sync_model(shifted_j, timesteps)
+        # Step 1: Add random synchronization errors to clean synced signals
+        corrupted_signals, error_info = self.sync_error_generator.apply_sync_errors(synced_signals)
 
-        # Complex MSE loss
-        complex_loss_i = self.complex_losses.complex_mse_loss(predicted_i, clean_i)
-        complex_loss_j = self.complex_losses.complex_mse_loss(predicted_j, clean_j)
-        complex_loss = (complex_loss_i + complex_loss_j) / 2
+        # Step 2: Add AWGN noise according to DDPM schedule
+        noisy_signals, noise = self.ddpm_scheduler.add_noise(corrupted_signals, timesteps)
 
-        # Phase loss
-        phase_loss_i = self.complex_losses.circular_phase_loss(predicted_i, clean_i)
-        phase_loss_j = self.complex_losses.circular_phase_loss(predicted_j, clean_j)
-        phase_loss = (phase_loss_i + phase_loss_j) / 2
+        # Step 3: Predict clean synchronized signal from noisy corrupted signal
+        predicted_clean = self.unet(noisy_signals, timesteps)
 
-        # Magnitude loss (optional, helps maintain signal power)
-        mag_loss_i = self.complex_losses.magnitude_loss(predicted_i, clean_i)
-        mag_loss_j = self.complex_losses.magnitude_loss(predicted_j, clean_j)
-        mag_loss = (mag_loss_i + mag_loss_j) / 2
+        # Step 4: Compute reconstruction loss
+        reconstruction_loss, loss_components = self.complex_loss(predicted_clean, synced_signals)
 
-        # Contrastive loss on synchronized outputs
-        # contrastive_loss = self.contrastive_loss_fn((predicted_i, predicted_j), labels)
+        # ===================
+        # CLASSIFICATION TRAINING (on original unsynced data)
+        # ===================
 
-        # Combined loss
-        # total_loss = (
-        #     self.complex_loss_weight * complex_loss +
-        #     self.phase_loss_weight * phase_loss +
-        #     0.1 * mag_loss +  # Small weight for magnitude
-        #     self.contrastive_weight * contrastive_loss
-        # )
-        total_loss = (
-            self.complex_loss_weight * complex_loss +
-            self.phase_loss_weight * phase_loss +
-            0.1 * mag_loss  # Small weight for magnitude
-        )
+        classification_loss = torch.tensor(0.0, device=device)
+        classification_accuracy = torch.tensor(0.0, device=device)
 
-        # Backprop
+        current_class_weight = self.get_current_classification_weight()
+
+        if current_class_weight > 0:
+            # Apply denoiser to original unsynced signals
+            with torch.no_grad():
+                denoised_unsynced = self.denoise_signal(original_unsynced_signals, num_steps=5)
+
+            # Classify the denoised signals
+            class_logits = self.classifier(denoised_unsynced)
+            classification_loss = self.classification_loss(class_logits, labels)
+
+            # Compute accuracy
+            _, predicted_classes = torch.max(class_logits, 1)
+            classification_accuracy = (predicted_classes == labels).float().mean()
+
+        # ===================
+        # COMBINED LOSS
+        # ===================
+
+        total_loss = reconstruction_loss + current_class_weight * classification_loss
+
+        # Backpropagation
         optimizer.zero_grad()
         self.manual_backward(total_loss)
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
@@ -444,374 +588,248 @@ class PSKDiscriminator(L.LightningModule):
         if scheduler is not None:
             scheduler.step()
 
-        # Logging
-        self.log('train_complex_loss', complex_loss, prog_bar=True)
-        self.log('train_phase_loss', phase_loss, prog_bar=True)
-        self.log('train_mag_loss', mag_loss)
-        # self.log('train_contrastive_loss', contrastive_loss, prog_bar=True)
-        self.log('train_total_loss', total_loss, prog_bar=True)
+        # ===================
+        # LOGGING
+        # ===================
 
-        # Log timing offset statistics
-        avg_offset = (torch.abs(timing_offsets_i).float().mean() + torch.abs(timing_offsets_j).float().mean()) / 2
-        self.log('train_avg_timing_offset', avg_offset)
+        # Main metrics
+        self.log('train_loss', total_loss, prog_bar=True)
+        self.log('train_reconstruction_loss', reconstruction_loss)
+        self.log('train_classification_loss', classification_loss)
+        self.log('train_classification_accuracy', classification_accuracy, prog_bar=True)
+        self.log('train_classification_weight', current_class_weight)
+
+        # Power monitoring
+        pred_power = torch.mean(torch.abs(torch.complex(predicted_clean[:, 0], predicted_clean[:, 1])) ** 2)
+        target_power = torch.mean(torch.abs(torch.complex(synced_signals[:, 0], synced_signals[:, 1])) ** 2)
+        self.log('train_pred_power', pred_power)
+        self.log('train_target_power', target_power)
+        self.log('train_power_ratio', pred_power / (target_power + 1e-8))
+
+        # Individual reconstruction loss components
+        for name, loss_val in loss_components.items():
+            self.log(f'train_{name}_loss', loss_val)
+
+        # Corruption statistics
+        avg_timing_offset = np.mean([abs(x) for x in error_info['timing_offsets']])
+        avg_phase_offset = np.mean(error_info['phase_offsets'])
+        avg_freq_offset = np.mean([abs(x) for x in error_info['freq_offsets']])
+
+        self.log('train_avg_timing_offset', avg_timing_offset)
+        self.log('train_avg_phase_offset', avg_phase_offset)
+        self.log('train_avg_freq_offset', avg_freq_offset)
 
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        # Extract BOTH signals from the pair
-        if len(batch) == 4:
-            x_i, x_j, labels, snrs = batch
-        elif len(batch) == 3:
-            (x_i, x_j), labels, snrs = batch
-        elif len(batch) == 2:
-            x_i, labels = batch
-            x_j = x_i  # Fallback if no pairs
-            snrs = None
-        else:
-            raise ValueError(f"Unexpected batch format with {len(batch)} elements")
+        # Handle the new 4-value batch format
+        synced_signals, original_unsynced_signals, labels, snrs = batch
 
-        labels = labels.long()
-        batch_size = x_i.shape[0]
-        device = x_i.device
+        batch_size = synced_signals.shape[0]
+        device = synced_signals.device
 
-        # Sample timesteps
-        timesteps = self.sync_model.scheduler.sample_timesteps(batch_size, device)
+        # ===================
+        # DENOISING VALIDATION
+        # ===================
 
-        # Add timing errors to BOTH signals in the pair
-        shifted_i, clean_i, timing_offsets_i, phase_offsets_i = self.sync_model.scheduler.add_sync_errors(x_i, timesteps)
-        shifted_j, clean_j, timing_offsets_j, phase_offsets_j = self.sync_model.scheduler.add_sync_errors(x_j, timesteps)
+        # Test 1: Clean synced signals (sanity check)
+        low_timesteps = torch.full((batch_size,), 50, device=device)
+        slightly_noisy, _ = self.ddpm_scheduler.add_noise(synced_signals, low_timesteps)
 
-        # Predict synchronized signals for BOTH
-        predicted_i = self.sync_model(shifted_i, timesteps)
-        predicted_j = self.sync_model(shifted_j, timesteps)
+        predicted_clean = self.unet(slightly_noisy, low_timesteps)
+        clean_preservation_loss, _ = self.complex_loss(predicted_clean, synced_signals)
 
-        # Complex MSE loss
-        complex_loss_i = self.complex_losses.complex_mse_loss(predicted_i, clean_i)
-        complex_loss_j = self.complex_losses.complex_mse_loss(predicted_j, clean_j)
-        complex_loss = (complex_loss_i + complex_loss_j) / 2
+        # Test 2: Synced signals with added corruptions
+        corrupted_signals, error_info = self.sync_error_generator.apply_sync_errors(synced_signals)
+        high_timesteps = torch.full((batch_size,), 500, device=device)
+        noisy_corrupted, _ = self.ddpm_scheduler.add_noise(corrupted_signals, high_timesteps)
 
-        # Phase loss
-        phase_loss_i = self.complex_losses.circular_phase_loss(predicted_i, clean_i)
-        phase_loss_j = self.complex_losses.circular_phase_loss(predicted_j, clean_j)
-        phase_loss = (phase_loss_i + phase_loss_j) / 2
+        predicted_restored = self.unet(noisy_corrupted, high_timesteps)
+        restoration_loss, _ = self.complex_loss(predicted_restored, synced_signals)
 
-        # Magnitude loss
-        mag_loss_i = self.complex_losses.magnitude_loss(predicted_i, clean_i)
-        mag_loss_j = self.complex_losses.magnitude_loss(predicted_j, clean_j)
-        mag_loss = (mag_loss_i + mag_loss_j) / 2
+        # ===================
+        # CLASSIFICATION VALIDATION (on original unsynced data)
+        # ===================
 
-        # Combined loss
-        total_loss = (
-            self.complex_loss_weight * complex_loss +
-            self.phase_loss_weight * phase_loss +
-            0.1 * mag_loss
-        )
+        # Apply denoiser to original unsynced signals
+        denoised_unsynced = self.denoise_signal(original_unsynced_signals, num_steps=10)
 
-        # Logging
-        self.log('val_complex_loss', complex_loss, prog_bar=True)
-        self.log('val_phase_loss', phase_loss, prog_bar=True)
-        self.log('val_mag_loss', mag_loss)
-        self.log('val_loss', total_loss, prog_bar=True)
+        # Classify the denoised signals
+        class_logits = self.classifier(denoised_unsynced)
+        classification_loss = self.classification_loss(class_logits, labels)
 
-        # Log timing offset statistics for monitoring
-        avg_offset_i = torch.abs(timing_offsets_i).float().mean()
-        avg_offset_j = torch.abs(timing_offsets_j).float().mean()
-        self.log('val_avg_timing_offset_i', avg_offset_i)
-        self.log('val_avg_timing_offset_j', avg_offset_j)
+        # Compute accuracy
+        _, predicted_classes = torch.max(class_logits, 1)
+        classification_accuracy = (predicted_classes == labels).float().mean()
 
-        # Store for visualization (first batch only)
+        # Per-class accuracy
+        for i, class_name in enumerate(self.label_names):
+            class_mask = (labels == i)
+            if class_mask.sum() > 0:
+                class_acc = (predicted_classes[class_mask] == labels[class_mask]).float().mean()
+                self.log(f'val_accuracy_{class_name}', class_acc)
+
+        # Overall validation loss
+        val_loss = (clean_preservation_loss + restoration_loss) / 2
+
+        # ===================
+        # LOGGING
+        # ===================
+
+        self.log('val_loss', val_loss, prog_bar=True)
+        self.log('val_clean_preservation_loss', clean_preservation_loss)
+        self.log('val_restoration_loss', restoration_loss)
+        self.log('val_classification_loss', classification_loss)
+        self.log('val_classification_accuracy', classification_accuracy, prog_bar=True)
+
+        # Store data for visualization (first batch only)
         if batch_idx == 0:
-            # Try to get a diverse set of samples with different PSK types
-            diverse_indices = []
-            labels_np = labels.cpu().numpy()
-
-            # Try to get at least one sample of each PSK type
-            for psk_type in [0, 1, 2]:
-                type_indices = np.where(labels_np == psk_type)[0]
-                if len(type_indices) > 0:
-                    diverse_indices.append(type_indices[0])
-
-            # Fill remaining slots with any available samples
-            while len(diverse_indices) < 4 and len(diverse_indices) < len(labels):
-                for i in range(len(labels)):
-                    if i not in diverse_indices:
-                        diverse_indices.append(i)
-                        if len(diverse_indices) >= 4:
-                            break
-
-            # Ensure we have at least some samples
-            if len(diverse_indices) == 0:
-                diverse_indices = [0, 1, 2, 3] if len(labels) >= 4 else list(range(len(labels)))
-
-            # Take up to 4 diverse samples
-            diverse_indices = diverse_indices[:4]
-
-            # Perform full synchronization on diverse samples
-            synchronized_i, intermediates_i = self.forward(shifted_i[diverse_indices], return_intermediates=True)
-            synchronized_j, intermediates_j = self.forward(shifted_j[diverse_indices], return_intermediates=True)
-
-            # NEW: Also run synchronization on ORIGINAL (undistorted) signals
-            with torch.no_grad():
-                # Take the original clean signals (no timing errors added)
-                clean_originals_i = x_i[diverse_indices]
-                clean_originals_j = x_j[diverse_indices]
-
-                # Run through the synchronization process
-                sync_from_clean_i, clean_intermediates_i = self.forward(clean_originals_i, return_intermediates=True)
-                sync_from_clean_j, clean_intermediates_j = self.forward(clean_originals_j, return_intermediates=True)
-
             self.val_data = {
-                # Store both signal pairs for visualization
-                'original_signals_i': x_i[diverse_indices].detach().cpu(),
-                'original_signals_j': x_j[diverse_indices].detach().cpu(),
-                'shifted_signals_i': shifted_i[diverse_indices].detach().cpu(),
-                'shifted_signals_j': shifted_j[diverse_indices].detach().cpu(),
-                'synchronized_signals_i': synchronized_i.detach().cpu(),
-                'synchronized_signals_j': synchronized_j.detach().cpu(),
-                'intermediates_i': intermediates_i,
-                'intermediates_j': intermediates_j,
-                'labels': labels[diverse_indices].detach().cpu(),
-                'timing_offsets_i': timing_offsets_i[diverse_indices].detach().cpu(),
-                'timing_offsets_j': timing_offsets_j[diverse_indices].detach().cpu(),
-                'phase_offsets_i': phase_offsets_i[diverse_indices].detach().cpu(),
-                'phase_offsets_j': phase_offsets_j[diverse_indices].detach().cpu(),
-                'timesteps': timesteps[diverse_indices].detach().cpu(),
-                'diverse_indices': diverse_indices,
-                # NEW: Add synchronization results from clean signals
-                'sync_from_clean_i': sync_from_clean_i.detach().cpu(),
-                'sync_from_clean_j': sync_from_clean_j.detach().cpu(),
-                'clean_intermediates_i': clean_intermediates_i,
-                'clean_intermediates_j': clean_intermediates_j
+                'original_synced': synced_signals[:4].detach().cpu(),
+                'original_unsynced': original_unsynced_signals[:4].detach().cpu(),
+                'denoised_unsynced': denoised_unsynced[:4].detach().cpu(),
+                'corrupted_signals': corrupted_signals[:4].detach().cpu(),
+                'predicted_restored': predicted_restored[:4].detach().cpu(),
+                'labels': labels[:4].detach().cpu(),
+                'predicted_classes': predicted_classes[:4].detach().cpu(),
+                'class_logits': class_logits[:4].detach().cpu(),
+                'error_info': {k: v[:4] for k, v in error_info.items()}
             }
 
-        return total_loss
+        return val_loss
 
     def on_validation_epoch_end(self):
-        """Create visualization"""
-        self._create_sync_visualization()
+        """Create comprehensive visualization"""
+        self._create_combined_visualization()
 
-    def _create_sync_visualization(self):
-        """Create simplified visualization: clean sync test + 3x3 grid for PSK types"""
+    def _create_combined_visualization(self):
+        """Create visualization showing denoising and classification results"""
         try:
-            fig = plt.figure(figsize=(15, 20))  # Adjusted size for new layout
-
-            # Check if we have validation data
             if not hasattr(self, 'val_data') or self.val_data is None:
-                plt.suptitle(f'No validation data available - Epoch {self.current_epoch}', fontsize=16)
-                plt.tight_layout()
-                if self.logger and hasattr(self.logger, 'experiment'):
-                    self.logger.experiment.log({'time_sync_analysis': wandb.Image(fig)})
-                plt.close(fig)
                 return
 
-            # 1. Clean Signal Synchronization Test (Row 1 - 2 columns only)
-            # Column 1: Original clean signal
-            ax_clean_orig = plt.subplot(5, 3, 1)
-            ax_clean_orig.text(0.5, 0.9, 'Clean Signal Test',
-                            ha='center', va='center', transform=ax_clean_orig.transAxes,
-                            fontsize=14, fontweight='bold')
+            # Create comprehensive visualization
+            fig = plt.figure(figsize=(25, 15))
 
-            # Show first sample's clean signal
-            try:
-                sample_idx = 0
-                label_idx = self.val_data['labels'][sample_idx].item()
-                label_name = self.label_names[label_idx]
+            # Show 4 samples
+            for sample_idx in range(4):
+                true_label_idx = self.val_data['labels'][sample_idx].item()
+                pred_label_idx = self.val_data['predicted_classes'][sample_idx].item()
+
+                true_label_name = self.label_names[true_label_idx]
+                pred_label_name = self.label_names[pred_label_idx]
+
+                # Get class confidence
+                class_probs = F.softmax(self.val_data['class_logits'][sample_idx], dim=0)
+                confidence = class_probs[pred_label_idx].item()
 
                 # Get ideal constellation
-                if label_idx == 0:  # QPSK
+                if true_label_idx == 0:  # QPSK
                     ideal_points = np.array([1+1j, 1-1j, -1+1j, -1-1j]) / np.sqrt(2)
-                elif label_idx == 1:  # 8PSK
+                elif true_label_idx == 1:  # 8PSK
                     angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
                     ideal_points = np.exp(1j * angles)
                 else:  # 16PSK
                     angles = np.linspace(0, 2*np.pi, 16, endpoint=False)
                     ideal_points = np.exp(1j * angles)
 
-                # Original clean signal
-                orig_signal = self.val_data['original_signals_i'][sample_idx]
-                orig_complex = torch.complex(orig_signal[0], orig_signal[1])
-                # subsample_orig = orig_complex[::20]
-                subsample_orig = orig_complex
+                # Row for this sample
+                row = sample_idx
 
-                ax_clean_orig.scatter(subsample_orig.real, subsample_orig.imag,
-                                    alpha=0.8, s=30, c='blue', label='Clean Original')
-                ax_clean_orig.scatter(ideal_points.real, ideal_points.imag,
-                                    c='black', s=120, marker='x', linewidth=4, alpha=0.9)
+                # Column 1: Original unsynced
+                ax1 = plt.subplot(4, 6, row * 6 + 1)
+                unsynced_signal = self.val_data['original_unsynced'][sample_idx]
+                unsynced_complex = torch.complex(unsynced_signal[0], unsynced_signal[1])
 
-                ax_clean_orig.set_title(f'{label_name} - Clean', fontsize=12, fontweight='bold')
-                ax_clean_orig.grid(True, alpha=0.3)
-                ax_clean_orig.set_aspect('equal')
-                ax_clean_orig.set_xlim(-1.5, 1.5)
-                ax_clean_orig.set_ylim(-1.5, 1.5)
+                ax1.scatter(unsynced_complex.real, unsynced_complex.imag, alpha=0.6, s=20, c='red')
+                ax1.scatter(ideal_points.real, ideal_points.imag,
+                          c='black', s=100, marker='x', linewidth=3)
+                ax1.set_title(f'{true_label_name}\nOriginal Unsynced' if row == 0 else 'Original Unsynced')
+                ax1.grid(True, alpha=0.3)
+                ax1.set_aspect('equal')
+                ax1.set_xlim(-1.5, 1.5)
+                ax1.set_ylim(-1.5, 1.5)
 
-            except Exception as e:
-                ax_clean_orig.text(0.5, 0.5, f'Error: {str(e)[:20]}',
-                                ha='center', va='center', transform=ax_clean_orig.transAxes)
+                # Column 2: Denoised from unsynced
+                ax2 = plt.subplot(4, 6, row * 6 + 2)
+                denoised_signal = self.val_data['denoised_unsynced'][sample_idx]
+                denoised_complex = torch.complex(denoised_signal[0], denoised_signal[1])
 
-            # Column 2: Synchronized from clean
-            ax_clean_sync = plt.subplot(5, 3, 2)
-            try:
-                # Synchronized from clean signal
-                sync_from_clean = self.val_data['sync_from_clean_i'][sample_idx]
-                sync_complex = torch.complex(sync_from_clean[0], sync_from_clean[1])
-                subsample_sync = sync_complex
-                # subsample_sync = sync_complex[::20]
+                ax2.scatter(denoised_complex.real, denoised_complex.imag, alpha=0.6, s=20, c='green')
+                ax2.scatter(ideal_points.real, ideal_points.imag,
+                          c='black', s=100, marker='x', linewidth=3)
+                ax2.set_title('Denoised' if row == 0 else '')
+                ax2.grid(True, alpha=0.3)
+                ax2.set_aspect('equal')
+                ax2.set_xlim(-1.5, 1.5)
+                ax2.set_ylim(-1.5, 1.5)
 
-                ax_clean_sync.scatter(subsample_sync.real, subsample_sync.imag,
-                                    alpha=0.8, s=30, c='red', label='After Sync')
-                ax_clean_sync.scatter(ideal_points.real, ideal_points.imag,
-                                    c='black', s=120, marker='x', linewidth=4, alpha=0.9)
+                # Column 3: Original synced (reference)
+                ax3 = plt.subplot(4, 6, row * 6 + 3)
+                synced_signal = self.val_data['original_synced'][sample_idx]
+                synced_complex = torch.complex(synced_signal[0], synced_signal[1])
 
-                # Compute MSE between original and "synchronized" clean
-                orig_clean = self.val_data['original_signals_i'][sample_idx].numpy()
-                sync_clean = self.val_data['sync_from_clean_i'][sample_idx].numpy()
-                mse = np.mean((orig_clean - sync_clean) ** 2)
+                ax3.scatter(synced_complex.real, synced_complex.imag, alpha=0.6, s=20, c='blue')
+                ax3.scatter(ideal_points.real, ideal_points.imag,
+                          c='black', s=100, marker='x', linewidth=3)
+                ax3.set_title('Manual Sync\n(Reference)' if row == 0 else 'Manual Sync')
+                ax3.grid(True, alpha=0.3)
+                ax3.set_aspect('equal')
+                ax3.set_xlim(-1.5, 1.5)
+                ax3.set_ylim(-1.5, 1.5)
 
-                ax_clean_sync.text(0.02, 0.98, f'MSE: {mse:.5f}',
-                                transform=ax_clean_sync.transAxes,
-                                verticalalignment='top',
-                                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
-                                fontsize=10)
+                # Column 4: Corrupted + restoration test
+                ax4 = plt.subplot(4, 6, row * 6 + 4)
+                corrupted_signal = self.val_data['corrupted_signals'][sample_idx]
+                corrupted_complex = torch.complex(corrupted_signal[0], corrupted_signal[1])
 
-                ax_clean_sync.set_title(f'{label_name} - After Sync', fontsize=12, fontweight='bold')
-                ax_clean_sync.grid(True, alpha=0.3)
-                ax_clean_sync.set_aspect('equal')
-                ax_clean_sync.set_xlim(-1.5, 1.5)
-                ax_clean_sync.set_ylim(-1.5, 1.5)
+                ax4.scatter(corrupted_complex.real, corrupted_complex.imag, alpha=0.6, s=20, c='orange')
+                ax4.scatter(ideal_points.real, ideal_points.imag,
+                          c='black', s=100, marker='x', linewidth=3)
+                ax4.set_title('Corrupted' if row == 0 else '')
+                ax4.grid(True, alpha=0.3)
+                ax4.set_aspect('equal')
+                ax4.set_xlim(-1.5, 1.5)
+                ax4.set_ylim(-1.5, 1.5)
 
-            except Exception as e:
-                ax_clean_sync.text(0.5, 0.5, f'Error: {str(e)[:20]}',
-                                ha='center', va='center', transform=ax_clean_sync.transAxes)
+                # Column 5: Restored
+                ax5 = plt.subplot(4, 6, row * 6 + 5)
+                restored_signal = self.val_data['predicted_restored'][sample_idx]
+                restored_complex = torch.complex(restored_signal[0], restored_signal[1])
 
-            # 2. Corrupted Signal Synchronization (Rows 2-4, 3 columns each)
-            # Create 3x3 grid for each PSK type showing: Original → Corrupted → Synchronized
-            psk_sample_map = {}
-            for i, label in enumerate(self.val_data['labels']):
-                label_val = label.item()
-                if label_val not in psk_sample_map and label_val in [0, 1, 2]:
-                    psk_sample_map[label_val] = i
+                ax5.scatter(restored_complex.real, restored_complex.imag, alpha=0.6, s=20, c='purple')
+                ax5.scatter(ideal_points.real, ideal_points.imag,
+                          c='black', s=100, marker='x', linewidth=3)
+                ax5.set_title('Restored' if row == 0 else '')
+                ax5.grid(True, alpha=0.3)
+                ax5.set_aspect('equal')
+                ax5.set_xlim(-1.5, 1.5)
+                ax5.set_ylim(-1.5, 1.5)
 
-            # Ensure we have all PSK types represented
-            for psk_type in [0, 1, 2]:
-                if psk_type not in psk_sample_map:
-                    if len(psk_sample_map) > 0:
-                        psk_sample_map[psk_type] = list(psk_sample_map.values())[0]
-                    else:
-                        psk_sample_map[psk_type] = 0
+                # Column 6: Classification result
+                ax6 = plt.subplot(4, 6, row * 6 + 6)
+                ax6.bar(range(3), class_probs.cpu().numpy(), alpha=0.7)
+                ax6.set_xticks(range(3))
+                ax6.set_xticklabels(self.label_names)
+                ax6.set_ylabel('Probability')
+                ax6.set_title('Classification' if row == 0 else '')
 
-            for row_idx, psk_type in enumerate([0, 1, 2]):  # QPSK, 8PSK, 16PSK
-                sample_idx = psk_sample_map[psk_type]
-                label_name = self.label_names[psk_type]
+                # Highlight prediction
+                correct = (true_label_idx == pred_label_idx)
+                color = 'green' if correct else 'red'
+                ax6.axvline(pred_label_idx, color=color, linewidth=3, alpha=0.7)
 
-                # Get timing and phase offsets for display
-                timing_offset = self.val_data['timing_offsets_i'][sample_idx].item()
-                phase_offset = self.val_data['phase_offsets_i'][sample_idx].item()
-                phase_offset_deg = phase_offset * 180 / np.pi
+                # Add text with prediction
+                ax6.text(0.02, 0.98, f'Pred: {pred_label_name}\nConf: {confidence:.2f}',
+                        transform=ax6.transAxes, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                        fontsize=8)
 
-                # Get ideal constellation points
-                if psk_type == 0:  # QPSK
-                    ideal_points = np.array([1+1j, 1-1j, -1+1j, -1-1j]) / np.sqrt(2)
-                elif psk_type == 1:  # 8PSK
-                    angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
-                    ideal_points = np.exp(1j * angles)
-                else:  # 16PSK
-                    angles = np.linspace(0, 2*np.pi, 16, endpoint=False)
-                    ideal_points = np.exp(1j * angles)
-
-                # Row for this PSK type (rows 2, 3, 4)
-                current_row = row_idx + 2
-
-                # Column 1: Original signal
-                ax_orig = plt.subplot(5, 3, (current_row - 1) * 3 + 1)
-                try:
-                    orig_signal = self.val_data['original_signals_i'][sample_idx]
-                    orig_complex = torch.complex(orig_signal[0], orig_signal[1])
-                    subsample = orig_complex
-                    # subsample = orig_complex[::20]
-
-                    ax_orig.scatter(subsample.real, subsample.imag, alpha=0.7, s=25, c='blue')
-                    ax_orig.scatter(ideal_points.real, ideal_points.imag,
-                                c='black', s=120, marker='x', linewidth=4, alpha=0.9)
-                except Exception as e:
-                    ax_orig.text(0.5, 0.5, 'Error', ha='center', va='center', transform=ax_orig.transAxes)
-
-                if row_idx == 0:
-                    ax_orig.set_title('Original', fontsize=12, fontweight='bold')
-
-                ax_orig.set_ylabel(f'{label_name}', fontsize=12, fontweight='bold')
-                ax_orig.grid(True, alpha=0.3)
-                ax_orig.set_aspect('equal')
-                ax_orig.set_xlim(-1.5, 1.5)
-                ax_orig.set_ylim(-1.5, 1.5)
-
-                # Column 2: Corrupted signal (timing + phase errors)
-                ax_corrupted = plt.subplot(5, 3, (current_row - 1) * 3 + 2)
-                try:
-                    corrupted_signal = self.val_data['shifted_signals_i'][sample_idx]
-                    corrupted_complex = torch.complex(corrupted_signal[0], corrupted_signal[1])
-                    subsample_corrupted = corrupted_complex
-                    # subsample_corrupted = corrupted_complex[::20]
-
-                    ax_corrupted.scatter(subsample_corrupted.real, subsample_corrupted.imag,
-                                    alpha=0.7, s=25, c='red')
-                    ax_corrupted.scatter(ideal_points.real, ideal_points.imag,
-                                    c='black', s=120, marker='x', linewidth=4, alpha=0.9)
-                except Exception as e:
-                    ax_corrupted.text(0.5, 0.5, 'Error', ha='center', va='center', transform=ax_corrupted.transAxes)
-
-                if row_idx == 0:
-                    ax_corrupted.set_title('Corrupted', fontsize=12, fontweight='bold')
-
-                # Add corruption info
-                ax_corrupted.text(0.02, 0.98, f'Time: {timing_offset}\nPhase: {phase_offset_deg:.1f}°',
-                                transform=ax_corrupted.transAxes,
-                                verticalalignment='top',
-                                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
-                                fontsize=8)
-
-                ax_corrupted.grid(True, alpha=0.3)
-                ax_corrupted.set_aspect('equal')
-                ax_corrupted.set_xlim(-1.5, 1.5)
-                ax_corrupted.set_ylim(-1.5, 1.5)
-
-                # Column 3: Synchronized signal
-                ax_sync = plt.subplot(5, 3, (current_row - 1) * 3 + 3)
-                try:
-                    sync_signal = self.val_data['synchronized_signals_i'][sample_idx]
-                    sync_complex = torch.complex(sync_signal[0], sync_signal[1])
-                    # subsample_sync = sync_complex[::20]
-                    subsample_sync = sync_complex
-
-                    ax_sync.scatter(subsample_sync.real, subsample_sync.imag,
-                                alpha=0.7, s=25, c='green')
-                    ax_sync.scatter(ideal_points.real, ideal_points.imag,
-                                c='black', s=120, marker='x', linewidth=4, alpha=0.9)
-
-                    # Compute reconstruction quality
-                    orig_np = self.val_data['original_signals_i'][sample_idx].numpy()
-                    sync_np = sync_signal.numpy()
-                    recon_mse = np.mean((orig_np - sync_np) ** 2)
-
-                    ax_sync.text(0.02, 0.98, f'Recon MSE:\n{recon_mse:.4f}',
-                            transform=ax_sync.transAxes,
-                            verticalalignment='top',
-                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
-                            fontsize=8)
-
-                except Exception as e:
-                    ax_sync.text(0.5, 0.5, 'Error', ha='center', va='center', transform=ax_sync.transAxes)
-
-                if row_idx == 0:
-                    ax_sync.set_title('Synchronized', fontsize=12, fontweight='bold')
-
-                ax_sync.grid(True, alpha=0.3)
-                ax_sync.set_aspect('equal')
-                ax_sync.set_xlim(-1.5, 1.5)
-                ax_sync.set_ylim(-1.5, 1.5)
+            plt.suptitle(f'PSK Denoising & Classification - Epoch {self.current_epoch}', fontsize=16)
             plt.tight_layout()
 
             if self.logger and hasattr(self.logger, 'experiment'):
-                self.logger.experiment.log({'time_sync_analysis': wandb.Image(fig)})
+                self.logger.experiment.log({'psk_denoising_classification': wandb.Image(fig)})
 
             plt.close(fig)
 
@@ -820,19 +838,15 @@ class PSKDiscriminator(L.LightningModule):
             import traceback
             traceback.print_exc()
 
-            # Create a simple error plot
-            fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-            ax.text(0.5, 0.5, f'Visualization Error: {str(e)}',
-                ha='center', va='center', transform=ax.transAxes, fontsize=14)
-            ax.set_title(f'Visualization Error - Epoch {self.current_epoch}')
-
-            if self.logger and hasattr(self.logger, 'experiment'):
-                self.logger.experiment.log({'time_sync_analysis': wandb.Image(fig)})
-
-            plt.close(fig)
-
     def configure_optimizers(self):
-        optimizer = AdamW(self.parameters(), lr=self.hparams.learning_rate, weight_decay=1e-4)
+        # Use different learning rates for denoiser and classifier
+        denoiser_params = list(self.unet.parameters()) + list(self.complex_loss.parameters())
+        classifier_params = list(self.classifier.parameters())
+
+        optimizer = AdamW([
+            {'params': denoiser_params, 'lr': self.hparams.learning_rate},
+            {'params': classifier_params, 'lr': self.hparams.learning_rate * 0.1}  # Lower LR for classifier
+        ], weight_decay=1e-4)
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,

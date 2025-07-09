@@ -1,6 +1,8 @@
 import torch
+from scipy import signal
 import h5py
 import random
+from matplotlib import pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from torch.utils.data import random_split
@@ -16,58 +18,195 @@ class RFMLDataset(Dataset):
         dataPath="/home/hshayde/Projects/MIT/AMR/Dataset/RML2016.10a_dict.pkl",
         data=2018,
         iq=False,
+        sync=False
     ):
         # Data in the shape of dict[('Mod_type','snr')] = [1000,2,128]
         if data == 2018:
-            data = self._load_2018_data()
+            data = self._load_2018_data(sync)
         else:
             data = self._load_data(dataPath)
 
         # Convert data to tensors and split
         self.samples = []
+        self.sync_samples = []
         self.labels = []
         self.snr = []
         self.encoded_hash = {}
-        for (mod_type, snr), signals in data.items():
-            if type(signals) == list:
-                signals = torch.from_numpy(
-                    np.array(signals)
-                ).float()  # signals shape: [1000, 2, 128]
+
+        # Remove the pdb line for production
+        # import pdb; pdb.set_trace()
+
+        for (mod_type, snr_val), signal_data in data.items():
+            if sync:
+                # When sync=True, signal_data is a list of tuples: [(synced, original), ...]
+                sync_signals_list = []
+                original_signals_list = []
+
+                for sync_sig, orig_sig in signal_data:
+                    sync_signals_list.append(sync_sig)
+                    original_signals_list.append(orig_sig)
+
+                # Convert to tensors
+                sync_signals = torch.from_numpy(np.array(sync_signals_list)).float()
+                original_signals = torch.from_numpy(np.array(original_signals_list)).float()
+
             else:
-                signals = torch.from_numpy(
-                    signals
-                ).float()  # signals shape: [1000, 2, 128]
+                # When sync=False, signal_data is a list of arrays: [signal, signal, ...]
+                original_signals = torch.from_numpy(np.array(signal_data)).float()
+                sync_signals = original_signals  # Same as original when no sync data
+
             mod_label = mod_type
+
             # Normalize all signals at once
             if iq:
-                processed_signals = self._normalize_data(
-                    signals
-                )  # Now shape: [1000, 2, 128]
+                processed_original = self._normalize_data(original_signals)
+                processed_sync = self._normalize_data(sync_signals)
             else:
                 # Convert to amplitude/phase for all signals at once
-                processed_signals = self._process_signals(signals)
+                processed_original = self._process_signals(original_signals)
+                processed_sync = self._process_signals(sync_signals)
 
             # Extend lists with all samples at once
-            self.samples.extend(list(processed_signals))
-            labels = [self._encode_labels(mod_label)] * signals.shape[0]
-            self.labels.extend(labels)
-            self.snr.extend([snr] * signals.shape[0])
+            self.samples.extend(list(processed_original))
+            self.sync_samples.extend(list(processed_sync))
 
-            # create decoded hash to convert back
-            self._decode_labels(self)
+            labels = [self._encode_labels(mod_label)] * original_signals.shape[0]
+            self.labels.extend(labels)
+            self.snr.extend([snr_val] * original_signals.shape[0])
+
+        # create decoded hash to convert back
+        self._decode_labels(self)
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return self.samples[idx], self.labels[idx], self.snr[idx]
+        return self.sync_samples[idx], self.samples[idx], self.labels[idx], self.snr[idx]
 
     def _load_data(self, dataPath):
         with open(dataPath, "rb") as f:
             data = pickle.load(f, encoding="latin")
         return data
 
-    def _load_2018_data(self):
+
+    def _sync(self, x, mod_type, plot=False):
+        # Convert (2, 1024) to complex: x[0] = real, x[1] = imag
+        # Convert to complex
+        x_complex = x[0] + 1j * x[1]
+
+        # Modulation-specific parameters
+        mod_params = {
+            'QPSK':  {'sps': 8, 'mod_order': 4, 'costas_bw': 0.01,  'costas_damp': 0.707},
+            '8PSK':  {'sps': 8, 'mod_order': 8, 'costas_bw': 0.005, 'costas_damp': 0.707},
+            '16PSK': {'sps': 8, 'mod_order': 16, 'costas_bw': 0.0025, 'costas_damp': 0.707},
+        }
+        assert mod_type in mod_params, f"Unsupported modulation: {mod_type}"
+        params = mod_params[mod_type]
+        sps, mod_order = params['sps'], params['mod_order']
+
+        def mm_timing_sync(samples, sps, gain=0.3, modulation_order=4):
+            mu = 0.0
+            N = len(samples)
+            out = np.zeros(N + 10, dtype=np.complex64)
+            out_rail = np.zeros_like(out)
+            i_in = 0
+            i_out = 2
+            sps_up = sps * 16
+            constellation = np.exp(1j * 2 * np.pi * np.arange(modulation_order) / modulation_order)
+
+            while (i_out < N) and (i_in + sps_up < N):
+                idx = int(i_in + mu)
+                frac = mu - int(mu)
+                s0 = samples[idx]
+                s1 = samples[idx + 1]
+                sample = s0 * (1 - frac) + s1 * frac
+
+                out[i_out] = sample
+                out_rail[i_out] = constellation[np.argmin(np.abs(sample - constellation))]
+
+                x_err = (out_rail[i_out] - out_rail[i_out - 2]) * np.conj(out[i_out - 1])
+                y_err = (out[i_out] - out[i_out - 2]) * np.conj(out_rail[i_out - 1])
+                mm_val = np.real(y_err - x_err)
+
+                mu += sps_up + gain * mm_val
+                i_in += int(mu)
+                mu = mu - int(mu)
+                i_out += 1
+
+            return out[2:i_out]
+
+        def costas_loop(signal, loop_bandwidth, damping_factor, modulation_order):
+            N = len(signal)
+            phase_est = 0.0
+            freq_est = 0.0
+            output = np.zeros(N, dtype=np.complex64)
+            theta = loop_bandwidth / (damping_factor + 0.25 / damping_factor)
+            d = 1 + 2 * damping_factor * theta + theta**2
+            alpha = (4 * damping_factor * theta) / d
+            beta = (4 * theta**2) / d
+            constellation = np.exp(1j * 2 * np.pi * np.arange(modulation_order) / modulation_order)
+
+            for n in range(N):
+                corrected = signal[n] * np.exp(-1j * phase_est)
+                output[n] = corrected
+                nearest = constellation[np.argmin(np.abs(corrected - constellation))]
+                error = np.angle(corrected * np.conj(nearest))
+                freq_est += beta * error
+                phase_est += freq_est + alpha * error
+
+            return output
+
+
+        # Step 1: interpolate for M&M
+        x_interp = signal.resample_poly(x_complex, up=16, down=1)
+
+        # Step 2: M&M timing sync
+        x_mm = mm_timing_sync(x_interp, sps=8, modulation_order=mod_order)
+
+        # Step 3: Costas loop carrier sync
+        x_costa = costas_loop(
+            x_mm,
+            loop_bandwidth=params['costas_bw'],
+            damping_factor=params['costas_damp'],
+            modulation_order=mod_order
+        )
+
+        # Step 4: resample to original 1024
+        x_sync = signal.resample(x_costa, 1024)
+
+        # Optional: plot synced constellation
+        if plot:
+            plt.figure(figsize=(15, 5))
+
+            # Plot original unsynced signal
+            plt.subplot(1, 3, 1)
+            plt.scatter(x_complex.real, x_complex.imag, s=2, alpha=0.6)
+            plt.title(f'{mod_type} - Original Unsynced')
+            plt.grid(True)
+            plt.axis('equal')
+
+            # Plot upsampled synced signal (x_mm or x_costas - pick Costas output here)
+            plt.subplot(1, 3, 2)
+            plt.scatter(x_costa.real, x_costa.imag, s=2, alpha=0.6)
+            plt.title(f'{mod_type} - Upsampled Synced (After Costas)')
+            plt.grid(True)
+            plt.axis('equal')
+
+            # Plot final synced and resampled back to 1024
+            plt.subplot(1, 3, 3)
+            plt.scatter(x_sync.real, x_sync.imag, s=2, alpha=0.6)
+            plt.title(f'{mod_type} - Synced & Resampled (1024 samples)')
+            plt.grid(True)
+            plt.axis('equal')
+
+            plt.tight_layout()
+            plt.show()
+
+        # Step 5: convert to (2, 1024)
+        return np.stack([x_sync.real, x_sync.imag], axis=0)
+
+
+    def _load_2018_data(self, sync):
         classes = [
             "OOK",
             "4ASK",
@@ -110,23 +249,51 @@ class RFMLDataset(Dataset):
         #     "GMSK",
         # ]
         choosen_classes = ["QPSK", "8PSK", "16PSK"]
-        min_snr_level = 0
-        with h5py.File(data_path, "r") as f:
-            X = f["X"][:]  # [num_samples, 2, signal_length]
-            Y = f["Y"][:]  # [num_samples]
-            Z = f["Z"][:]  # [num_samples]
-            # Decode byte labels to string if necessary
-            if isinstance(Y[0], bytes):
-                Y = [y.decode("utf-8") for y in Y]
-            for x, y, z in tqdm(zip(X, Y, Z)):
-                if classes[np.argmax(y)] in choosen_classes and int(z) >= min_snr_level:
-                    key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
-                    if key not in data_dict:
-                        data_dict[key] = []
-                    data_dict[key].append(x.T)  # transpose so channels x features
-        print(f"Total keys created: {len(data_dict)}")
-        total_samples = sum(len(v) for v in data_dict.values())
-        print(f"Total signals stored: {total_samples}")
+        min_snr_level = -5
+        if sync: # load synchronized data, should be a dict of synchonized data
+            sync_data_path = '/home/hshayde/Projects/MIT/AMR/Dataset/sync_data.pkl'
+            if not os.path.exists(sync_data_path):
+                print(f"Synchronized data file not found at {sync_data_path}, creating the data and syncing manually")
+                # If we dont have sync we can load from memory
+                with h5py.File(data_path, "r") as f:
+                    X = f["X"][:]  # [num_samples, 2, signal_length]
+                    Y = f["Y"][:]  # [num_samples]
+                    Z = f["Z"][:]  # [num_samples]
+                    # Decode byte labels to string if necessary
+                    if isinstance(Y[0], bytes):
+                        Y = [y.decode("utf-8") for y in Y]
+                    for x, y, z in tqdm(zip(X, Y, Z)):
+                        if classes[np.argmax(y)] in choosen_classes and int(z) >= min_snr_level:
+                            key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
+                            if key not in data_dict:
+                                data_dict[key] = []
+                            data_dict[key].append((self._sync(x.T, key[0]), x.T))  # transpose so channels x features
+                with open(sync_data_path, 'wb') as f:
+                    print('Saving synced data into new file')
+                    pickle.dump(data_dict, f)
+            else: # load the sync data
+                print(f' Loading synced Data')
+                with open(sync_data_path, 'rb') as f:
+                    data_dict = pickle.load(f)
+
+        else: #  Load unsync'd data
+            # If we dont have sync we can load from memory
+            with h5py.File(data_path, "r") as f:
+                X = f["X"][:]  # [num_samples, 2, signal_length]
+                Y = f["Y"][:]  # [num_samples]
+                Z = f["Z"][:]  # [num_samples]
+                # Decode byte labels to string if necessary
+                if isinstance(Y[0], bytes):
+                    Y = [y.decode("utf-8") for y in Y]
+                for x, y, z in tqdm(zip(X, Y, Z)):
+                    if classes[np.argmax(y)] in choosen_classes and int(z) >= min_snr_level:
+                        key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
+                        if key not in data_dict:
+                            data_dict[key] = []
+                        data_dict[key].append(x.T)  # transpose so channels x features
+                print(f"Total keys created: {len(data_dict)}")
+                total_samples = sum(len(v) for v in data_dict.values())
+                print(f"Total signals stored: {total_samples}")
         return data_dict
 
     def _encode_labels(self, label):
@@ -191,7 +358,7 @@ class RFMLDataset(Dataset):
 
 def get_dataloaders(config):
     # Create full dataset
-    full_dataset = RFMLDataset(data=config.data, iq=config.iq)
+    full_dataset = RFMLDataset(data=config.data, iq=config.iq, sync=config.sync)
 
     # Get parameters from config
     batch_size = config.batch_size
