@@ -58,7 +58,7 @@ data_dir: data/
 #         _target_: models.latent_encoder_models.decoder.Decoder1D
 
 Encoder:
-    _target_: models.latent_encoder_models.psk.PSKDenoiser
+    _target_: models.latent_encoder_models.psk.PSKDenoisingClassifier
     learning_rate: .0001
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
