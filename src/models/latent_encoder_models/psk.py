@@ -9,6 +9,42 @@ import wandb
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import math
+class PSKDiscriminator(nn.Module):
+    """Simple discriminator to ensure denoised signals look like valid PSK constellations"""
+
+    def __init__(self, signal_length: int = 1024):
+        super().__init__()
+
+        # Process I/Q channels
+        self.conv_layers = nn.Sequential(
+            nn.Conv1d(2, 64, kernel_size=15, stride=2, padding=7),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(64, 128, kernel_size=15, stride=2, padding=7),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(128, 256, kernel_size=15, stride=2, padding=7),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2),
+            nn.AdaptiveAvgPool1d(16)
+        )
+
+        self.fc = nn.Sequential(
+            nn.Linear(256 * 16, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: [batch, 2, signal_length] I/Q signal
+        Returns:
+            validity: [batch, 1] real/fake score
+        """
+        features = self.conv_layers(x)
+        features = features.view(features.size(0), -1)
+        validity = self.fc(features)
+        return validity
 
 class DDPMScheduler(nn.Module):
     """Standard DDPM scheduler for AWGN noise"""
@@ -218,109 +254,74 @@ class SimplifiedReconstructionLoss(nn.Module):
         aligned = pred_c * phase_corr
         return torch.stack([aligned.real, aligned.imag], dim=1)
 
-class ResidualBlock(nn.Module):
-    """Basic residual block for 1D convolutions"""
-
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
+class SELayer(nn.Module):
+    def __init__(self, channels, reduction=16):
         super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(channels // reduction, channels, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return x * self.fc(x)
 
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=kernel_size//2)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=kernel_size//2)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-
-        # Shortcut connection
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
-                nn.BatchNorm1d(out_channels)
-            )
+class DilatedSEBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, dilation):
+        super().__init__()
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=3,
+                              padding=dilation, dilation=dilation)
+        self.bn = nn.BatchNorm1d(out_ch)
+        self.se = SELayer(out_ch)
+        self.act = nn.ReLU(inplace=True)
+        self.residual = (in_ch == out_ch)
 
     def forward(self, x):
-        residual = x
+        y = self.conv(x)
+        y = self.bn(y)
+        y = self.se(y)
+        if self.residual:
+            y = y + x
+        return self.act(y)
 
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-
-        out += self.shortcut(residual)
-        out = F.relu(out)
-
-        return out
-
-class ResidualStack(nn.Module):
-    """Stack of residual blocks with downsampling"""
-
-    def __init__(self, in_channels: int, out_channels: int, num_blocks: int, stride: int = 2):
+class XVectorPool(nn.Module):
+    def __init__(self, in_ch):
         super().__init__()
-
-        layers = []
-        # First block handles dimension change
-        layers.append(ResidualBlock(in_channels, out_channels, stride=stride))
-
-        # Remaining blocks maintain dimensions
-        for _ in range(num_blocks - 1):
-            layers.append(ResidualBlock(out_channels, out_channels))
-
-        self.layers = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool1d(1)
 
     def forward(self, x):
-        return self.layers(x)
+        # Statistics pooling: avg + std, concatenated
+        mu = self.pool(x).squeeze(-1)
+        sigma = torch.sqrt(torch.var(x, dim=2) + 1e-9)
+        return torch.cat([mu, sigma], dim=1)
 
-class PSKResNetClassifier(nn.Module):
-    """ResNet-based classifier for PSK signals"""
-
-    def __init__(self, input_channels: int = 2, num_classes: int = 3, input_length: int = 1024):
+class DilatedSE_XVector(nn.Module):
+    def __init__(self, in_ch=2, num_classes=24):
         super().__init__()
+        chs = [64, 128, 256]
+        self.block1 = DilatedSEBlock(in_ch, chs[0], dilation=1)
+        self.pool1 = nn.MaxPool1d(4)
+        self.block2 = DilatedSEBlock(chs[0], chs[1], dilation=2)
+        self.pool2 = nn.MaxPool1d(4)
+        self.block3 = DilatedSEBlock(chs[1], chs[2], dilation=4)
+        self.pool3 = nn.MaxPool1d(4)
 
-        self.input_length = input_length
-
-        # Initial convolution to get to 32 channels
-        self.initial_conv = nn.Conv1d(input_channels, 32, kernel_size=7, stride=2, padding=3)
-        self.initial_bn = nn.BatchNorm1d(32)
-
-        # Residual stacks following the paper architecture
-        # Input: 2 × 1024 → 32 × 512 (after initial conv)
-        self.stack1 = ResidualStack(32, 32, num_blocks=2, stride=1)   # 32 × 512
-        self.stack2 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 256
-        self.stack3 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 128
-        self.stack4 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 64
-        self.stack5 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 32
-        self.stack6 = ResidualStack(32, 32, num_blocks=2, stride=2)   # 32 × 16
-
-        # Global average pooling
-        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
-
-        # Fully connected layers
-        self.fc1 = nn.Linear(32, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, num_classes)
-
-        # Activation function (SeLU as specified in paper)
-        self.selu = nn.SELU()
+        self.xvector = XVectorPool(chs[2])
+        self.classifier = nn.Sequential(
+            nn.Linear(chs[2] * 2, chs[2]),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(chs[2], num_classes)
+        )
 
     def forward(self, x):
-        # Initial convolution
-        x = F.relu(self.initial_bn(self.initial_conv(x)))
+        x = self.pool1(self.block1(x))
+        x = self.pool2(self.block2(x))
+        x = self.pool3(self.block3(x))
+        x = self.xvector(x)
+        return self.classifier(x)
 
-        # Residual stacks
-        x = self.stack1(x)
-        x = self.stack2(x)
-        x = self.stack3(x)
-        x = self.stack4(x)
-        x = self.stack5(x)
-        x = self.stack6(x)
-
-        # Global average pooling
-        x = self.global_avg_pool(x)
-        x = x.view(x.size(0), -1)
-
-        # Fully connected layers
-        x = self.selu(self.fc1(x))
-        x = self.selu(self.fc2(x))
-        x = self.fc3(x)  # No activation here, will apply softmax in loss
-
-        return x
 
 class PSKDenoisingClassifier(L.LightningModule):
     """Simplified PSK Denoiser and Classifier with baseline losses"""
@@ -339,7 +340,10 @@ class PSKDenoisingClassifier(L.LightningModule):
         amp_weight=0.3,
         align_global_phase=True,
         classification_weight: float = 1.0,
-        warmup_epochs: int = 3,
+        warmup_epochs: int = 5,
+        # ADD THESE ADVERSARIAL PARAMETERS
+        use_adversarial: bool = True,
+        adversarial_weight: float = 0.1,
         **kwargs
     ):
         super().__init__()
@@ -349,6 +353,10 @@ class PSKDenoisingClassifier(L.LightningModule):
         self.label_names = ['QPSK', '8PSK', '16PSK']
         self.num_classes = 3
         self.warmup_epochs = warmup_epochs
+
+        # ADD THESE LINES
+        self.use_adversarial = use_adversarial
+        self.adversarial_weight = adversarial_weight
 
         # Core components
         self.unet = unet
@@ -361,7 +369,7 @@ class PSKDenoisingClassifier(L.LightningModule):
             sample_rate=sample_rate
         )
 
-        # Simplified reconstruction loss: Complex MSE + Cosine Similarity
+        # Simplified reconstruction loss
         self.reconstruction_loss = SimplifiedReconstructionLoss(
             complex_mse_weight=complex_mse_weight,
             phase_weight=phase_weight,
@@ -371,17 +379,19 @@ class PSKDenoisingClassifier(L.LightningModule):
         )
 
         # ResNet classifier
-        self.classifier = PSKResNetClassifier(
-            input_channels=2,
+        self.classifier = DilatedSE_XVector(
+            in_ch=2,
             num_classes=self.num_classes,
-            input_length=signal_length
         )
 
         # Classification loss
         self.classification_loss = nn.CrossEntropyLoss()
-
-        # Classification weight schedule
         self.classification_weight = classification_weight
+
+        # ADD ADVERSARIAL COMPONENTS
+        if self.use_adversarial:
+            self.discriminator = PSKDiscriminator(signal_length=signal_length)
+            self.adversarial_loss = nn.BCEWithLogitsLoss()
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Forward pass: predict clean signal from corrupted signal"""
@@ -414,22 +424,18 @@ class PSKDenoisingClassifier(L.LightningModule):
 
         return current_signal
 
-    def get_current_classification_weight(self) -> float:
-        """Get current classification weight based on training progress"""
-        if self.current_epoch < self.warmup_epochs:
-            return 0.0
-        else:
-            # Gradually increase classification weight
-            progress = (self.current_epoch - self.warmup_epochs) / max(1, self.trainer.max_epochs - self.warmup_epochs)
-            return self.classification_weight * min(1.0, progress * 2)
-
     def training_step(self, batch, batch_idx):
-        optimizer = self.optimizers()
-        scheduler = self.lr_schedulers()
+        # Get optimizers
+        optimizers = self.optimizers()
+        if self.use_adversarial:
+            opt_denoise, opt_disc = optimizers
+            scheduler_denoise, scheduler_disc = self.lr_schedulers()
+        else:
+            opt_denoise = optimizers
+            scheduler_denoise = self.lr_schedulers()
 
         # Handle the new 4-value batch format
         synced_signals, original_unsynced_signals, labels, snrs = batch
-
         batch_size = synced_signals.shape[0]
         device = synced_signals.device
 
@@ -437,7 +443,7 @@ class PSKDenoisingClassifier(L.LightningModule):
         # DENOISING TRAINING
         # ===================
 
-        # Sample timesteps for DDPM (keep random for denoising training)
+        # Sample timesteps for DDPM
         timesteps = self.ddpm_scheduler.sample_timesteps(batch_size, device)
 
         # Step 1: Add random synchronization errors to clean synced signals
@@ -453,21 +459,58 @@ class PSKDenoisingClassifier(L.LightningModule):
         reconstruction_loss_total, loss_components = self.reconstruction_loss(predicted_clean, synced_signals)
 
         # ===================
-        # CLASSIFICATION TRAINING (on original unsynced data with SNR-aware denoising)
+        # DISCRIMINATOR TRAINING (if using adversarial)
+        # ===================
+
+        disc_loss = torch.tensor(0.0, device=device)
+        gen_adversarial_loss = torch.tensor(0.0, device=device)
+        real_validity_mean = torch.tensor(0.0, device=device)
+        fake_validity_mean = torch.tensor(0.0, device=device)
+
+        if self.use_adversarial:
+            # --- Train Discriminator ---
+            opt_disc.zero_grad()
+
+            # Real samples (clean synced signals)
+            real_validity = self.discriminator(synced_signals)
+            real_labels = torch.ones_like(real_validity)
+
+            # Fake samples (denoised signals) - detach to not backprop through generator
+            fake_validity = self.discriminator(predicted_clean.detach())
+            fake_labels = torch.zeros_like(fake_validity)
+
+            # Discriminator loss
+            disc_loss = (self.adversarial_loss(real_validity, real_labels) +
+                        self.adversarial_loss(fake_validity, fake_labels)) / 2
+
+            self.manual_backward(disc_loss)
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+            opt_disc.step()
+            if scheduler_disc is not None:
+                scheduler_disc.step()
+
+            # --- Generator adversarial loss (make denoised signals look real) ---
+            fake_validity_for_gen = self.discriminator(predicted_clean)
+            gen_adversarial_loss = self.adversarial_loss(fake_validity_for_gen, real_labels)
+
+            # Store metrics for logging
+            real_validity_mean = real_validity.mean()
+            fake_validity_mean = fake_validity.mean()
+
+        # ===================
+        # CLASSIFICATION TRAINING (ONLY AFTER WARMUP)
         # ===================
 
         classification_loss = torch.tensor(0.0, device=device)
         classification_accuracy = torch.tensor(0.0, device=device)
 
-        current_class_weight = self.get_current_classification_weight()
+        # Check if we're past warmup epochs
+        use_classifier = (self.current_epoch >= self.warmup_epochs) and (self.classification_weight > 0)
+        current_class_weight = self.classification_weight if use_classifier else 0.0
 
-        if current_class_weight > 0:
-            # Apply SNR-aware denoising to original unsynced signals (same as validation)
-            with torch.no_grad():
-                denoised_unsynced = self.adaptive_denoise_signal(original_unsynced_signals, snrs, num_steps=5)
-
-            # Classify the denoised signals
-            class_logits = self.classifier(denoised_unsynced)
+        if use_classifier:
+            # Train classifier on the denoised clean signal
+            class_logits = self.classifier(predicted_clean)
             classification_loss = self.classification_loss(class_logits, labels)
 
             # Compute accuracy
@@ -475,19 +518,29 @@ class PSKDenoisingClassifier(L.LightningModule):
             classification_accuracy = (predicted_classes == labels).float().mean()
 
         # ===================
-        # COMBINED LOSS
+        # COMBINED LOSS FOR GENERATOR/DENOISER
         # ===================
 
-        total_loss = reconstruction_loss_total + current_class_weight * classification_loss
+        total_loss = reconstruction_loss_total
 
-        # Backpropagation
-        optimizer.zero_grad()
+        if self.use_adversarial:
+            total_loss += self.adversarial_weight * gen_adversarial_loss
+
+        if use_classifier:
+            total_loss += current_class_weight * classification_loss
+
+        # Backpropagation for main model (generator/denoiser/classifier)
+        opt_denoise.zero_grad()
         self.manual_backward(total_loss)
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-        optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.unet.parameters(), max_norm=1.0)
 
-        if scheduler is not None:
-            scheduler.step()
+        # Only clip classifier gradients if we're using it
+        if use_classifier:
+            torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), max_norm=1.0)
+
+        opt_denoise.step()
+        if scheduler_denoise is not None:
+            scheduler_denoise.step()
 
         # ===================
         # LOGGING
@@ -498,41 +551,39 @@ class PSKDenoisingClassifier(L.LightningModule):
         self.log('train_reconstruction_loss', reconstruction_loss_total)
         self.log('train_classification_loss', classification_loss)
         self.log('train_classification_accuracy', classification_accuracy, prog_bar=True)
-        self.log('train_classification_weight', current_class_weight)
+        self.log('train_classifier_active', float(use_classifier), prog_bar=True)
+
+        # Adversarial metrics
+        if self.use_adversarial:
+            self.log('train_disc_loss', disc_loss, prog_bar=True)
+            self.log('train_gen_adv_loss', gen_adversarial_loss)
+            self.log('train_real_validity', real_validity_mean)
+            self.log('train_fake_validity', fake_validity_mean)
+            self.log('train_disc_accuracy', ((real_validity > 0).float().mean() + (fake_validity < 0).float().mean()) / 2)
 
         # Individual reconstruction loss components
         for name, loss_val in loss_components.items():
             self.log(f'train_{name}_loss', loss_val)
 
-        # Corruption statistics
-        avg_timing_offset = np.mean([abs(x) for x in error_info['timing_offsets']])
-        avg_phase_offset = np.mean(error_info['phase_offsets'])
-        avg_freq_offset = np.mean([abs(x) for x in error_info['freq_offsets']])
+        # Power monitoring for collapse detection
+        pred_power = torch.mean(torch.abs(torch.complex(predicted_clean[:, 0], predicted_clean[:, 1])) ** 2)
+        target_power = torch.mean(torch.abs(torch.complex(synced_signals[:, 0], synced_signals[:, 1])) ** 2)
+        self.log('train_pred_power', pred_power)
+        self.log('train_target_power', target_power)
+        self.log('train_power_ratio', pred_power / (target_power + 1e-8))
 
-        self.log('train_avg_timing_offset', avg_timing_offset)
-        self.log('train_avg_phase_offset', avg_phase_offset)
-        self.log('train_avg_freq_offset', avg_freq_offset)
+        # Classification training statistics (only log if classifier is active)
+        if use_classifier:
+            # Per-class accuracy on denoised clean signals
+            for i, class_name in enumerate(self.label_names):
+                class_mask = (labels == i)
+                if class_mask.sum() > 0:
+                    class_acc = (predicted_classes[class_mask] == labels[class_mask]).float().mean()
+                    self.log(f'train_accuracy_{class_name}', class_acc)
 
-        # SNR-aware training statistics
-        if current_class_weight > 0:
-            # Log SNR statistics for training
-            self.log('train_avg_snr', snrs.float().mean())
-            self.log('train_min_snr', snrs.float().min())
-            self.log('train_max_snr', snrs.float().max())
-
-            # Log assigned timesteps for classification training
-            assigned_timesteps = self.snr_to_timestep(snrs)
-            self.log('train_avg_assigned_timestep', assigned_timesteps.float().mean())
-            self.log('train_min_assigned_timestep', assigned_timesteps.float().min())
-            self.log('train_max_assigned_timestep', assigned_timesteps.float().max())
-
-            # SNR-based accuracy analysis during training
-            snr_ranges = [(-20, -10), (-10, 0), (0, 10), (10, 20), (20, 30)]
-            for snr_min, snr_max in snr_ranges:
-                snr_mask = (snrs >= snr_min) & (snrs < snr_max)
-                if snr_mask.sum() > 0:
-                    snr_acc = (predicted_classes[snr_mask] == labels[snr_mask]).float().mean()
-                    self.log(f'train_accuracy_snr_{snr_min}to{snr_max}', snr_acc)
+        # Log warmup status
+        self.log('train_warmup_epoch', float(self.current_epoch < self.warmup_epochs))
+        self.log('train_current_epoch', float(self.current_epoch))
 
         return total_loss
 
@@ -558,7 +609,7 @@ class PSKDenoisingClassifier(L.LightningModule):
         timesteps = 950 - (snr_clamped + 20) * (900 / 50)
 
         # Round to integers and clamp to valid range
-        timesteps = torch.clamp(timesteps.round().long(), 50, 950)
+        timesteps = torch.clamp(timesteps.round().long(), 1, 950)
 
         return timesteps
 
@@ -608,7 +659,6 @@ class PSKDenoisingClassifier(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         # Handle the new 4-value batch format
         synced_signals, original_unsynced_signals, labels, snrs = batch
-
         batch_size = synced_signals.shape[0]
         device = synced_signals.device
 
@@ -617,7 +667,6 @@ class PSKDenoisingClassifier(L.LightningModule):
         # ===================
 
         # Test 1: Clean synced signals (sanity check)
-        # For clean signals, use low timesteps (light denoising)
         low_timesteps = torch.full((batch_size,), 50, device=device)
         slightly_noisy, _ = self.ddpm_scheduler.add_noise(synced_signals, low_timesteps)
 
@@ -626,8 +675,6 @@ class PSKDenoisingClassifier(L.LightningModule):
 
         # Test 2: Synced signals with added corruptions
         corrupted_signals, error_info = self.sync_error_generator.apply_sync_errors(synced_signals)
-
-        # Use medium timesteps for artificially corrupted signals
         medium_timesteps = torch.full((batch_size,), 500, device=device)
         noisy_corrupted, _ = self.ddpm_scheduler.add_noise(corrupted_signals, medium_timesteps)
 
@@ -635,11 +682,34 @@ class PSKDenoisingClassifier(L.LightningModule):
         restoration_loss, restoration_loss_components = self.reconstruction_loss(predicted_restored, synced_signals)
 
         # ===================
-        # SNR-AWARE CLASSIFICATION VALIDATION (on original unsynced data)
+        # ADVERSARIAL VALIDATION
         # ===================
 
-        # Apply SNR-aware denoising to original unsynced signals (same as training)
-        denoised_unsynced = self.adaptive_denoise_signal(original_unsynced_signals, snrs, num_steps=10)
+        disc_loss_val = torch.tensor(0.0, device=device)
+        real_validity_val = torch.tensor(0.0, device=device)
+        fake_validity_val = torch.tensor(0.0, device=device)
+
+        if self.use_adversarial:
+            with torch.no_grad():
+                # Evaluate discriminator on validation data
+                real_validity = self.discriminator(synced_signals)
+                fake_validity = self.discriminator(predicted_restored)
+
+                real_labels = torch.ones_like(real_validity)
+                fake_labels = torch.zeros_like(fake_validity)
+
+                disc_loss_val = (self.adversarial_loss(real_validity, real_labels) +
+                            self.adversarial_loss(fake_validity, fake_labels)) / 2
+
+                real_validity_val = real_validity.mean()
+                fake_validity_val = fake_validity.mean()
+
+        # ===================
+        # CLASSIFICATION VALIDATION
+        # ===================
+
+        # Apply SNR-aware denoising to original unsynced signals
+        denoised_unsynced = self.adaptive_denoise_signal(original_unsynced_signals, snrs, num_steps=1)
 
         # Classify the adaptively denoised signals
         class_logits = self.classifier(denoised_unsynced)
@@ -677,19 +747,20 @@ class PSKDenoisingClassifier(L.LightningModule):
         self.log('val_classification_loss', classification_loss)
         self.log('val_classification_accuracy', classification_accuracy, prog_bar=True)
 
+        # Adversarial validation metrics
+        if self.use_adversarial:
+            self.log('val_disc_loss', disc_loss_val)
+            self.log('val_real_validity', real_validity_val)
+            self.log('val_fake_validity', fake_validity_val)
+
         # Log SNR statistics
         self.log('val_avg_snr', snrs.float().mean())
         self.log('val_min_snr', snrs.float().min())
         self.log('val_max_snr', snrs.float().max())
 
-        # Log timestep statistics
-        assigned_timesteps = self.snr_to_timestep(snrs)
-        self.log('val_avg_assigned_timestep', assigned_timesteps.float().mean())
-        self.log('val_min_assigned_timestep', assigned_timesteps.float().min())
-        self.log('val_max_assigned_timestep', assigned_timesteps.float().max())
-
         # Store data for visualization (first batch only)
         if batch_idx == 0:
+            assigned_timesteps = self.snr_to_timestep(snrs)
             self.val_data = {
                 'original_synced': synced_signals[:4].detach().cpu(),
                 'original_unsynced': original_unsynced_signals[:4].detach().cpu(),
@@ -905,50 +976,75 @@ class PSKDenoisingClassifier(L.LightningModule):
             print(f"Error in visualization: {e}")
             import traceback
             traceback.print_exc()
+
     def configure_optimizers(self):
-        """Configure optimizers with different learning rates for denoiser and classifier"""
+        """Configure optimizers for adversarial training"""
 
-        # Separate parameters for different components
-        denoiser_params = list(self.unet.parameters())
-        reconstruction_loss_params = list(self.reconstruction_loss.parameters())
-        classifier_params = list(self.classifier.parameters())
+        # Main optimizer for denoising + classification
+        denoise_params = []
+        denoise_params.extend(list(self.unet.parameters()))
+        denoise_params.extend(list(self.reconstruction_loss.parameters()))
+        denoise_params.extend(list(self.classifier.parameters()))
 
-        # Combine denoiser and reconstruction loss parameters
-        denoiser_all_params = denoiser_params + reconstruction_loss_params
-
-        # Create optimizer with parameter groups
-        optimizer = AdamW([
-            {
-                'params': denoiser_all_params,
-                'lr': self.hparams.learning_rate,
-                'name': 'denoiser'
-            },
-            {
-                'params': classifier_params,
-                'lr': self.hparams.learning_rate * 0.1,  # Lower LR for classifier
-                'name': 'classifier'
-            }
-        ], weight_decay=1e-4)
-
-        # Learning rate scheduler
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=self.hparams.learning_rate,
-            total_steps=self.trainer.estimated_stepping_batches,
-            pct_start=0.1,  # 10% warm-up
-            anneal_strategy='cos',
-            div_factor=25,  # Initial LR = max_lr / div_factor
-            final_div_factor=1e4  # Final LR = initial_LR / final_div_factor
+        opt_denoise = AdamW(
+            denoise_params,
+            lr=self.hparams.learning_rate,
+            weight_decay=1e-4,
+            betas=(0.5, 0.999)  # Different betas for GAN training stability
         )
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",  # Update every step
-                "frequency": 1,
-                "monitor": "val_loss",
-                "strict": True,
-                "name": "OneCycleLR"
-            },
-        }
+        if self.use_adversarial:
+            # Discriminator optimizer
+            opt_disc = AdamW(
+                self.discriminator.parameters(),
+                lr=self.hparams.learning_rate * 0.5,  # Lower LR for discriminator
+                weight_decay=1e-4,
+                betas=(0.5, 0.999)
+            )
+
+            # Schedulers for both optimizers
+            scheduler_denoise = torch.optim.lr_scheduler.OneCycleLR(
+                opt_denoise,
+                max_lr=self.hparams.learning_rate,
+                total_steps=self.trainer.estimated_stepping_batches,
+                pct_start=0.1,
+                anneal_strategy='cos',
+                div_factor=25,
+                final_div_factor=1e4
+            )
+
+            scheduler_disc = torch.optim.lr_scheduler.OneCycleLR(
+                opt_disc,
+                max_lr=self.hparams.learning_rate * 0.5,
+                total_steps=self.trainer.estimated_stepping_batches,
+                pct_start=0.1,
+                anneal_strategy='cos',
+                div_factor=25,
+                final_div_factor=1e4
+            )
+
+            return [opt_denoise, opt_disc], [scheduler_denoise, scheduler_disc]
+
+        else:
+            # Original single optimizer setup
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                opt_denoise,
+                max_lr=self.hparams.learning_rate,
+                total_steps=self.trainer.estimated_stepping_batches,
+                pct_start=0.1,
+                anneal_strategy='cos',
+                div_factor=25,
+                final_div_factor=1e4
+            )
+
+            return {
+                "optimizer": opt_denoise,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                    "monitor": "val_loss",
+                    "strict": True,
+                    "name": "OneCycleLR"
+                },
+            }

@@ -757,7 +757,7 @@ class RFEncoderDecoder(L.LightningModule):
         mask_ratio: float = 0.50,
         temperature: float = 0.07,
         learning_rate: float = 1e-4,
-        warmup_epochs: int = 10,
+        warmup_epochs: int = 1,
         max_epochs: int = 100,
         reconstruction_weight: float = 0.5,
         contrastive_weight: float = 3.0,
@@ -801,6 +801,24 @@ class RFEncoderDecoder(L.LightningModule):
         # Track codebook statistics
         self.codebook_stats = defaultdict(int)
         self.epoch_codes = []
+
+    def get_conditioning_vector(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Get VQ-MAE conditioning vector for diffusion process
+
+        Args:
+            x: [batch_size, 2, signal_length] RF signal
+
+        Returns:
+            conditioning: [batch_size, d_model] global quantized features for conditioning
+        """
+        self.eval()
+
+        with torch.no_grad():
+            # Get quantized features using existing forward_single method
+            global_quantized_features = self.encoder.forward_single(x)
+
+            return global_quantized_features
 
     def training_step(self, batch, batch_idx):
         # Unpack batch

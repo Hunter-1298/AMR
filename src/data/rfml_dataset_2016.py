@@ -483,7 +483,7 @@ class MoCoRFMLDataset(Dataset):
         # Build mapping: modulation -> list of high-SNR indices
         self.high_snr_indices = defaultdict(list)
         for idx in range(self.n):
-            _, mod, snr = dataset[idx]
+            _, _, mod, snr = dataset[idx]
             if snr >= high_snr_threshold:
                 self.high_snr_indices[mod].append(idx)
 
@@ -491,12 +491,12 @@ class MoCoRFMLDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx):
-        x1, mod, snr1 = self.dataset[idx]
+        x1_sync, x1, mod, snr1 = self.dataset[idx]
         # Get high-SNR positive sample with same modulation
         candidates = self.high_snr_indices.get(mod, [])
         pos_idx = random.choice(candidates)
-        x2, _, snr2 = self.dataset[pos_idx]
-        return (x1, x2), mod, (snr1, snr2)
+        x2_sync, x2, _, snr2 = self.dataset[pos_idx]
+        return (x1_sync, x2_sync), mod, (snr1, snr2)
 
 
 def get_moco_dataloaders(train_loader, val_loader, config):

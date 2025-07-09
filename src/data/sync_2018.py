@@ -220,7 +220,7 @@ synced_qpsk = costas_loop(synced_qpsk)
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
 # Plot original signal (not interpolated/synced)
-ax1.plot(sample_complex.real, sample_complex.imag, '.', alpha=0.5)
+ax1.plot(sample_complex.real[::16], sample_complex.imag[::16], '.', alpha=0.5)
 ax1.set_title("Original QPSK Signal")
 ax1.set_xlabel('In-Phase (I)')
 ax1.set_ylabel('Quadrature (Q)')

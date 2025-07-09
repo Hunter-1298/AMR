@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: PreSynced_Data_Classifier
+run_name: Testing_Adversial
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -38,7 +38,7 @@ hyperparams:
     classifier_epochs: 100
     learning_rate: .001
     batch_size: 64
-    contrastive_batch_size: 32
+    contrastive_batch_size: 128
     # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
@@ -57,6 +57,11 @@ data_dir: data/
 #     decoder:
 #         _target_: models.latent_encoder_models.decoder.Decoder1D
 
+# Encoder:
+#     _target_: models.latent_encoder_models.vq-mae.RFEncoderDecoder
+#     learning_rate: .0001
+#     max_epochs: 5
+
 Encoder:
     _target_: models.latent_encoder_models.psk.PSKDenoisingClassifier
     learning_rate: .0001
@@ -74,31 +79,6 @@ Encoder:
         layers_per_block: 3 #3
         condition: ${conditon}
         conditional: 3 # Class conditioning
-
-Diffusion:
-    _target_: models.diffusion.latent_diffusion.LatentDiffusion
-    learning_rate: ${hyperparams.learning_rate}
-    n_steps: 500
-    weight_decay: 1e-2
-    latent_scaling: 0.57221 #- arcface encoder #1.1981 # contrastive scaling # 2.98697 - reconstruction encoder # False - set to false if we want to recalcualte
-    num_classes: ${hyperparams.num_classes}
-    unet:
-        _target_: models.diffusion.unet_1d.UNet1DModel
-        sample_size: 64
-        in_channels: 32
-        out_channels: 32
-        down_block_types:
-            ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
-        up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
-        mid_block_type: "UNetMidBlock1D"
-        block_out_channels: [32, 64, 128]
-        layers_per_block: 3
-        condition: ${conditon}
-        conditional: 11 # Class conditioning
-    rfnet:
-        _target_: models.classifier.rfnet.RFNet
-        num_classes: 11
-        dropout_rate: 0.2
 
 Classifier:
     _target_: models.classifier.classifier.LatentClassifier
