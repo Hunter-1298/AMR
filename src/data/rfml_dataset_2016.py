@@ -18,7 +18,7 @@ class RFMLDataset(Dataset):
         dataPath="/home/hshayde/Projects/MIT/AMR/Dataset/RML2016.10a_dict.pkl",
         data=2018,
         iq=False,
-        sync=False
+        sync=False,
     ):
         # Data in the shape of dict[('Mod_type','snr')] = [1000,2,128]
         if data == 2018:
@@ -48,7 +48,9 @@ class RFMLDataset(Dataset):
 
                 # Convert to tensors
                 sync_signals = torch.from_numpy(np.array(sync_signals_list)).float()
-                original_signals = torch.from_numpy(np.array(original_signals_list)).float()
+                original_signals = torch.from_numpy(
+                    np.array(original_signals_list)
+                ).float()
 
             else:
                 # When sync=False, signal_data is a list of arrays: [signal, signal, ...]
@@ -81,13 +83,17 @@ class RFMLDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return self.sync_samples[idx], self.samples[idx], self.labels[idx], self.snr[idx]
+        return (
+            self.sync_samples[idx],
+            self.samples[idx],
+            self.labels[idx],
+            self.snr[idx],
+        )
 
     def _load_data(self, dataPath):
         with open(dataPath, "rb") as f:
             data = pickle.load(f, encoding="latin")
         return data
-
 
     def _sync(self, x, mod_type, plot=False):
         # Convert (2, 1024) to complex: x[0] = real, x[1] = imag
@@ -96,13 +102,23 @@ class RFMLDataset(Dataset):
 
         # Modulation-specific parameters
         mod_params = {
-            'QPSK':  {'sps': 8, 'mod_order': 4, 'costas_bw': 0.01,  'costas_damp': 0.707},
-            '8PSK':  {'sps': 8, 'mod_order': 8, 'costas_bw': 0.005, 'costas_damp': 0.707},
-            '16PSK': {'sps': 8, 'mod_order': 16, 'costas_bw': 0.0025, 'costas_damp': 0.707},
+            "QPSK": {"sps": 8, "mod_order": 4, "costas_bw": 0.01, "costas_damp": 0.707},
+            "8PSK": {
+                "sps": 8,
+                "mod_order": 8,
+                "costas_bw": 0.005,
+                "costas_damp": 0.707,
+            },
+            "16PSK": {
+                "sps": 8,
+                "mod_order": 16,
+                "costas_bw": 0.0025,
+                "costas_damp": 0.707,
+            },
         }
         assert mod_type in mod_params, f"Unsupported modulation: {mod_type}"
         params = mod_params[mod_type]
-        sps, mod_order = params['sps'], params['mod_order']
+        sps, mod_order = params["sps"], params["mod_order"]
 
         def mm_timing_sync(samples, sps, gain=0.3, modulation_order=4):
             mu = 0.0
@@ -112,7 +128,9 @@ class RFMLDataset(Dataset):
             i_in = 0
             i_out = 2
             sps_up = sps * 16
-            constellation = np.exp(1j * 2 * np.pi * np.arange(modulation_order) / modulation_order)
+            constellation = np.exp(
+                1j * 2 * np.pi * np.arange(modulation_order) / modulation_order
+            )
 
             while (i_out < N) and (i_in + sps_up < N):
                 idx = int(i_in + mu)
@@ -122,9 +140,13 @@ class RFMLDataset(Dataset):
                 sample = s0 * (1 - frac) + s1 * frac
 
                 out[i_out] = sample
-                out_rail[i_out] = constellation[np.argmin(np.abs(sample - constellation))]
+                out_rail[i_out] = constellation[
+                    np.argmin(np.abs(sample - constellation))
+                ]
 
-                x_err = (out_rail[i_out] - out_rail[i_out - 2]) * np.conj(out[i_out - 1])
+                x_err = (out_rail[i_out] - out_rail[i_out - 2]) * np.conj(
+                    out[i_out - 1]
+                )
                 y_err = (out[i_out] - out[i_out - 2]) * np.conj(out_rail[i_out - 1])
                 mm_val = np.real(y_err - x_err)
 
@@ -144,7 +166,9 @@ class RFMLDataset(Dataset):
             d = 1 + 2 * damping_factor * theta + theta**2
             alpha = (4 * damping_factor * theta) / d
             beta = (4 * theta**2) / d
-            constellation = np.exp(1j * 2 * np.pi * np.arange(modulation_order) / modulation_order)
+            constellation = np.exp(
+                1j * 2 * np.pi * np.arange(modulation_order) / modulation_order
+            )
 
             for n in range(N):
                 corrected = signal[n] * np.exp(-1j * phase_est)
@@ -156,7 +180,6 @@ class RFMLDataset(Dataset):
 
             return output
 
-
         # Step 1: interpolate for M&M
         x_interp = signal.resample_poly(x_complex, up=16, down=1)
 
@@ -166,9 +189,9 @@ class RFMLDataset(Dataset):
         # Step 3: Costas loop carrier sync
         x_costa = costas_loop(
             x_mm,
-            loop_bandwidth=params['costas_bw'],
-            damping_factor=params['costas_damp'],
-            modulation_order=mod_order
+            loop_bandwidth=params["costas_bw"],
+            damping_factor=params["costas_damp"],
+            modulation_order=mod_order,
         )
 
         # Step 4: resample to original 1024
@@ -181,30 +204,29 @@ class RFMLDataset(Dataset):
             # Plot original unsynced signal
             plt.subplot(1, 3, 1)
             plt.scatter(x_complex.real, x_complex.imag, s=2, alpha=0.6)
-            plt.title(f'{mod_type} - Original Unsynced')
+            plt.title(f"{mod_type} - Original Unsynced")
             plt.grid(True)
-            plt.axis('equal')
+            plt.axis("equal")
 
             # Plot upsampled synced signal (x_mm or x_costas - pick Costas output here)
             plt.subplot(1, 3, 2)
             plt.scatter(x_costa.real, x_costa.imag, s=2, alpha=0.6)
-            plt.title(f'{mod_type} - Upsampled Synced (After Costas)')
+            plt.title(f"{mod_type} - Upsampled Synced (After Costas)")
             plt.grid(True)
-            plt.axis('equal')
+            plt.axis("equal")
 
             # Plot final synced and resampled back to 1024
             plt.subplot(1, 3, 3)
             plt.scatter(x_sync.real, x_sync.imag, s=2, alpha=0.6)
-            plt.title(f'{mod_type} - Synced & Resampled (1024 samples)')
+            plt.title(f"{mod_type} - Synced & Resampled (1024 samples)")
             plt.grid(True)
-            plt.axis('equal')
+            plt.axis("equal")
 
             plt.tight_layout()
             plt.show()
 
         # Step 5: convert to (2, 1024)
         return np.stack([x_sync.real, x_sync.imag], axis=0)
-
 
     def _load_2018_data(self, sync):
         classes = [
@@ -249,11 +271,13 @@ class RFMLDataset(Dataset):
         #     "GMSK",
         # ]
         choosen_classes = ["QPSK", "8PSK", "16PSK"]
-        min_snr_level = -5
-        if sync: # load synchronized data, should be a dict of synchonized data
-            sync_data_path = '/home/hshayde/Projects/MIT/AMR/Dataset/sync_data.pkl'
+        min_snr_level = -25
+        if sync:  # load synchronized data, should be a dict of synchonized data
+            sync_data_path = "/home/hshayde/Projects/MIT/AMR/Dataset/sync_data.pkl"
             if not os.path.exists(sync_data_path):
-                print(f"Synchronized data file not found at {sync_data_path}, creating the data and syncing manually")
+                print(
+                    f"Synchronized data file not found at {sync_data_path}, creating the data and syncing manually"
+                )
                 # If we dont have sync we can load from memory
                 with h5py.File(data_path, "r") as f:
                     X = f["X"][:]  # [num_samples, 2, signal_length]
@@ -263,20 +287,25 @@ class RFMLDataset(Dataset):
                     if isinstance(Y[0], bytes):
                         Y = [y.decode("utf-8") for y in Y]
                     for x, y, z in tqdm(zip(X, Y, Z)):
-                        if classes[np.argmax(y)] in choosen_classes and int(z) >= min_snr_level:
+                        if (
+                            classes[np.argmax(y)] in choosen_classes
+                            and int(z) >= min_snr_level
+                        ):
                             key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
                             if key not in data_dict:
                                 data_dict[key] = []
-                            data_dict[key].append((self._sync(x.T, key[0]), x.T))  # transpose so channels x features
-                with open(sync_data_path, 'wb') as f:
-                    print('Saving synced data into new file')
+                            data_dict[key].append(
+                                (self._sync(x.T, key[0]), x.T)
+                            )  # transpose so channels x features
+                with open(sync_data_path, "wb") as f:
+                    print("Saving synced data into new file")
                     pickle.dump(data_dict, f)
-            else: # load the sync data
-                print(f' Loading synced Data')
-                with open(sync_data_path, 'rb') as f:
+            else:  # load the sync data
+                print(f" Loading synced Data")
+                with open(sync_data_path, "rb") as f:
                     data_dict = pickle.load(f)
 
-        else: #  Load unsync'd data
+        else:  #  Load unsync'd data
             # If we dont have sync we can load from memory
             with h5py.File(data_path, "r") as f:
                 X = f["X"][:]  # [num_samples, 2, signal_length]
@@ -286,7 +315,10 @@ class RFMLDataset(Dataset):
                 if isinstance(Y[0], bytes):
                     Y = [y.decode("utf-8") for y in Y]
                 for x, y, z in tqdm(zip(X, Y, Z)):
-                    if classes[np.argmax(y)] in choosen_classes and int(z) >= min_snr_level:
+                    if (
+                        classes[np.argmax(y)] in choosen_classes
+                        and int(z) >= min_snr_level
+                    ):
                         key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
                         if key not in data_dict:
                             data_dict[key] = []
