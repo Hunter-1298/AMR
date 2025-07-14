@@ -323,7 +323,7 @@ class CrossAttention1d(nn.Module):
     def __init__(
         self,
         in_channels: int,
-        context_channels: int,
+        context_channels: int,  # This should be 2 for I/Q signals
         n_head: int = 1,
         dropout_rate: float = 0.0,
         activation: str = "mish",
@@ -332,20 +332,19 @@ class CrossAttention1d(nn.Module):
         assert in_channels % n_head == 0, "in_channels must be divisible by n_head"
 
         self.in_channels = in_channels
-        self.context_channels = context_channels
+        self.context_channels = 2  # FIX: Remove the = 2 part
         self.num_heads = n_head
         self.head_dim = in_channels // n_head
-
-        self.cond_emb_act = get_activation(activation)
 
         # normalize over feature channels
         self.norm = nn.GroupNorm(num_groups=1, num_channels=in_channels)
 
         # query from hidden_states: use Conv1d on feature channels
         self.query = nn.Conv1d(in_channels, in_channels, kernel_size=1)
-        # key/value from context: project context_dim to in_channels
-        self.key = nn.Linear(context_channels, in_channels)
-        self.value = nn.Linear(context_channels, in_channels)
+
+        # key/value from context: use Conv1d to process signal context
+        self.key = nn.Conv1d(2, in_channels, kernel_size=1)
+        self.value = nn.Conv1d(2, in_channels, kernel_size=1)
 
         # output projection back to in_channels
         self.out_proj = nn.Conv1d(in_channels, in_channels, kernel_size=1)
@@ -354,59 +353,57 @@ class CrossAttention1d(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
-        hidden_states: [B, C, T]
-        context: [B, context_dim]
+        hidden_states: [B, C, T] - features from the model
+        context: [B, 2, L] - self-conditioning signals (I/Q channels x sequence length)
         Returns: [B, C, T]
         """
-        # Apply activation since last act was linear projection
-        context = self.cond_emb_act(context.to(hidden_states.dtype))
-
         residual = hidden_states
         B, C, T = hidden_states.size()
+
+        # Handle context - should be [B, context_channels, L]
+        if context is not None:
+            B_ctx, ctx_channels, L = context.size()
+            assert B_ctx == B, f"Batch size mismatch: hidden_states {B}, context {B_ctx}"
+            assert ctx_channels == self.context_channels, f"Context channels mismatch: expected {self.context_channels}, got {ctx_channels}"
+
+            # If sequence lengths don't match, interpolate context to match hidden_states
+            if L != T:
+                context = F.interpolate(context, size=T, mode='linear', align_corners=False)
+        else:
+            # If no context, create zero context
+            context = torch.zeros(B, self.context_channels, T, device=hidden_states.device, dtype=hidden_states.dtype)
 
         # 1. Normalize features per channel
         x = self.norm(hidden_states)
 
-        # 2. Compute queries: Conv1d over feature channels
-        # hidden_states: [B, C, T] -> q: [B, C, T]
-        q = self.query(x)
-        # prepare for heads: [B, C, T] -> [B, T, C]
-        q = q.permute(0, 2, 1)
+        # 2. Compute queries, keys, values using Conv1d
+        q = self.query(x)           # [B, C, T]
+        k = self.key(context)       # [B, C, T] (projected from context_channels to C)
+        v = self.value(context)     # [B, C, T]
 
-        # 3. Prepare key/value from context
-        # ensure context has shape [B, S, context_dim]
-        B_ctx, ctx_dim = context.size()
-        # 3. If context is [B, context_dim], make it [B, 1, context_dim]
-        if context.dim() == 2:
-            context = context.unsqueeze(1)  # [B, 1, context_dim]
-        # Now context: [B, S=1, context_dim]
-        # project to feature dimension: [B, S, C]
-        k = self.key(context)
-        v = self.value(context)
+        # 3. Prepare for multi-head attention: [B, C, T] -> [B, T, C] -> [B, H, T, D]
+        q = q.permute(0, 2, 1).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
+        k = k.permute(0, 2, 1).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
+        v = v.permute(0, 2, 1).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
 
-        S = context.size(1)
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
-        k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, S, D]
-        v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, S, D]
-
-        # 5. Scaled dot-product attention: [B, H, T, S]
+        # 4. Scaled dot-product attention
         scale = self.head_dim ** -0.5
-        attn_logits = (q * scale) @ (k * scale).transpose(-1, -2)
+        attn_logits = (q * scale) @ (k * scale).transpose(-1, -2)  # [B, H, T, T]
         attn = F.softmax(attn_logits, dim=-1)
         attn = self.dropout(attn)
 
-        # 6. Weighted sum: [B, H, T, D]
-        out = attn @ v
+        # 5. Apply attention to values
+        out = attn @ v  # [B, H, T, D]
 
-        # 7. Merge heads -> [B, T, C]
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        # 6. Merge heads and reshape back
+        out = out.transpose(1, 2).contiguous().view(B, T, C)  # [B, T, C]
+        out = out.permute(0, 2, 1)  # [B, C, T]
 
-        # 8. Project back to channels and restore shape [B, C, T]
-        out = out.permute(0, 2, 1)
+        # 7. Output projection
         out = self.out_proj(out)
         out = self.dropout(out)
 
-        # 9. Residual connection
+        # 8. Residual connection
         return out + residual
 
 

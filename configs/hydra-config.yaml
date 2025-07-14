@@ -1,12 +1,12 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: Cirr_Training_NoFeatureLoss
+run_name: Diffusion_FrozenClassifier
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
 contrastive_encoder: False
 train_diffusion: False
-conditon: False
+conditon: True
 diffusion_contrastive: "bottleneck" #"output"
 vis_diffusion: False
 # Classifier Settings #
@@ -34,9 +34,9 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 50
+    epochs: 30
     classifier_epochs: 100
-    learning_rate: .001
+    learning_rate: .0001
     batch_size: 32
     contrastive_batch_size: 128
     # make this high so we can use all negatives in batch without increase batch for diffusion model
@@ -62,16 +62,16 @@ data_dir: data/
 #     learning_rate: .0001
 #     max_epochs: 5
 
-# Encoder:
-#     _target_: models.latent_encoder_models.psk.PSKBaselineClassifier
-#     learning_rate: .0001
-#     classifier:
-#         _target_: models.latent_encoder_models.psk.HybridConvTransformer
-#         in_ch: 2
-#         num_classes: 3
-Encoder:
-    _target_: models.latent_encoder_models.psk.PSKDenoisingClassifier
+BaselineClassifier:
+    _target_: models.latent_encoder_models.psk.BaselineClassifier
     learning_rate: .0001
+    classifier:
+        _target_: models.latent_encoder_models.psk.HybridConvTransformer
+        in_ch: 2
+        num_classes: 3
+Encoder:
+    _target_: models.latent_encoder_models.psk.SelfConditioningDiffusionWithClassifier
+    learning_rate: .001
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
         sample_size: 1024

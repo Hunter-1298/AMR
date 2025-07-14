@@ -61,10 +61,16 @@ def main(cfg: DictConfig):
             # encoder_train_loader, encoder_val_loader = train_loader, val_loader
         else:
             encoder_train_loader, encoder_val_loader = train_loader, val_loader
+        classifier = hydra.utils.instantiate(cfg.BaselineClassifier)
+        checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
+        checkpoint_name = 'classifier.ckpt'
+        checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
+        classifier.load_state_dict(checkpoint["state_dict"])
+        classifier.eval()
 
         print("Training VAE Encoder...")
         # Create and train encoder
-        encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
+        encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names, classifier=classifier)
         # encoder = torch.compile(encoder)
 
         # Create checkpoint dir
@@ -77,7 +83,7 @@ def main(cfg: DictConfig):
             max_epochs=cfg.hyperparams.epochs,
             logger=wandb_logger,
             default_root_dir=".",
-            check_val_every_n_epoch=5,
+            check_val_every_n_epoch=1,
             log_every_n_steps=10,
             accelerator="gpu",
             devices=1,
