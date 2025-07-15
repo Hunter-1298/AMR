@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: Diffusion_FrozenClassifier
+run_name: VGG
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -34,10 +34,10 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 30
+    epochs: 100
     classifier_epochs: 100
     learning_rate: .0001
-    batch_size: 32
+    batch_size: 64
     contrastive_batch_size: 128
     # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
@@ -82,7 +82,7 @@ Encoder:
             ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
         up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
         mid_block_type: "UNetMidBlock1D"
-        block_out_channels: [32, 64, 128]
+        block_out_channels: [16, 32, 64]
         layers_per_block: 3 #3
         condition: ${conditon}
         conditional: 3 # Class conditioning
