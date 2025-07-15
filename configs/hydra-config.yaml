@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: VGG
+run_name: SYNC
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -71,21 +71,21 @@ BaselineClassifier:
         num_classes: 3
 Encoder:
     _target_: models.latent_encoder_models.psk.SelfConditioningDiffusionWithClassifier
-    learning_rate: .001
+    learning_rate: .0001
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
-        sample_size: 1024
-        in_channels: 2
-        out_channels: 2
-        out_block: False
-        down_block_types:
-            ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
-        up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
-        mid_block_type: "UNetMidBlock1D"
-        block_out_channels: [16, 32, 64]
-        layers_per_block: 3 #3
-        condition: ${conditon}
-        conditional: 3 # Class conditioning
+        # sample_size: 1024
+        # in_channels: 2
+        # # out_channels: 2
+        # # out_block: False
+        # # down_block_types:
+        # #     ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
+        # up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
+        # mid_block_type: "UNetMidBlock1D"
+        # block_out_channels: [16, 32, 64]
+        # layers_per_block: 3 #3
+        # condition: ${conditon}
+        # conditional: 3 # Class conditioning
 
 Classifier:
     _target_: models.classifier.classifier.LatentClassifier

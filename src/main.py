@@ -84,7 +84,7 @@ def main(cfg: DictConfig):
             max_epochs=cfg.hyperparams.epochs,
             logger=wandb_logger,
             default_root_dir=".",
-            check_val_every_n_epoch=3,
+            check_val_every_n_epoch=1,
             log_every_n_steps=10,
             accelerator="gpu",
             devices=1,
@@ -99,7 +99,7 @@ def main(cfg: DictConfig):
                 ),
                 LearningRateMonitor(logging_interval="step"),
                 EarlyStopping(
-                    monitor="val_loss",
+                    monitor="val/offset_loss",
                     patience=20,  # Stop after 20 epochs without improvement
                     mode="min",
                     verbose=True,

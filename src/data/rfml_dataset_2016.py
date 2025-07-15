@@ -31,31 +31,39 @@ class RFMLDataset(Dataset):
         self.sync_samples = []
         self.labels = []
         self.snr = []
+        self.sync_params = []  # Store sync parameters (timing, freq, phase offsets)
         self.encoded_hash = {}
-
-        # Remove the pdb line for production
-        # import pdb; pdb.set_trace()
 
         for (mod_type, snr_val), signal_data in data.items():
             if sync:
-                # When sync=True, signal_data is a list of tuples: [(synced, original), ...]
+                # When sync=True, signal_data is a list of tuples: [(sync_result, original), ...]
+                # where sync_result is (synced_signal, timing_offset, freq_offset, phase_offset)
                 sync_signals_list = []
                 original_signals_list = []
+                sync_params_list = []
 
-                for sync_sig, orig_sig in signal_data:
-                    sync_signals_list.append(sync_sig)
+                for sync_result, orig_sig in signal_data:
+                    if isinstance(sync_result, tuple) and len(sync_result) == 4:
+                        # New format: (synced_signal, timing_offset, freq_offset, phase_offset)
+                        synced_signal, timing_offset, freq_offset, phase_offset = sync_result
+                        sync_signals_list.append(synced_signal)
+                        sync_params_list.append((timing_offset, freq_offset, phase_offset))
+                    else:
+                        # Old format: just synced_signal
+                        sync_signals_list.append(sync_result)
+                        sync_params_list.append((0.0, 0.0, 0.0))  # Default values
+
                     original_signals_list.append(orig_sig)
 
                 # Convert to tensors
                 sync_signals = torch.from_numpy(np.array(sync_signals_list)).float()
-                original_signals = torch.from_numpy(
-                    np.array(original_signals_list)
-                ).float()
+                original_signals = torch.from_numpy(np.array(original_signals_list)).float()
 
             else:
                 # When sync=False, signal_data is a list of arrays: [signal, signal, ...]
                 original_signals = torch.from_numpy(np.array(signal_data)).float()
                 sync_signals = original_signals  # Same as original when no sync data
+                sync_params_list = [(0.0, 0.0, 0.0)] * original_signals.shape[0]  # Default values
 
             mod_label = mod_type
 
@@ -71,6 +79,7 @@ class RFMLDataset(Dataset):
             # Extend lists with all samples at once
             self.samples.extend(list(processed_original))
             self.sync_samples.extend(list(processed_sync))
+            self.sync_params.extend(sync_params_list)
 
             labels = [self._encode_labels(mod_label)] * original_signals.shape[0]
             self.labels.extend(labels)
@@ -83,12 +92,24 @@ class RFMLDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
+        sync_sample = self.sync_samples[idx].float()  # Ensure float32
+        unsync_sample = self.samples[idx].float()     # Ensure float32
+        label = self.labels[idx]                      # Should be long for classification
+        snr = self.snr[idx]                          # Can be float32
+
+        # Sync parameters should be float32
+        timing_offset = self.sync_params[idx][0] if isinstance(self.sync_params[idx][0], torch.Tensor) else torch.tensor(self.sync_params[idx][0], dtype=torch.float32)
+        freq_offset = self.sync_params[idx][1] if isinstance(self.sync_params[idx][1], torch.Tensor) else torch.tensor(self.sync_params[idx][1], dtype=torch.float32)
+        phase_offset = self.sync_params[idx][2] if isinstance(self.sync_params[idx][2], torch.Tensor) else torch.tensor(self.sync_params[idx][2], dtype=torch.float32)
+
         return (
-            self.sync_samples[idx],
-            self.samples[idx],
-            self.labels[idx],
-            self.snr[idx],
+            sync_sample,
+            unsync_sample,
+            label,
+            snr,
+            (timing_offset, freq_offset, phase_offset)
         )
+
 
     def _load_data(self, dataPath):
         with open(dataPath, "rb") as f:
@@ -97,7 +118,6 @@ class RFMLDataset(Dataset):
 
     def _sync(self, x, mod_type, plot=False):
         # Convert (2, 1024) to complex: x[0] = real, x[1] = imag
-        # Convert to complex
         x_complex = x[0] + 1j * x[1]
 
         # Modulation-specific parameters
@@ -132,6 +152,10 @@ class RFMLDataset(Dataset):
                 1j * 2 * np.pi * np.arange(modulation_order) / modulation_order
             )
 
+            # Track timing offset
+            total_sample_shift = 0
+            mu_accumulator = 0
+
             while (i_out < N) and (i_in + sps_up < N):
                 idx = int(i_in + mu)
                 frac = mu - int(mu)
@@ -150,12 +174,22 @@ class RFMLDataset(Dataset):
                 y_err = (out[i_out] - out[i_out - 2]) * np.conj(out_rail[i_out - 1])
                 mm_val = np.real(y_err - x_err)
 
+                # Update mu and track changes
+                old_mu = mu
                 mu += sps_up + gain * mm_val
-                i_in += int(mu)
+                mu_accumulator += mu - old_mu
+
+                sample_advance = int(mu)
+                total_sample_shift += sample_advance
+                i_in += sample_advance
                 mu = mu - int(mu)
                 i_out += 1
 
-            return out[2:i_out]
+            # Calculate average timing offset in samples relative to original rate
+            # Convert back to original sample rate from upsampled rate
+            avg_timing_offset = (mu_accumulator / (i_out - 2)) / 16 if i_out > 2 else 0
+
+            return out[2:i_out], avg_timing_offset
 
         def costas_loop(signal, loop_bandwidth, damping_factor, modulation_order):
             N = len(signal)
@@ -178,16 +212,24 @@ class RFMLDataset(Dataset):
                 freq_est += beta * error
                 phase_est += freq_est + alpha * error
 
-            return output
+            # Return signal and final estimates
+            final_phase_offset = phase_est % (2 * np.pi)  # Normalize to [0, 2π]
+            if final_phase_offset > np.pi:
+                final_phase_offset -= 2 * np.pi  # Convert to [-π, π]
+
+            # Convert frequency estimate to normalized frequency (cycles per sample)
+            final_freq_offset = freq_est / (2 * np.pi)
+
+            return output, final_freq_offset, final_phase_offset
 
         # Step 1: interpolate for M&M
         x_interp = signal.resample_poly(x_complex, up=16, down=1)
 
-        # Step 2: M&M timing sync
-        x_mm = mm_timing_sync(x_interp, sps=8, modulation_order=mod_order)
+        # Step 2: M&M timing sync - now returns timing offset
+        x_mm, timing_offset = mm_timing_sync(x_interp, sps=8, modulation_order=mod_order)
 
-        # Step 3: Costas loop carrier sync
-        x_costa = costas_loop(
+        # Step 3: Costas loop carrier sync - now returns freq and phase offsets
+        x_costa, freq_offset, phase_offset = costas_loop(
             x_mm,
             loop_bandwidth=params["costas_bw"],
             damping_factor=params["costas_damp"],
@@ -218,15 +260,19 @@ class RFMLDataset(Dataset):
             # Plot final synced and resampled back to 1024
             plt.subplot(1, 3, 3)
             plt.scatter(x_sync.real, x_sync.imag, s=2, alpha=0.6)
-            plt.title(f"{mod_type} - Synced & Resampled (1024 samples)")
+            plt.title(f"{mod_type} - Synced & Resampled (1024 samples)\n"
+                    f"Timing: {timing_offset:.3f}, Freq: {freq_offset:.6f}, Phase: {phase_offset:.3f}")
             plt.grid(True)
             plt.axis("equal")
 
             plt.tight_layout()
             plt.show()
 
-        # Step 5: convert to (2, 1024)
-        return np.stack([x_sync.real, x_sync.imag], axis=0)
+        # Step 5: convert to (2, 1024) and return with sync parameters
+        synced_signal = np.stack([x_sync.real, x_sync.imag], axis=0)
+
+        # Return tuple: (synchronized_signal, timing_offset, frequency_offset, phase_offset)
+        return synced_signal, timing_offset, freq_offset, phase_offset
 
     def _load_2018_data(self, sync):
         classes = [
@@ -257,21 +303,9 @@ class RFMLDataset(Dataset):
         ]
         data_path = "/home/hshayde/Projects/MIT/AMR/Dataset/2018.01/2018_RFML.hdf5"
         data_dict = {}
-        # choosen_classes = [
-        #     "QPSK",
-        #     "16QAM",
-        #     "64QAM",
-        #     "OOK",
-        #     "8PSK",
-        #     "16PSK",
-        #     "AM-SSB-SC",
-        #     "AM-DSB-WC",
-        #     "FM",
-        #     "BPSK",
-        #     "GMSK",
-        # ]
         choosen_classes = ["QPSK", "8PSK", "16PSK"]
-        min_snr_level = -25
+        min_snr_level = 0
+
         if sync:  # load synchronized data, should be a dict of synchonized data
             sync_data_path = "/home/hshayde/Projects/MIT/AMR/Dataset/sync_data.pkl"
             if not os.path.exists(sync_data_path):
@@ -294,9 +328,13 @@ class RFMLDataset(Dataset):
                             key = (classes[np.argmax(y)], int(z))  # (mod_type, snr) key
                             if key not in data_dict:
                                 data_dict[key] = []
+
+                            # _sync now returns (synced_signal, timing_offset, freq_offset, phase_offset)
+                            sync_result = self._sync(x.T, key[0])
                             data_dict[key].append(
-                                (self._sync(x.T, key[0]), x.T)
-                            )  # transpose so channels x features
+                                (sync_result, x.T)
+                            )  # Store full sync result and original
+
                 with open(sync_data_path, "wb") as f:
                     print("Saving synced data into new file")
                     pickle.dump(data_dict, f)
@@ -323,6 +361,7 @@ class RFMLDataset(Dataset):
                         if key not in data_dict:
                             data_dict[key] = []
                         data_dict[key].append(x.T)  # transpose so channels x features
+
                 print(f"Total keys created: {len(data_dict)}")
                 total_samples = sum(len(v) for v in data_dict.values())
                 print(f"Total signals stored: {total_samples}")
