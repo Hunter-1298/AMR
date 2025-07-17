@@ -61,16 +61,16 @@ def main(cfg: DictConfig):
             # encoder_train_loader, encoder_val_loader = train_loader, val_loader
         else:
             encoder_train_loader, encoder_val_loader = train_loader, val_loader
-        classifier = hydra.utils.instantiate(cfg.BaselineClassifier)
-        checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
-        checkpoint_name = 'classifier.ckpt'
-        checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
-        classifier.load_state_dict(checkpoint["state_dict"])
-        classifier.eval()
+        # classifier = hydra.utils.instantiate(cfg.BaselineClassifier)
+        # checkpoint_dir = "/home/hshayde/Projects/MIT/AMR/best_checkpoints/"
+        # checkpoint_name = 'classifier.ckpt'
+        # checkpoint = torch.load(checkpoint_dir + checkpoint_name, weights_only=False)
+        # classifier.load_state_dict(checkpoint["state_dict"])
+        # classifier.eval()
 
         print("Training VAE Encoder...")
         # Create and train encoder
-        encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names, classifier=classifier)
+        encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
         # encoder = hydra.utils.instantiate(cfg.Encoder, label_names=label_names)
         # encoder = torch.compile(encoder)
 
@@ -83,13 +83,13 @@ def main(cfg: DictConfig):
         encoder_trainer = L.Trainer(
             max_epochs=cfg.hyperparams.epochs,
             logger=wandb_logger,
+            precision="32-true",
             default_root_dir=".",
             check_val_every_n_epoch=1,
             log_every_n_steps=10,
             accelerator="gpu",
             devices=1,
             strategy="auto",
-            precision="16-mixed",
             callbacks=[
                 ModelCheckpoint(
                     filename="{dir}{epoch:02d}_{val_loss:.7f}",
@@ -98,12 +98,12 @@ def main(cfg: DictConfig):
                     every_n_epochs=1,
                 ),
                 LearningRateMonitor(logging_interval="step"),
-                EarlyStopping(
-                    monitor="val/offset_loss",
-                    patience=20,  # Stop after 20 epochs without improvement
-                    mode="min",
-                    verbose=True,
-                ),
+                # EarlyStopping(
+                #     monitor="val/avg",
+                #     patience=20,  # Stop after 20 epochs without improvement
+                #     mode="min",
+                #     verbose=True,
+                # ),
             ],
         )
 

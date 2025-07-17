@@ -304,7 +304,7 @@ class RFMLDataset(Dataset):
         data_path = "/home/hshayde/Projects/MIT/AMR/Dataset/2018.01/2018_RFML.hdf5"
         data_dict = {}
         choosen_classes = ["QPSK", "8PSK", "16PSK"]
-        min_snr_level = 0
+        min_snr_level = -20
 
         if sync:  # load synchronized data, should be a dict of synchonized data
             sync_data_path = "/home/hshayde/Projects/MIT/AMR/Dataset/sync_data.pkl"

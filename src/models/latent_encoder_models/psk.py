@@ -81,107 +81,110 @@ class DDPMScheduler(nn.Module):
 
         return noisy_signal, noise
 
-
 class SelfConditioningDiffusionWithClassifier(L.LightningModule):
     """
-    PSK diffusion denoiser with self-conditioning and baseline classifier
-
-    Training Schedule:
-    - Epochs 0-1: Diffusion only (reconstruction loss)
-    - Epochs 2+: Diffusion + Classification
-    - Training: Only SNR >= 0 dB
-    - Validation: All SNR values
+    Complete PSK diffusion denoiser with integrated classification
+    JOINT TRAINING with step-wise corrections and all improvements
     """
     def __init__(
         self,
         unet: nn.Module,
-        classifier: Optional[nn.Module] = None,
         label_names: Optional[List[str]] = None,
         learning_rate: float = 1e-4,
-        num_train_timesteps: int = 20,  # Reduced from 1000 to 20
-        # Loss weights
-        lambda_t: float = 1.0,
-        lambda_f: float = 1.0,
-        lambda_phi: float = 1.0,
-        use_phase_loss: bool = True,
-        # Timestep-aware training
-        use_timestep_aware_loss: bool = True,
-        # Visualization settings
-        log_every_n_epochs: int = 5,
-        num_vis_steps: int = 20,  # Use all 20 steps for visualization
-        vis_batch_size: int = 4,
-        # Scheduler settings
-        use_scheduler: bool = True,
-        warmup_steps: int = 1000,
-        # Interpolation strategy
-        interpolation_type: str = "linear",
-        noise_regularization: float = 0.01,
-        sps: int = 8,  # samples per symbol
-        max_freq_offset: float = 1e-3,  # max expected frequency offset in cycles/sample
+        num_train_timesteps: int = 10,
+
+        # Classifier parameters
+        num_classes: int = 3,
+        conv_hidden: tuple = (32,64,128),
+        trans_dim: int = 256,
+        n_heads: int = 8,
+        n_layers: int = 3,
+        mlp_hidden: int = 256,
+
+        # Loss weights for joint training
+        lambda_sync: float = 1.0,      # Synchronization loss weight
+        lambda_class: float = 1.0,     # Classification loss weight
+
+        # Training schedule
+        classification_start_epoch: int = 0,  # Start classification after sync has some progress
+
+        # Normalization parameters
+        sps: int = 8,
+        max_freq_offset: float = 1e-3,
         normalize_params: bool = True,
+
+        # Visualization settings
+        log_every_n_epochs: int = 1,
+        vis_batch_size: int = 5,
+
+        # Other settings
+        use_scheduler: bool = True,
+        interpolation_type: str = "cosine",  # Keep cosine for better step distribution
+        noise_regularization: float = 0.01,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['model', 'classifier'])
-        self.sps = sps
-        self.max_freq_offset = max_freq_offset
-        self.normalize_params = normalize_params
+        self.save_hyperparameters(ignore=['unet'])
 
-        # Store the pre-instantiated model and classifier
+        # Store the pre-instantiated UNet
         self.model = unet
-        self.classifier = classifier
-        if self.classifier is not None:
-            self.classifier.eval()
+        if label_names is not None:
+            # Create ordered list: [label_names[0], label_names[1], label_names[2], ...]
+            max_class = max(label_names.keys())
+            self.label_names = [label_names.get(i, f"Class_{i}") for i in range(max_class + 1)]
+        else:
+            self.label_names = [f"Class_{i}" for i in range(num_classes)]
 
-        # Loss weights
-        self.lambda_t = lambda_t
-        self.lambda_f = lambda_f
-        self.lambda_phi = lambda_phi
-        self.use_phase_loss = use_phase_loss
-        self.use_timestep_aware_loss = use_timestep_aware_loss
+        # === INSTANTIATE CLASSIFIER ===
+        self.classifier = HybridConvTransformer(
+            in_ch=2,  # I/Q channels
+            num_classes=num_classes,
+            conv_hidden=conv_hidden,
+            trans_dim=trans_dim,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            mlp_hidden=mlp_hidden,
+        )
 
-        # Metrics tracking
-        self.train_losses = {
-            'timing': [], 'freq': [], 'phase': [], 'total': []
-        }
-        self.val_losses = {
-            'timing': [], 'freq': [], 'phase': [], 'total': []
-        }
+        # Classification loss function
+        self.classification_criterion = nn.CrossEntropyLoss()
 
         # Store validation samples for visualization
         self.val_samples_stored = False
         self.stored_val_data = None
 
+        # Store validation outputs for SNR analysis
+        self.validation_step_outputs = []
+
     def normalize_sync_params(self, timing, freq, phase):
         """Normalize synchronization parameters for training"""
-        if not self.normalize_params:
+        if not self.hparams.normalize_params:
             return timing, freq, phase
 
-        norm_timing = timing / self.sps
-        norm_freq = freq / self.max_freq_offset
+        norm_timing = timing / self.hparams.sps
+        norm_freq = freq / self.hparams.max_freq_offset
         norm_phase = phase / torch.pi
 
         return norm_timing, norm_freq, norm_phase
 
     def denormalize_sync_params(self, norm_timing, norm_freq, norm_phase):
         """Convert normalized parameters back to physical units"""
-        if not self.normalize_params:
+        if not self.hparams.normalize_params:
             return norm_timing, norm_freq, norm_phase
 
-        timing = norm_timing * self.sps
-        freq = norm_freq * self.max_freq_offset
+        timing = norm_timing * self.hparams.sps
+        freq = norm_freq * self.hparams.max_freq_offset
         phase = norm_phase * torch.pi
 
         return timing, freq, phase
+
     def get_interpolation_alpha(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """Get interpolation weights based on timesteps and interpolation strategy"""
-        alpha = timesteps.float() / (self.hparams.num_train_timesteps - 1)  # Normalize to [0,1]
+        """Get interpolation weights based on timesteps"""
+        alpha = timesteps.float() / (self.hparams.num_train_timesteps - 1)
 
         if self.hparams.interpolation_type == "linear":
             return alpha
         elif self.hparams.interpolation_type == "cosine":
             return 0.5 * (1 - torch.cos(alpha * torch.pi))
-        elif self.hparams.interpolation_type == "quadratic":
-            return alpha ** 2
         else:
             return alpha
 
@@ -192,7 +195,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         timesteps: torch.Tensor
     ) -> torch.Tensor:
         """Create interpolation between synchronized and unsynchronized signals"""
-        # Ensure all signals are float32
         sync_signals = sync_signals.float()
         unsync_signals = unsync_signals.float()
 
@@ -203,226 +205,128 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         # At t=19: fully unsynchronized (alpha=1)
         interpolated = (1 - alpha) * sync_signals + alpha * unsync_signals
 
-        # Optional: Add small amount of noise for regularization
-        if self.hparams.noise_regularization > 0:
-            noise = torch.randn_like(interpolated) * self.hparams.noise_regularization
-            interpolated = interpolated + noise * alpha
-
-        # Debug: print some alpha values occasionally
-        if torch.rand(1) < 0.001:  # Print very rarely
-            print(f"Debug interpolation: timesteps={timesteps[:3]}, alphas={alpha[:3,0,0]}")
+        if self.training and self.hparams.noise_regularization > 0:
+            noise_scale = self.hparams.noise_regularization * (1 - alpha + 0.1)
+            noise = torch.randn_like(interpolated) * noise_scale
+            interpolated = interpolated + noise
 
         return interpolated.float()
 
-    def phase_loss(self, pred_phase: torch.Tensor, true_phase: torch.Tensor) -> torch.Tensor:
-        """Special phase loss with proper dtype handling"""
-        pred_phase = pred_phase.float()
-        true_phase = true_phase.float()
+    def should_do_classification(self) -> bool:
+        """Determine if we should include classification loss"""
+        return self.current_epoch >= self.hparams.classification_start_epoch
 
-        diff = pred_phase - true_phase
-        diff = torch.atan2(torch.sin(diff), torch.cos(diff))
-        return torch.mean(diff ** 2)
+    def training_step(self, batch, batch_idx):
+        """Joint training with step-wise sync corrections + classification on fully synchronized signals"""
+        sync_signals, unsync_signals, labels, snrs, sync_params = batch
+        batch_size = sync_signals.shape[0]
 
-    def compute_timestep_aware_losses(
-        self,
-        output: Dict,
-        true_params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        timesteps: torch.Tensor,
-        sync_signals: torch.Tensor,
-        unsync_signals: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """Compute losses with normalized parameters"""
-        true_timing, true_freq, true_phase = true_params
-
-        # Normalize true parameters
+        # === NORMALIZE SYNC PARAMETERS ===
+        true_timing, true_freq, true_phase = sync_params
         norm_true_timing, norm_true_freq, norm_true_phase = self.normalize_sync_params(
             true_timing, true_freq, true_phase
         )
 
-        # Ensure all tensors are float32
-        norm_true_timing = norm_true_timing.float()
-        norm_true_freq = norm_true_freq.float()
-        norm_true_phase = norm_true_phase.float()
+        # === SYNCHRONIZATION LOSS (STEP-WISE FOR EFFICIENCY) ===
+        timesteps = torch.randint(0, self.hparams.num_train_timesteps, (batch_size,), device=self.device)
+        interpolated_signals = self.create_sync_interpolation(sync_signals, unsync_signals, timesteps)
 
-        if self.use_timestep_aware_loss:
-            # Compute timestep-aware targets
-            alpha = self.get_interpolation_alpha(timesteps).to(self.device)
+        # Get sync model predictions
+        sync_output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
 
-            # Scale normalized target parameters based on timestep
-            target_timing = norm_true_timing * alpha
-            target_freq = norm_true_freq * alpha
-            target_phase = norm_true_phase * alpha
-        else:
-            # Standard loss - always predict full correction
-            target_timing = norm_true_timing
-            target_freq = norm_true_freq
-            target_phase = norm_true_phase
+        # Calculate step-wise targets
+        alpha_current = self.get_interpolation_alpha(timesteps).to(self.device)
+        next_timesteps = torch.clamp(timesteps - 1, 0, self.hparams.num_train_timesteps - 1)
+        alpha_next = self.get_interpolation_alpha(next_timesteps).to(self.device)
 
-        losses = {}
+        # For t=0, step should be zero
+        step_alpha = torch.where(timesteps == 0,
+                                torch.zeros_like(alpha_current),
+                                alpha_current - alpha_next)
 
-        # Compute losses on normalized parameters
-        losses['timing_loss'] = F.mse_loss(
-            output['timing_offset'].squeeze().float(),
-            target_timing
-        )
+        target_timing = norm_true_timing * step_alpha
+        target_freq = norm_true_freq * step_alpha
+        target_phase = norm_true_phase * step_alpha
 
-        losses['freq_loss'] = F.mse_loss(
-            output['freq_offset'].squeeze().float(),
-            target_freq
-        )
+        # Synchronization loss
+        timing_mse = F.mse_loss(sync_output['timing_offset'].squeeze(), target_timing)
+        freq_mse = F.mse_loss(sync_output['freq_offset'].squeeze(), target_freq)
+        phase_mse = F.mse_loss(sync_output['phase_offset'].squeeze(), target_phase)
 
-        if self.use_phase_loss:
-            losses['phase_loss'] = self.phase_loss(
-                output['phase_offset'].squeeze().float(),
-                target_phase
-            )
-        else:
-            losses['phase_loss'] = F.mse_loss(
-                output['phase_offset'].squeeze().float(),
-                target_phase
+        sync_loss = timing_mse + freq_mse + phase_mse
+
+        # === CLASSIFICATION LOSS (FULLY SYNCHRONIZED SIGNALS) ===
+        classification_loss = torch.tensor(0.0, device=self.device)
+        classification_acc = torch.tensor(0.0, device=self.device)
+
+        # Run FULL iterative synchronization for classification training
+        # Use the same function as visualization but enable gradients
+        with torch.enable_grad():  # Explicitly enable gradients
+            fully_synchronized_signals, _ = self.iterative_synchronization_for_gif(
+                unsync_signals, labels, num_steps=5
             )
 
-        # Total offset loss
-        losses['offset_loss'] = (
-            self.lambda_t * losses['timing_loss'] +
-            self.lambda_f * losses['freq_loss'] +
-            self.lambda_phi * losses['phase_loss']
+        # Train classifier on FULLY synchronized signals
+        class_logits = self.classifier(fully_synchronized_signals)
+        classification_loss = self.classification_criterion(class_logits, labels)
+
+        # Calculate accuracy
+        class_preds = torch.argmax(class_logits, dim=1)
+        classification_acc = (class_preds == labels).float().mean()
+
+        # === TOTAL LOSS ===
+        total_loss = (
+            self.hparams.lambda_sync * sync_loss +
+            self.hparams.lambda_class * classification_loss
         )
 
-        return losses
+        # === ENHANCED LOGGING ===
+        self.log('train/sync_loss', sync_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train/timing_mse', timing_mse, on_step=True)
+        self.log('train/freq_mse', freq_mse, on_step=True)
+        self.log('train/phase_mse', phase_mse, on_step=True)
+        self.log('train/class_loss', classification_loss, on_step=True, on_epoch=True)
+        self.log('train/class_acc', classification_acc, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train/total_loss', total_loss, on_step=True, on_epoch=True)
 
-    def compute_standard_losses(
-        self,
-        output: Dict,
-        true_params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Standard loss computation for validation (always full correction)"""
-        true_timing, true_freq, true_phase = true_params
+        # Log step-wise behavior
+        avg_step_timing = torch.mean(torch.abs(target_timing))
+        avg_step_freq = torch.mean(torch.abs(target_freq))
+        avg_step_phase = torch.mean(torch.abs(target_phase))
 
-        # Ensure all tensors are float32
-        true_timing = true_timing.float()
-        true_freq = true_freq.float()
-        true_phase = true_phase.float()
+        self.log('train/avg_step_timing', avg_step_timing)
+        self.log('train/avg_step_freq', avg_step_freq)
+        self.log('train/avg_step_phase', avg_step_phase)
 
-        losses = {}
+        # Log by timestep ranges
+        high_t_mask = timesteps >= 15
+        med_t_mask = (timesteps >= 5) & (timesteps < 15)
+        low_t_mask = timesteps < 5
 
-        # Individual parameter losses
-        losses['timing_loss'] = F.mse_loss(
-            output['timing_offset'].squeeze().float(),
-            true_timing
-        )
+        if high_t_mask.any():
+            self.log('train/step_size_high_t', torch.mean(step_alpha[high_t_mask]))
+            self.log('train/pred_timing_high_t', torch.mean(torch.abs(sync_output['timing_offset'][high_t_mask])))
+        if med_t_mask.any():
+            self.log('train/step_size_med_t', torch.mean(step_alpha[med_t_mask]))
+            self.log('train/pred_timing_med_t', torch.mean(torch.abs(sync_output['timing_offset'][med_t_mask])))
+        if low_t_mask.any():
+            self.log('train/step_size_low_t', torch.mean(step_alpha[low_t_mask]))
+            self.log('train/pred_timing_low_t', torch.mean(torch.abs(sync_output['timing_offset'][low_t_mask])))
 
-        losses['freq_loss'] = F.mse_loss(
-            output['freq_offset'].squeeze().float(),
-            true_freq
-        )
-
-        if self.use_phase_loss:
-            losses['phase_loss'] = self.phase_loss(
-                output['phase_offset'].squeeze().float(),
-                true_phase
-            )
-        else:
-            losses['phase_loss'] = F.mse_loss(
-                output['phase_offset'].squeeze().float(),
-                true_phase
-            )
-
-        # Total offset loss
-        losses['offset_loss'] = (
-            self.lambda_t * losses['timing_loss'] +
-            self.lambda_f * losses['freq_loss'] +
-            self.lambda_phi * losses['phase_loss']
-        )
-
-        return losses
-
-    @torch.no_grad()
-    def debug_timestep_conditioning(
-        self,
-        unsync_signal: torch.Tensor,
-        modulation: torch.Tensor,
-    ):
-        """Debug function to check if model is using timestep information"""
-        device = unsync_signal.device
-
-        # Test all timesteps since we only have 20
-        timesteps_to_test = [0, 5, 10, 15, 19]  # From synchronized to corrupted
-
-        print("\nDebugging timestep conditioning (20 timesteps):")
-        print("Expected: parameters should increase with timestep")
-        print("t=0 (sync): small corrections needed")
-        print("t=19 (corrupted): large corrections needed")
-        print("-" * 60)
-
-        for t in timesteps_to_test:
-            t_batch = torch.full((1,), t, device=device)
-
-            # Get model prediction
-            output = self.model(unsync_signal[:1], t_batch, modulation[:1], return_dict=True)
-
-            alpha = self.get_interpolation_alpha(torch.tensor([t])).item()
-
-            print(f"Timestep {t:2d} (α={alpha:.2f}): "
-                  f"timing={output['timing_offset'][0,0].item():7.4f}, "
-                  f"freq={output['freq_offset'][0,0].item():7.4f}, "
-                  f"phase={output['phase_offset'][0,0].item():7.4f}")
-
-        print("-" * 60)
-
-    def training_step(self, batch, batch_idx):
-        """Enhanced training step with timestep-aware targets"""
-        sync_signals, unsync_signals, labels, snrs, sync_params = batch
-        # import pdb; pdb.set_trace()
-        batch_size = sync_signals.shape[0]
-
-        # Sample random timesteps from 0 to 19
-        timesteps = torch.randint(
-            0, self.hparams.num_train_timesteps,
-            (batch_size,), device=self.device
-        )
-
-        # Create interpolated signals between sync and unsync
-        interpolated_signals = self.create_sync_interpolation(
-            sync_signals, unsync_signals, timesteps
-        )
-
-        # Forward pass
-        output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
-
-        # Compute timestep-aware losses
-        losses = self.compute_timestep_aware_losses(
-            output, sync_params, timesteps, sync_signals, unsync_signals
-        )
-
-        # Logging with reduced frequency to avoid spam
-        if batch_idx % 100 == 0:
-            for loss_name, loss_value in losses.items():
-                self.log(f'train/{loss_name}', loss_value, on_step=True, on_epoch=True, prog_bar=True)
-
-            # Log timestep statistics
-            self.log('train/avg_timestep', timesteps.float().mean(), on_step=True)
-            self.log('train/max_timestep', timesteps.float().max(), on_step=True)
-            self.log('train/min_timestep', timesteps.float().min(), on_step=True)
-
-            # Log interpolation alpha statistics
-            alphas = self.get_interpolation_alpha(timesteps)
-            self.log('train/avg_alpha', alphas.mean(), on_step=True)
-
-        # Track for epoch-end statistics
-        self.train_losses['timing'].append(losses['timing_loss'].item())
-        self.train_losses['freq'].append(losses['freq_loss'].item())
-        self.train_losses['phase'].append(losses['phase_loss'].item())
-        self.train_losses['total'].append(losses['offset_loss'].item())
-
-        return losses['offset_loss']
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step with comprehensive evaluation"""
+        """Validation with full iterative synchronization for consistent evaluation"""
         sync_signals, unsync_signals, labels, snrs, sync_params = batch
         batch_size = sync_signals.shape[0]
 
-        # Store first batch for visualization
+        # === NORMALIZE SYNC PARAMETERS ===
+        true_timing, true_freq, true_phase = sync_params
+        norm_true_timing, norm_true_freq, norm_true_phase = self.normalize_sync_params(
+            true_timing, true_freq, true_phase
+        )
+
+        # Store first batch for visualization (with normalized params)
         if batch_idx == 0 and not self.val_samples_stored:
             self.stored_val_data = {
                 'sync_signals': sync_signals[:self.hparams.vis_batch_size].cpu(),
@@ -430,93 +334,148 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
                 'labels': labels[:self.hparams.vis_batch_size].cpu(),
                 'snrs': snrs[:self.hparams.vis_batch_size].cpu(),
                 'sync_params': (
-                    sync_params[0][:self.hparams.vis_batch_size].cpu(),
-                    sync_params[1][:self.hparams.vis_batch_size].cpu(),
-                    sync_params[2][:self.hparams.vis_batch_size].cpu(),
+                    norm_true_timing[:self.hparams.vis_batch_size].cpu(),
+                    norm_true_freq[:self.hparams.vis_batch_size].cpu(),
+                    norm_true_phase[:self.hparams.vis_batch_size].cpu(),
                 )
             }
             self.val_samples_stored = True
 
-        # Evaluate at different timesteps for comprehensive validation
-        timestep_evaluations = [0, 5, 10, 15, 19]  # Adjusted for 20 timesteps
-        all_losses = []
-        all_outputs = []  # Store model outputs for parameter accuracy
+        with torch.no_grad():
+            # === SYNCHRONIZATION LOSS (at t=0 for best case) ===
+            timesteps = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
+            interpolated_signals = self.create_sync_interpolation(sync_signals, unsync_signals, timesteps)
 
-        for t in timestep_evaluations:
-            timesteps = torch.full((batch_size,), t, device=self.device)
+            sync_output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
 
-            # Create interpolated signals for this timestep
-            interpolated_signals = self.create_sync_interpolation(
-                sync_signals, unsync_signals, timesteps
+            # Step-wise sync loss (for t=0, step_alpha should be 0)
+            alpha_current = self.get_interpolation_alpha(timesteps).to(self.device)
+            next_timesteps = torch.clamp(timesteps - 1, 0, self.hparams.num_train_timesteps - 1)
+            alpha_next = self.get_interpolation_alpha(next_timesteps).to(self.device)
+            step_alpha = torch.where(timesteps == 0, torch.zeros_like(alpha_current), alpha_current - alpha_next)
+
+            target_timing = norm_true_timing * step_alpha
+            target_freq = norm_true_freq * step_alpha
+            target_phase = norm_true_phase * step_alpha
+
+            sync_loss = (
+                F.mse_loss(sync_output['timing_offset'].squeeze(), target_timing) +
+                F.mse_loss(sync_output['freq_offset'].squeeze(), target_freq) +
+                F.mse_loss(sync_output['phase_offset'].squeeze(), target_phase)
             )
 
-            with torch.no_grad():
-                output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
+            # === CLASSIFICATION ON FULLY SYNCHRONIZED SIGNALS ===
+            # Run FULL iterative synchronization - same as training
+            fully_synchronized_signals, progression = self.iterative_synchronization_for_gif(
+                unsync_signals, labels, num_steps=5
+            )
 
-            # Store model output
-            all_outputs.append(output)
+            # Classify the fully synchronized signals
+            class_logits = self.classifier(fully_synchronized_signals)
+            class_loss = self.classification_criterion(class_logits, labels)
+            class_preds = torch.argmax(class_logits, dim=1)
+            class_acc = (class_preds == labels).float().mean()
+            class_probs = F.softmax(class_logits, dim=-1)
 
-            # For validation, use standard loss (full correction expected)
-            losses = self.compute_standard_losses(output, sync_params)
-            all_losses.append(losses)
+            # Store outputs for SNR analysis
+            self.validation_step_outputs.append({
+                'predictions': class_preds.cpu(),
+                'labels': labels.cpu(),
+                'snrs': snrs.cpu(),
+                'probabilities': class_probs.cpu(),
+                'sync_loss': sync_loss.cpu(),
+            })
 
-            # Log timestep-specific metrics for first batch only
-            if batch_idx == 0:
-                for loss_name, loss_value in losses.items():
-                    if loss_name != 'offset_loss':
-                        self.log(f'val/{loss_name}_t{t}', loss_value)
+        # Log metrics
+        self.log('val/sync_loss', sync_loss, on_epoch=True, prog_bar=True)
+        self.log('val/class_loss', class_loss, on_epoch=True)
+        self.log('val/class_acc', class_acc, on_epoch=True, prog_bar=True)
 
-        # Average losses across timesteps
-        avg_losses = {}
-        for key in all_losses[0].keys():
-            avg_losses[key] = torch.stack([loss[key] for loss in all_losses]).mean()
+        # Log per-class accuracy - UPDATED TO USE ACTUAL LABEL NAMES
+        for i, label_name in enumerate(self.label_names):
+            class_mask = labels == i
+            if class_mask.sum() > 0:
+                class_acc_per_class = (class_preds[class_mask] == labels[class_mask]).float().mean()
+                self.log(f'val/class_acc_{label_name}', class_acc_per_class)
 
-        # Log averaged validation metrics
-        for loss_name, loss_value in avg_losses.items():
-            self.log(f'val/{loss_name}', loss_value, on_epoch=True)
-
-        self.val_losses['timing'].append(avg_losses['timing_loss'].item())
-        self.val_losses['freq'].append(avg_losses['freq_loss'].item())
-        self.val_losses['phase'].append(avg_losses['phase_loss'].item())
-        self.val_losses['total'].append(avg_losses['offset_loss'].item())
-
-        # Debug timestep conditioning and parameter accuracy for first batch
+        # Debug timestep response for first batch
         if batch_idx == 0:
-            # Use the model output from worst case (t=19) for parameter accuracy
-            worst_case_output = all_outputs[-1]
-            self.log_parameter_accuracy(worst_case_output, sync_params, labels)
-            self.debug_timestep_conditioning(unsync_signals[:1], labels[:1])
+            self.debug_timestep_conditioning_stepwise(unsync_signals[:1], labels[:1])
 
-        return avg_losses['offset_loss']
+        return sync_loss + class_loss
 
-    def log_parameter_accuracy(self, output, true_params, labels):
-        """Log parameter prediction accuracy metrics"""
-        true_timing, true_freq, true_phase = true_params
+    @torch.no_grad()
+    def iterative_synchronization_for_gif(
+        self,
+        unsync_signal: torch.Tensor,
+        modulation: torch.Tensor,
+        num_steps: int = 10
+    ) -> Tuple[torch.Tensor, List[Dict]]:
+        """Iterative synchronization with cumulative timing tracking for visualization"""
+        device = unsync_signal.device
+        current_signal = unsync_signal.clone()
 
-        # Check if output is a losses dict or model output dict
-        if 'timing_offset' in output:
-            # This is a model output dict
-            pred_timing = output['timing_offset'].squeeze()
-            pred_freq = output['freq_offset'].squeeze()
-            pred_phase = output['phase_offset'].squeeze()
-        else:
-            # This is a losses dict, we can't compute accuracy from losses
-            print("Warning: Cannot compute parameter accuracy from loss dict")
-            return
+        progression = []
+        cumulative_timing = torch.zeros(current_signal.shape[0], device=device)  # Track cumulative timing
 
-        # Mean absolute errors
-        timing_mae = F.l1_loss(pred_timing.float(), true_timing.float())
-        freq_mae = F.l1_loss(pred_freq.float(), true_freq.float())
-        phase_mae = F.l1_loss(pred_phase.float(), true_phase.float())
+        # Reverse diffusion schedule
+        timesteps = torch.linspace(
+            self.hparams.num_train_timesteps - 1, 0, num_steps
+        ).long().to(device)
 
-        self.log('val/timing_mae', timing_mae)
-        self.log('val/freq_mae', freq_mae)
-        self.log('val/phase_mae', phase_mae)
+        for step, t in enumerate(timesteps):
+            t_batch = torch.full((current_signal.shape[0],), t, device=device)
 
-        # Log parameter ranges for monitoring
-        self.log('val/timing_range', pred_timing.max() - pred_timing.min())
-        self.log('val/freq_range', pred_freq.max() - pred_freq.min())
-        self.log('val/phase_range', pred_phase.max() - pred_phase.min())
+            # Get model prediction
+            output = self.model(current_signal, t_batch, modulation, return_dict=True)
+
+            # Apply step-wise corrections to current signal
+            corrected_signal = self.apply_predicted_sync(
+                current_signal,
+                output['timing_offset'],
+                output['freq_offset'],
+                output['phase_offset']
+            )
+
+            # Update cumulative timing (denormalized for tracking)
+            timing_physical, freq_physical, phase_physical = self.denormalize_sync_params(
+                output['timing_offset'].squeeze(-1),
+                output['freq_offset'].squeeze(-1),
+                output['phase_offset'].squeeze(-1)
+            )
+            cumulative_timing += timing_physical
+
+            # Get classification for this step
+            if hasattr(self, 'classifier'):
+                class_logits = self.classifier(corrected_signal)
+                class_probs = F.softmax(class_logits, dim=-1)
+                class_preds = torch.argmax(class_logits, dim=1)
+            else:
+                class_probs = torch.zeros((corrected_signal.shape[0], self.hparams.num_classes))
+                class_preds = torch.zeros((corrected_signal.shape[0],), dtype=torch.long)
+
+            # Store step info with cumulative timing tracking
+            step_info = {
+                'step': step,
+                'timestep': t.item(),
+                'signal': corrected_signal.cpu().clone(),
+                'input_signal': current_signal.cpu().clone(),
+                'timing_offset': output['timing_offset'].cpu().clone(),
+                'freq_offset': output['freq_offset'].cpu().clone(),
+                'phase_offset': output['phase_offset'].cpu().clone(),
+                'cumulative_timing_offset': cumulative_timing.cpu().clone(),  # Track cumulative timing
+                'cumulative_freq_offset': torch.zeros_like(cumulative_timing.cpu()),  # Placeholder for future
+                'cumulative_phase_offset': torch.zeros_like(cumulative_timing.cpu()),  # Placeholder for future
+                'class_probs': class_probs.cpu().clone(),
+                'class_preds': class_preds.cpu().clone(),
+            }
+
+            progression.append(step_info)
+
+            # Update for next iteration
+            current_signal = corrected_signal.detach()
+
+        return current_signal, progression
 
     def apply_predicted_sync(
         self,
@@ -525,103 +484,121 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         freq_offset: torch.Tensor,
         phase_offset: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply predicted synchronization parameters to signal"""
-
-        # Denormalize parameters to physical units
-        timing_physical, freq_physical, phase_physical = self.denormalize_sync_params(
-            timing_offset.squeeze(), freq_offset.squeeze(), phase_offset.squeeze()
-        )
-
+        """Apply predicted synchronization with fractional timing correction"""
         batch_size, channels, length = signal.shape
         device = signal.device
 
-        # Ensure correct input shape [B, 2, L]
         assert channels == 2, f"Expected 2 channels (I/Q), got {channels}"
-        assert signal.dim() == 3, f"Expected 3D input [B, 2, L], got {signal.shape}"
+
+        # Denormalize parameters to physical units
+        timing_physical, freq_physical, phase_physical = self.denormalize_sync_params(
+            timing_offset.squeeze(-1), freq_offset.squeeze(-1), phase_offset.squeeze(-1)
+        )
 
         # Convert I/Q to complex
-        complex_signal = signal[:, 0] + 1j * signal[:, 1]  # [B, L]
+        complex_signal = signal[:, 0] + 1j * signal[:, 1]
 
-        # Apply timing offset (simple circular shift)
-        timing_samples = timing_physical.round().long()  # [B]
-        shifted_signals = []
-        for i, shift in enumerate(timing_samples):
-            shifted = torch.roll(complex_signal[i], -shift.item(), dims=0)
-            shifted_signals.append(shifted)
-        shifted_signal = torch.stack(shifted_signals, dim=0)  # [B, L]
+        # Apply fractional timing correction
+        timing_corrected = self.apply_fractional_timing_correction_freq_domain(
+            complex_signal, timing_physical
+        )
 
-        # Apply frequency and phase correction
-        t = torch.arange(length, device=device, dtype=torch.float32).unsqueeze(0)  # [1, L]
-
-        # Create correction phasor using physical units
+        # Apply frequency and phase correction (FIXED: removed /length)
+        t = torch.arange(length, device=device, dtype=torch.float32).unsqueeze(0)
         freq_phase_correction = (
-            -2 * torch.pi * freq_physical.unsqueeze(-1) * t / length -
+            -2 * torch.pi * freq_physical.unsqueeze(-1) * t -  # Removed /length division
             phase_physical.unsqueeze(-1)
         )
-        correction_phasor = torch.exp(1j * freq_phase_correction)  # [B, L]
+        correction_phasor = torch.exp(1j * freq_phase_correction)
 
-        # Apply correction
-        corrected_signal = shifted_signal * correction_phasor  # [B, L]
+        fully_corrected = timing_corrected * correction_phasor
 
-        # Convert back to I/Q format
+        # Convert back to I/Q
         output_signal = torch.stack([
-            corrected_signal.real,
-            corrected_signal.imag
-        ], dim=1)  # [B, 2, L]
+            fully_corrected.real,
+            fully_corrected.imag
+        ], dim=1)
 
-        return output_signal
+        return output_signal.float()
 
-    def apply_fractional_delay(self, signal: torch.Tensor, delay_samples: torch.Tensor) -> torch.Tensor:
-        """
-        Apply fractional delay using linear interpolation
-        """
-        batch_size, length = signal.shape
-        device = signal.device
+    def apply_fractional_timing_correction_freq_domain(
+        self,
+        complex_signal: torch.Tensor,
+        timing_offset_samples: torch.Tensor
+    ) -> torch.Tensor:
+        """Vectorized frequency domain fractional timing correction"""
+        batch_size, length = complex_signal.shape
+        device = complex_signal.device
 
-        # Create time indices
-        t_indices = torch.arange(length, device=device, dtype=torch.float32)  # [L]
+        # FFT
+        signal_fft = torch.fft.fft(complex_signal, dim=-1)
 
-        # Apply delay: positive delay means signal arrives later, so we shift left (subtract)
-        delayed_indices = t_indices.unsqueeze(0) - delay_samples.unsqueeze(-1)  # [B, L]
+        # Frequency vector
+        freqs = torch.fft.fftfreq(length, device=device).unsqueeze(0)
 
-        # Wrap around using modulo for circular buffer effect
-        delayed_indices = delayed_indices % length
+        # Phase shifts for fractional delays
+        phase_shifts = torch.exp(
+            -1j * 2 * torch.pi * freqs * timing_offset_samples.unsqueeze(-1)
+        )
 
-        # Linear interpolation
-        floor_indices = torch.floor(delayed_indices).long()
-        ceil_indices = (floor_indices + 1) % length
+        # Apply phase shifts in frequency domain
+        delayed_fft = signal_fft * phase_shifts
 
-        # Interpolation weights
-        weights = delayed_indices - floor_indices.float()
+        # IFFT back to time domain
+        delayed_signals = torch.fft.ifft(delayed_fft, dim=-1)
 
-        # Gather values and interpolate
-        signal_floor = torch.gather(signal, 1, floor_indices)
-        signal_ceil = torch.gather(signal, 1, ceil_indices)
+        return delayed_signals
 
-        interpolated = signal_floor * (1 - weights) + signal_ceil * weights
+    @torch.no_grad()
+    def debug_timestep_conditioning_stepwise(self, unsync_signal: torch.Tensor, modulation: torch.Tensor):
+        """Debug function to check step-wise timestep response"""
+        device = unsync_signal.device
 
-        return interpolated
+        print("\nStep-wise Timestep Response Debug:")
+        print("Expected: step sizes should decrease as timestep decreases")
+        print("-" * 80)
+
+        for t in [19, 15, 10, 5, 0]:
+            t_batch = torch.full((1,), t, device=device)
+
+            output = self.model(unsync_signal, t_batch, modulation, return_dict=True)
+
+            alpha_current = self.get_interpolation_alpha(torch.tensor([t])).item()
+            next_t = max(0, t - 1)
+            alpha_next = self.get_interpolation_alpha(torch.tensor([next_t])).item()
+            step_alpha = alpha_current - alpha_next if t > 0 else 0.0
+
+            print(f"t={t:2d} (α_curr={alpha_current:.3f}, α_next={alpha_next:.3f}, step={step_alpha:.3f}):")
+            print(f"    pred_norm: timing={output['timing_offset'][0,0].item():7.4f}, "
+                  f"freq={output['freq_offset'][0,0].item():7.4f}, "
+                  f"phase={output['phase_offset'][0,0].item():7.4f}")
+
+            # Show denormalized values
+            timing_phys, freq_phys, phase_phys = self.denormalize_sync_params(
+                output['timing_offset'][0,0],
+                output['freq_offset'][0,0],
+                output['phase_offset'][0,0]
+            )
+            print(f"    pred_phys: timing={timing_phys.item():7.4f}, "
+                  f"freq={freq_phys.item():9.6f}, "
+                  f"phase={phase_phys.item():7.4f}")
+
+        print("-" * 80)
 
     @torch.no_grad()
     def iterative_synchronization_for_gif(
         self,
         unsync_signal: torch.Tensor,
         modulation: torch.Tensor,
-        num_steps: int = 20
+        num_steps: int = 10
     ) -> Tuple[torch.Tensor, List[Dict]]:
-        """
-        Proper iterative synchronization - apply corrections to previous iteration's result
-        """
+        """Iterative synchronization with step-wise corrections for visualization"""
         device = unsync_signal.device
-        original_corrupted = unsync_signal.clone()  # Keep for reference
-
-        # Start with the corrupted signal
         current_signal = unsync_signal.clone()
 
-        # Store progression
         progression = []
 
-        # Reverse diffusion schedule (from most corrupted to synchronized)
+        # Reverse diffusion schedule
         timesteps = torch.linspace(
             self.hparams.num_train_timesteps - 1, 0, num_steps
         ).long().to(device)
@@ -629,98 +606,175 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         for step, t in enumerate(timesteps):
             t_batch = torch.full((current_signal.shape[0],), t, device=device)
 
-            # Get model prediction for current signal state
+            # Get model prediction (should be step-wise correction)
             output = self.model(current_signal, t_batch, modulation, return_dict=True)
 
-            # Apply corrections to the CURRENT signal (not original)
+            # Apply step-wise corrections to current signal
             corrected_signal = self.apply_predicted_sync(
-                current_signal,  # Apply to current iteration's result
+                current_signal,
                 output['timing_offset'],
                 output['freq_offset'],
                 output['phase_offset']
             )
+
+            # Get classification for this step
+            if self.should_do_classification():
+                class_logits = self.classifier(corrected_signal)
+                class_probs = F.softmax(class_logits, dim=-1)
+                class_preds = torch.argmax(class_logits, dim=1)
+            else:
+                class_probs = torch.zeros((corrected_signal.shape[0], self.hparams.num_classes))
+                class_preds = torch.zeros((corrected_signal.shape[0],), dtype=torch.long)
 
             # Store step info
             step_info = {
                 'step': step,
                 'timestep': t.item(),
                 'signal': corrected_signal.cpu().clone(),
-                'input_signal': current_signal.cpu().clone(),  # What we fed to the model
+                'input_signal': current_signal.cpu().clone(),
                 'timing_offset': output['timing_offset'].cpu().clone(),
                 'freq_offset': output['freq_offset'].cpu().clone(),
                 'phase_offset': output['phase_offset'].cpu().clone(),
+                'class_probs': class_probs.cpu().clone(),
+                'class_preds': class_preds.cpu().clone(),
             }
 
             progression.append(step_info)
 
-            # Update current signal for next iteration
+            # Update for next iteration (key: step-wise application)
             current_signal = corrected_signal.detach()
-
-            # Optional: Add some debug info
-            if step % 5 == 0:  # Print every 5 steps
-                print(f"Step {step}, t={t.item()}: "
-                      f"timing={output['timing_offset'][0,0].item():.4f}, "
-                      f"freq={output['freq_offset'][0,0].item():.4f}, "
-                      f"phase={output['phase_offset'][0,0].item():.4f}")
 
         return current_signal, progression
 
-    @torch.no_grad()
-    def single_step_synchronization_for_gif(
-        self,
-        unsync_signal: torch.Tensor,
-        modulation: torch.Tensor,
-        num_steps: int = 20
-    ) -> Tuple[torch.Tensor, List[Dict]]:
-        """
-        Alternative: Show different timestep predictions without iteration
-        (Keep this for comparison purposes)
-        """
-        device = unsync_signal.device
-        original_corrupted = unsync_signal.clone()
+    def create_snr_vs_accuracy_plot(self):
+        """Create SNR vs Classification Accuracy plot"""
+        if not self.validation_step_outputs:
+            print("No validation outputs available for SNR analysis")
+            return
 
-        progression = []
-        timesteps = torch.linspace(self.hparams.num_train_timesteps - 1, 0, num_steps).long().to(device)
+        try:
+            # Aggregate all validation outputs
+            all_preds = torch.cat([x['predictions'] for x in self.validation_step_outputs])
+            all_labels = torch.cat([x['labels'] for x in self.validation_step_outputs])
+            all_snrs = torch.cat([x['snrs'] for x in self.validation_step_outputs])
 
-        for step, t in enumerate(timesteps):
-            t_batch = torch.full((original_corrupted.shape[0],), t, device=device)
+            # Define SNR bins - UPDATED to cover -20dB to 30dB range
+            snr_bins = [(-20, -18), (-18, -16), (-16, -14), (-14, -12), (-12, -10),
+                    (-10, -8), (-8, -6), (-6, -4), (-4, -2), (-2, 0),
+                    (0, 2), (2, 4), (4, 6), (6, 8), (8, 10), (10, 12),
+                    (12, 14), (14, 16), (16, 18), (18, 20), (20, 22),
+                    (22, 24), (24, 26), (26, 28), (28, 30)]
+            snr_centers = [(low + high) / 2 for low, high in snr_bins]
 
-            # Get model prediction for this timestep
-            output = self.model(original_corrupted, t_batch, modulation, return_dict=True)
+            # Calculate overall accuracy per SNR bin
+            overall_accuracies = []
+            class_accuracies = {label_name: [] for label_name in self.label_names}
 
-            # Apply to original signal (non-iterative)
-            sync_signal = self.apply_predicted_sync(
-                original_corrupted,
-                output['timing_offset'],
-                output['freq_offset'],
-                output['phase_offset']
-            )
+            for snr_min, snr_max in snr_bins:
+                snr_mask = (all_snrs >= snr_min) & (all_snrs < snr_max)
 
-            step_info = {
-                'step': step,
-                'timestep': t.item(),
-                'signal': sync_signal.cpu().clone(),
-                'timing_offset': output['timing_offset'].cpu().clone(),
-                'freq_offset': output['freq_offset'].cpu().clone(),
-                'phase_offset': output['phase_offset'].cpu().clone(),
-            }
+                if snr_mask.sum() > 0:
+                    # Overall accuracy
+                    overall_acc = (all_preds[snr_mask] == all_labels[snr_mask]).float().mean().item()
+                    overall_accuracies.append(overall_acc)
 
-            progression.append(step_info)
+                    # Per-class accuracy
+                    for class_idx, label_name in enumerate(self.label_names):
+                        class_mask = snr_mask & (all_labels == class_idx)
+                        if class_mask.sum() > 0:
+                            class_acc = (all_preds[class_mask] == all_labels[class_mask]).float().mean().item()
+                            class_accuracies[label_name].append(class_acc)
+                        else:
+                            class_accuracies[label_name].append(0.0)
+                else:
+                    overall_accuracies.append(0.0)
+                    for label_name in self.label_names:
+                        class_accuracies[label_name].append(0.0)
 
-        return sync_signal, progression
+            # Create the plot
+            fig, ax = plt.subplots(figsize=(12, 8))
 
-    def create_sync_animation(
+            # Plot overall accuracy
+            ax.plot(snr_centers, overall_accuracies, 'ko-', linewidth=3, markersize=8,
+                label='Overall Accuracy', zorder=3)
+
+            colors = ['red', 'blue', 'green', 'orange', 'purple']
+            markers = ['s', '^', 'D', 'v', '<']
+
+            for idx, (label_name, accuracies) in enumerate(class_accuracies.items()):
+                color = colors[idx % len(colors)]
+                marker = markers[idx % len(markers)]
+                ax.plot(snr_centers, accuracies, color=color, marker=marker,
+                    linewidth=2, markersize=6, label=str(label_name), alpha=0.8)
+
+            # Add only the random guess baseline reference line
+            num_classes = len(self.label_names)
+            ax.axhline(y=1/num_classes, color='gray', linestyle='--', alpha=0.5,
+                    label=f'Random Guess ({1/num_classes:.3f})')
+
+            # Formatting with updated axis limits
+            ax.set_xlabel('SNR (dB)', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Classification Accuracy', fontsize=14, fontweight='bold')
+            ax.set_title(f'Classification Accuracy vs SNR - Epoch {self.current_epoch}\n'
+                        f'Synchronized Signals (Joint Training)', fontsize=16, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=10, loc='lower right', frameon=True, fancybox=True, shadow=True)
+            ax.set_ylim(0, 1.05)
+            ax.set_xlim(-22, 32)  # UPDATED range
+
+            # Add sample count annotations
+            for i, (snr_min, snr_max) in enumerate(snr_bins):
+                snr_mask = (all_snrs >= snr_min) & (all_snrs < snr_max)
+                count = snr_mask.sum().item()
+                if count > 0:
+                    ax.annotate(f'n={count}', (snr_centers[i], 0.02),
+                            ha='center', fontsize=8, alpha=0.7)
+
+            # Add performance statistics text box
+            max_acc = max(overall_accuracies)
+            max_snr_idx = overall_accuracies.index(max_acc)
+            max_snr = snr_centers[max_snr_idx]
+
+            stats_text = f'Peak Accuracy: {max_acc:.3f} @ {max_snr:.1f}dB\n'
+            stats_text += f'Samples: {len(all_preds)} total\n'
+            stats_text += f'Classes: {num_classes}'
+
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+            plt.tight_layout()
+
+            # Log to wandb
+            if hasattr(self, 'logger') and self.logger is not None:
+                logger_class_name = self.logger.__class__.__name__
+                if 'WandbLogger' in logger_class_name:
+                    self.logger.experiment.log({
+                        "snr_vs_accuracy": wandb.Image(fig),
+                        "epoch": self.current_epoch
+                    })
+                    print("SNR vs Accuracy plot logged to WandB")
+
+            # Save locally
+            plot_filename = f'snr_vs_accuracy_epoch_{self.current_epoch}.png'
+            fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
+            print(f"SNR vs Accuracy plot saved as {plot_filename}")
+
+            plt.close(fig)
+
+        except Exception as e:
+            print(f"Error creating SNR vs Accuracy plot: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def create_sync_animation_with_classification(
         self,
         unsync_signals: torch.Tensor,
-        true_sync_signals: torch.Tensor,
         progression: List[Dict],
         labels: torch.Tensor,
         snrs: torch.Tensor,
-        num_samples: int = 2
+        num_samples: int = 4
     ):
-        """
-        Enhanced animation creation with better visualization of iterative progress
-        """
+        """Enhanced animation showing synchronization progression + classification confidence with corrected symbol tracking"""
         try:
             num_samples = min(num_samples, unsync_signals.shape[0])
             num_steps = len(progression)
@@ -729,129 +783,175 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
                 print("Error: No progression data available")
                 return None, None
 
-            # Set up the figure with additional subplot for convergence metrics
-            fig = plt.figure(figsize=(6*num_samples, 12))
-
-            # Create subplots: constellation plots, parameter evolution, and convergence metrics
-            gs = fig.add_gridspec(3, num_samples, height_ratios=[2, 1.5, 1])
-
-            constellation_axes = [fig.add_subplot(gs[0, i]) for i in range(num_samples)]
-            param_axes = [fig.add_subplot(gs[1, i]) for i in range(num_samples)]
-            convergence_ax = fig.add_subplot(gs[2, :])  # Span all columns
+            # Set up figure: constellation plots, parameter evolution, and classification confidence
+            fig = plt.figure(figsize=(6*num_samples, 14))
+            gs = fig.add_gridspec(3, num_samples, height_ratios=[1, 1, 1],
+                                hspace=0.4, wspace=0.3)
 
             # Store plots for animation
             scatters = []
             param_lines = []
 
-            # Sample every 16th point for symbol visualization
-            symbol_stride = 1
+            # Base symbol stride and calculate corrected indices for each step
+            symbol_stride = 16
+            signal_length = unsync_signals.shape[2]
+            base_symbol_indices = torch.arange(0, signal_length, symbol_stride)
 
-            # Initialize constellation and parameter plots (same as before)
+            # Pre-calculate corrected symbol indices for each step and sample
+            corrected_indices_per_step = []
+            for step_idx in range(num_steps):
+                step_indices = []
+                for sample_idx in range(num_samples):
+                    # Get cumulative timing correction for this step and sample
+                    if 'cumulative_timing_offset' in progression[step_idx]:
+                        cumulative_timing = progression[step_idx]['cumulative_timing_offset'][sample_idx].item()
+                    else:
+                        # Fallback: calculate cumulative from step values up to this point
+                        cumulative_timing = 0.0
+                        for prev_step in range(step_idx + 1):
+                            step_timing_norm = progression[prev_step]['timing_offset'][sample_idx].item()
+                            step_timing_phys = step_timing_norm * getattr(self.hparams, 'sps', 8)
+                            cumulative_timing += step_timing_phys
+
+                    # Adjust symbol indices by cumulative timing correction
+                    adjusted_indices = base_symbol_indices + int(round(cumulative_timing))
+
+                    # Clamp to valid range
+                    adjusted_indices = torch.clamp(adjusted_indices, 0, signal_length - 1)
+                    step_indices.append(adjusted_indices)
+
+                corrected_indices_per_step.append(step_indices)
+
+            # Initialize constellation and parameter plots for each sample
             for sample_idx in range(num_samples):
+                label = labels[sample_idx].item()
+                snr = snrs[sample_idx].item()
+
+                # Convert label to class name
+                if isinstance(self.label_names, dict):
+                    class_name = self.label_names.get(label, f"Class_{label}")
+                elif isinstance(self.label_names, list) and label < len(self.label_names):
+                    class_name = self.label_names[label]
+                else:
+                    class_name = f"Class_{label}"
+
+                # Top row: Constellation plots
+                ax_const = fig.add_subplot(gs[0, sample_idx])
+                ax_const.set_xlim(-2, 2)
+                ax_const.set_ylim(-2, 2)
+                ax_const.set_xlabel('I Channel', fontsize=10)
+                ax_const.set_ylabel('Q Channel', fontsize=10)
+                ax_const.set_title(f'Sample {sample_idx}: {class_name}, SNR {snr:.1f}dB',
+                                fontsize=11, pad=10)
+                ax_const.grid(True, alpha=0.3)
+                ax_const.set_aspect('equal')
+                ax_const.tick_params(labelsize=9)
+
+                # Plot initial unsynchronized signal (using original indices)
+                unsync_sig = unsync_signals[sample_idx]
+                original_indices = corrected_indices_per_step[0][sample_idx]
+
+                ax_const.scatter(
+                    unsync_sig[0, original_indices], unsync_sig[1, original_indices],
+                    c='red', alpha=0.5, s=15, label='Initial (Unsync)', zorder=1, marker='x'
+                )
+
+                # Initialize animated scatter for progression
+                initial_signal = progression[0]['signal'][sample_idx]
+                initial_indices = corrected_indices_per_step[0][sample_idx]
+                scatter = ax_const.scatter(
+                    initial_signal[0, initial_indices], initial_signal[1, initial_indices],
+                    c='blue', alpha=0.8, s=25, label='Synchronizing', zorder=3, marker='o'
+                )
+                scatters.append((scatter, sample_idx))
+                ax_const.legend(fontsize=9)
+
+                # Middle row: Parameter evolution (WITHOUT cumulative timing)
+                ax_params = fig.add_subplot(gs[1, sample_idx])
+                ax_params.set_xlim(0, num_steps-1)
+                ax_params.set_xlabel('Iteration Step', fontsize=10)
+                ax_params.set_ylabel('Parameter Value (Normalized)', fontsize=10)
+                ax_params.set_title('Parameter Evolution', fontsize=11, pad=10)
+                ax_params.grid(True, alpha=0.3)
+                ax_params.tick_params(labelsize=9)
+
+                # Initialize parameter plots (NO cumulative line)
+                timing_line, = ax_params.plot([], [], 'o-', label='Timing Offset', color='blue',
+                                            linewidth=2, markersize=3)
+                freq_line, = ax_params.plot([], [], 's-', label='Freq Offset', color='orange',
+                                        linewidth=2, markersize=3)
+                phase_line, = ax_params.plot([], [], '^-', label='Phase Offset', color='purple',
+                                        linewidth=2, markersize=3)
+
+                param_lines.append((timing_line, freq_line, phase_line))
+
+                # Set parameter plot limits (without cumulative values)
                 try:
-                    label = labels[sample_idx].item()
-                    snr = snrs[sample_idx].item()
-
-                    # Constellation plot
-                    ax_const = constellation_axes[sample_idx]
-                    ax_const.set_xlim(-2, 2)
-                    ax_const.set_ylim(-2, 2)
-                    ax_const.set_xlabel('I Channel')
-                    ax_const.set_ylabel('Q Channel')
-                    ax_const.set_title(f'Sample {sample_idx}: Class {label}, SNR {snr:.1f}dB')
-                    ax_const.grid(True, alpha=0.3)
-                    ax_const.set_aspect('equal')
-
-                    # Plot reference signals
-                    unsync_sig = unsync_signals[sample_idx]
-                    true_sync_sig = true_sync_signals[sample_idx]
-
-                    signal_length = unsync_sig.shape[1]
-                    symbol_indices = torch.arange(0, signal_length, symbol_stride)
-
-                    ax_const.scatter(
-                        unsync_sig[0, symbol_indices], unsync_sig[1, symbol_indices],
-                        c='red', alpha=0.5, s=20, label='Unsync', zorder=1, marker='x'
-                    )
-                    ax_const.scatter(
-                        true_sync_sig[0, symbol_indices], true_sync_sig[1, symbol_indices],
-                        c='green', alpha=0.6, s=25, label='True Sync', zorder=2, marker='o'
-                    )
-
-                    # Initialize animated scatter
-                    initial_signal = progression[0]['signal'][sample_idx]
-                    scatter = ax_const.scatter(
-                        initial_signal[0, symbol_indices], initial_signal[1, symbol_indices],
-                        c='blue', alpha=0.8, s=30, label='Iterative Sync', zorder=3, marker='s'
-                    )
-                    scatters.append((scatter, symbol_indices))
-                    ax_const.legend()
-
-                    # Parameter evolution plot
-                    ax_params = param_axes[sample_idx]
-                    ax_params.set_xlim(0, num_steps-1)
-                    ax_params.set_xlabel('Iteration Step')
-                    ax_params.set_ylabel('Parameter Value')
-                    ax_params.set_title('Parameter Evolution')
-                    ax_params.grid(True, alpha=0.3)
-
-                    # Initialize parameter plots
-                    timing_line, = ax_params.plot([], [], 'o-', label='Timing', color='blue', linewidth=2, markersize=4)
-                    freq_line, = ax_params.plot([], [], 's-', label='Frequency', color='orange', linewidth=2, markersize=4)
-                    phase_line, = ax_params.plot([], [], '^-', label='Phase', color='purple', linewidth=2, markersize=4)
-
-                    param_lines.append((timing_line, freq_line, phase_line))
-
-                    # Set parameter plot limits
                     all_timing = [progression[i]['timing_offset'][sample_idx].item() for i in range(num_steps)]
                     all_freq = [progression[i]['freq_offset'][sample_idx].item() for i in range(num_steps)]
                     all_phase = [progression[i]['phase_offset'][sample_idx].item() for i in range(num_steps)]
 
-                    y_min = min(min(all_timing), min(all_freq), min(all_phase)) - 0.1
-                    y_max = max(max(all_timing), max(all_freq), max(all_phase)) + 0.1
+                    all_values = all_timing + all_freq + all_phase
+                    y_min = min(all_values) - 0.1
+                    y_max = max(all_values) + 0.1
                     if y_min != y_max:
                         ax_params.set_ylim(y_min, y_max)
                     else:
                         ax_params.set_ylim(y_min - 0.1, y_max + 0.1)
+                except:
+                    ax_params.set_ylim(-1, 1)
 
-                    ax_params.legend()
+                ax_params.legend(fontsize=8)
 
-                except Exception as e:
-                    print(f"Error setting up sample {sample_idx}: {e}")
-                    return None, None
+                # Bottom row: Classification confidence over steps
+                ax_class = fig.add_subplot(gs[2, sample_idx])
+                ax_class.set_xlim(0, num_steps-1)
+                ax_class.set_xlabel('Iteration Step', fontsize=10)
+                ax_class.set_ylabel('Classification Probability', fontsize=10)
+                ax_class.set_title('Classification Confidence', fontsize=11, pad=10)
+                ax_class.grid(True, alpha=0.3)
+                ax_class.set_ylim(0, 1.05)
+                ax_class.tick_params(labelsize=9)
 
-            # Initialize convergence metrics plot
-            convergence_ax.set_xlim(0, num_steps-1)
-            convergence_ax.set_xlabel('Iteration Step')
-            convergence_ax.set_ylabel('Parameter Magnitude')
-            convergence_ax.set_title('Convergence: Parameter Magnitudes Over Iterations')
-            convergence_ax.grid(True, alpha=0.3)
+                # Initialize classification confidence plots
+                class_lines = []
+                colors = ['red', 'blue', 'green', 'orange', 'purple']
 
-            # Convergence lines (average across samples)
-            conv_timing_line, = convergence_ax.plot([], [], 'o-', label='Avg |Timing|', color='blue', linewidth=2)
-            conv_freq_line, = convergence_ax.plot([], [], 's-', label='Avg |Frequency|', color='orange', linewidth=2)
-            conv_phase_line, = convergence_ax.plot([], [], '^-', label='Avg |Phase|', color='purple', linewidth=2)
-            convergence_ax.legend()
+                # Handle both dict and list label_names
+                if isinstance(self.label_names, dict):
+                    label_names_list = [self.label_names[i] for i in sorted(self.label_names.keys())]
+                else:
+                    label_names_list = self.label_names
 
-            # Enhanced animation function
+                for class_idx, label_name in enumerate(label_names_list):
+                    color = colors[class_idx % len(colors)]
+                    line, = ax_class.plot([], [], label=str(label_name), color=color, linewidth=2)
+                    class_lines.append(line)
+
+                param_lines[sample_idx] = param_lines[sample_idx] + (class_lines,)
+                ax_class.legend(fontsize=9, loc='upper right')
+
+            # Animation function
             def animate(frame):
                 try:
                     updates = []
 
-                    # Update constellation and parameter plots for each sample
                     for sample_idx in range(num_samples):
-                        # Update constellation plot
-                        scatter, symbol_indices = scatters[sample_idx]
+                        # Update constellation plot with CORRECTED indices
+                        scatter, _ = scatters[sample_idx]
                         current_signal = progression[frame]['signal'][sample_idx]
 
+                        # Use pre-calculated corrected indices for this frame and sample
+                        corrected_indices = corrected_indices_per_step[frame][sample_idx]
+
                         new_offsets = np.column_stack([
-                            current_signal[0, symbol_indices].numpy(),
-                            current_signal[1, symbol_indices].numpy()
+                            current_signal[0, corrected_indices].numpy(),
+                            current_signal[1, corrected_indices].numpy()
                         ])
                         scatter.set_offsets(new_offsets)
 
-                        # Update parameter plots
-                        timing_line, freq_line, phase_line = param_lines[sample_idx]
+                        # Update parameter plots (WITHOUT cumulative)
+                        timing_line, freq_line, phase_line, class_lines = param_lines[sample_idx]
 
                         steps_so_far = list(range(frame + 1))
                         timing_vals = [progression[i]['timing_offset'][sample_idx].item() for i in steps_so_far]
@@ -862,34 +962,24 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
                         freq_line.set_data(steps_so_far, freq_vals)
                         phase_line.set_data(steps_so_far, phase_vals)
 
-                        updates.extend([scatter, timing_line, freq_line, phase_line])
+                        # Update classification confidence
+                        for class_idx, class_line in enumerate(class_lines):
+                            if class_idx < progression[frame]['class_probs'].shape[1]:
+                                class_probs = [progression[i]['class_probs'][sample_idx][class_idx].item()
+                                            for i in steps_so_far]
+                                class_line.set_data(steps_so_far, class_probs)
 
-                    # Update convergence plot (average magnitudes across samples)
-                    steps_so_far = list(range(frame + 1))
-                    avg_timing_mags = []
-                    avg_freq_mags = []
-                    avg_phase_mags = []
+                        updates.extend([scatter, timing_line, freq_line, phase_line] + class_lines)
 
-                    for step in steps_so_far:
-                        timing_mags = [abs(progression[step]['timing_offset'][i].item()) for i in range(num_samples)]
-                        freq_mags = [abs(progression[step]['freq_offset'][i].item()) for i in range(num_samples)]
-                        phase_mags = [abs(progression[step]['phase_offset'][i].item()) for i in range(num_samples)]
-
-                        avg_timing_mags.append(sum(timing_mags) / len(timing_mags))
-                        avg_freq_mags.append(sum(freq_mags) / len(freq_mags))
-                        avg_phase_mags.append(sum(phase_mags) / len(phase_mags))
-
-                    conv_timing_line.set_data(steps_so_far, avg_timing_mags)
-                    conv_freq_line.set_data(steps_so_far, avg_freq_mags)
-                    conv_phase_line.set_data(steps_so_far, avg_phase_mags)
-
-                    updates.extend([conv_timing_line, conv_freq_line, conv_phase_line])
-
-                    # Update title with iteration info
+                    # Update main title (remove cumulative timing info)
                     timestep_val = progression[frame]["timestep"]
-                    iteration_type = "Iterative" if hasattr(progression[frame], 'input_signal') else "Single-step"
-                    fig.suptitle(f'{iteration_type} Synchronization - Step {frame}/{num_steps-1} (t={timestep_val:.0f})',
-                                fontsize=14, fontweight='bold')
+                    current_predictions = progression[frame]['class_preds']
+                    current_labels = labels.cpu()
+                    current_accuracy = (current_predictions == current_labels).float().mean().item()
+
+                    fig.suptitle(f'Diffusion Synchronization + Classification - Step {frame}/{num_steps-1} (t={timestep_val:.0f})\n'
+                                f'Current Accuracy: {current_accuracy:.3f}',
+                                fontsize=14, fontweight='bold', y=0.96)
 
                     return updates
 
@@ -900,8 +990,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             # Create animation
             anim = animation.FuncAnimation(
                 fig, animate, frames=num_steps,
-                interval=800,  # 800ms between frames
-                blit=False, repeat=True
+                interval=1000, blit=False, repeat=True
             )
 
             return fig, anim
@@ -913,7 +1002,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             return None, None
 
     def visualize_sync_progression(self):
-        """Create animated GIF visualization of synchronization progression"""
+        """Create enhanced synchronization visualization with classification"""
         if not self.val_samples_stored or self.stored_val_data is None:
             print("No validation data stored for visualization")
             return
@@ -927,9 +1016,9 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
             print(f"Creating animation with shapes: sync={sync_signals.shape}, unsync={unsync_signals.shape}")
 
-            # Use ITERATIVE synchronization for proper diffusion behavior
+            # Perform iterative synchronization
             final_signals, progression = self.iterative_synchronization_for_gif(
-                unsync_signals, labels, num_steps=20
+                unsync_signals, labels, num_steps=10
             )
 
             if not progression:
@@ -937,25 +1026,38 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
                 return
 
             print(f"Generated {len(progression)} progression steps")
-            print("Using iterative synchronization - each step builds on the previous result")
 
-            # Create animation
-            result = self.create_sync_animation(
+            # DEBUG: Check if cumulative data exists
+            if progression and 'cumulative_timing_offset' in progression[0]:
+                print("✓ Cumulative timing data found in progression")
+            else:
+                print("⚠ Cumulative timing data missing - using fallback calculation")
+
+            # Create enhanced animation with classification
+            result = self.create_sync_animation_with_classification(
                 unsync_signals.cpu(),
-                sync_signals.cpu(),
                 progression,
                 labels.cpu(),
                 snrs,
-                num_samples=2
+                num_samples=4
             )
 
-            if result[0] is None or result[1] is None:
-                print("Error: Animation creation failed")
+            # BETTER ERROR HANDLING
+            if result is None:
+                print("Error: create_sync_animation_with_classification returned None")
+                return
+
+            if not isinstance(result, tuple) or len(result) != 2:
+                print(f"Error: Expected tuple of length 2, got {type(result)} of length {len(result) if hasattr(result, '__len__') else 'unknown'}")
                 return
 
             fig, anim = result
 
-            # Save and log animation (same as before)
+            if fig is None or anim is None:
+                print("Error: Animation creation failed - fig or anim is None")
+                return
+
+            # Save and log animation
             if hasattr(self, 'logger') and self.logger is not None:
                 logger_class_name = self.logger.__class__.__name__
                 if 'WandbLogger' in logger_class_name:
@@ -965,72 +1067,70 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
                             anim.save(tmp_file.name, writer=writer)
 
                             self.logger.experiment.log({
-                                "iterative_synchronization_animation": wandb.Video(tmp_file.name, fps=1.25, format="gif"),
+                                "synchronization_classification_animation": wandb.Video(tmp_file.name, fps=1.25, format="gif"),
                                 "global_step": self.global_step,
                                 "epoch": self.current_epoch
                             })
 
                         os.unlink(tmp_file.name)
-                        print("Successfully logged iterative animation to WandB")
+                        print("Successfully logged enhanced animation to WandB")
 
                     except Exception as e:
                         print(f"Failed to log to WandB: {e}")
-                        local_filename = f'iterative_sync_animation_epoch_{self.current_epoch}.gif'
+                        local_filename = f'sync_class_animation_epoch_{self.current_epoch}.gif'
                         anim.save(local_filename, writer=PillowWriter(fps=1.25))
-                        print(f"Saved animation locally as {local_filename}")
+                        print(f"Saved enhanced animation locally as {local_filename}")
                 else:
-                    local_filename = f'iterative_sync_animation_epoch_{self.current_epoch}.gif'
+                    local_filename = f'sync_class_animation_epoch_{self.current_epoch}.gif'
                     anim.save(local_filename, writer=PillowWriter(fps=1.25))
-                    print(f"Saved animation locally as {local_filename}")
+                    print(f"Saved enhanced animation locally as {local_filename}")
             else:
-                local_filename = f'iterative_sync_animation_epoch_{self.current_epoch}.gif'
+                local_filename = f'sync_class_animation_epoch_{self.current_epoch}.gif'
                 anim.save(local_filename, writer=PillowWriter(fps=1.25))
-                print(f"Saved animation locally as {local_filename}")
+                print(f"Saved enhanced animation locally as {local_filename}")
 
             plt.close(fig)
-            print("Iterative animation creation completed successfully")
+            print("Enhanced animation creation completed successfully")
 
         except Exception as e:
-            print(f"Animation creation failed: {e}")
+            print(f"Enhanced animation creation failed: {e}")
             import traceback
             traceback.print_exc()
 
-    def on_train_epoch_end(self):
-        """Log training epoch metrics"""
-        if self.train_losses['total']:
-            for loss_type, losses in self.train_losses.items():
-                avg_loss = sum(losses) / len(losses)
-                self.log(f'train/epoch_{loss_type}_loss', avg_loss)
-                losses.clear()
+    def on_train_epoch_start(self):
+        """Log joint training status"""
+        print(f"\nEpoch {self.current_epoch}: Joint Training (Sync + Classification)")
+        print("   - UNet training 🔥")
+        print("   - Classifier training 🔥")
 
     def on_validation_epoch_end(self):
-        """Log validation epoch metrics and create animations"""
-        # Log averaged losses
-        if self.val_losses['total']:
-            for loss_type, losses in self.val_losses.items():
-                avg_loss = sum(losses) / len(losses)
-                self.log(f'val/epoch_{loss_type}_loss', avg_loss)
-                losses.clear()
+        """Create visualizations and SNR analysis for joint training"""
+        if self.validation_step_outputs:
+            # Create SNR vs accuracy plot
+            self.create_snr_vs_accuracy_plot()
+            self.validation_step_outputs.clear()
 
-        # Create animation every N epochs
-        self.visualize_sync_progression()
+        # Create animations periodically
+        if self.current_epoch % self.hparams.log_every_n_epochs == 0:
+            self.visualize_sync_progression()
 
     def configure_optimizers(self):
-        """Configure optimizer and scheduler with proper step order"""
+        """Configure optimizer for joint training"""
+        # Joint training: optimize both UNet and classifier parameters
+        all_params = list(self.model.parameters()) + list(self.classifier.parameters())
         optimizer = AdamW(
-            self.parameters(),
+            all_params,
             lr=self.hparams.learning_rate,
             weight_decay=0.01,
             betas=(0.9, 0.999)
         )
 
         if self.hparams.use_scheduler:
-            # Use step-based scheduler to avoid the warning
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
-                max_lr=self.hparams.learning_rate,
+                max_lr=optimizer.param_groups[0]['lr'],
                 total_steps=self.trainer.estimated_stepping_batches,
-                pct_start=0.1,  # 10% warmup
+                pct_start=0.1,
                 anneal_strategy='cos'
             )
 
@@ -1038,7 +1138,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
                 'optimizer': optimizer,
                 'lr_scheduler': {
                     'scheduler': scheduler,
-                    'interval': 'step',  # Step-based scheduling
+                    'interval': 'step',
                     'frequency': 1,
                     'name': 'learning_rate'
                 }
@@ -1046,7 +1146,123 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         return optimizer
 
+    def get_classifier_state_dict(self):
+        """Get classifier state dict for saving/loading"""
+        return self.classifier.state_dict()
 
+    def load_classifier_state_dict(self, state_dict):
+        """Load classifier state dict"""
+        self.classifier.load_state_dict(state_dict)
+
+    def freeze_classifier(self):
+        """Freeze classifier parameters"""
+        for param in self.classifier.parameters():
+            param.requires_grad = False
+
+    def unfreeze_classifier(self):
+        """Unfreeze classifier parameters"""
+        for param in self.classifier.parameters():
+            param.requires_grad = True
+
+    def freeze_unet(self):
+        """Freeze UNet parameters"""
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+    def unfreeze_unet(self):
+        """Unfreeze UNet parameters"""
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+    def get_classification_accuracy(self, signals: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Get classification accuracy for given signals and labels"""
+        with torch.no_grad():
+            logits = self.classifier(signals)
+            preds = torch.argmax(logits, dim=1)
+            accuracy = (preds == labels).float().mean()
+
+        return accuracy
+
+    def classify_signals(self, signals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Classify signals and return predictions and probabilities"""
+        with torch.no_grad():
+            logits = self.classifier(signals)
+            probs = F.softmax(logits, dim=-1)
+            preds = torch.argmax(logits, dim=1)
+
+        return preds, probs
+
+    def get_sync_and_classification_loss(self, batch):
+        """Get both synchronization and classification losses for analysis"""
+        sync_signals, unsync_signals, labels, snrs, sync_params = batch
+        batch_size = sync_signals.shape[0]
+
+        # Normalize sync parameters
+        true_timing, true_freq, true_phase = sync_params
+        norm_true_timing, norm_true_freq, norm_true_phase = self.normalize_sync_params(
+            true_timing, true_freq, true_phase
+        )
+
+        # Random timesteps for training
+        timesteps = torch.randint(0, self.hparams.num_train_timesteps, (batch_size,), device=self.device)
+        interpolated_signals = self.create_sync_interpolation(sync_signals, unsync_signals, timesteps)
+
+        # Get sync predictions
+        sync_output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
+
+        # Apply corrections
+        synchronized_signals = self.apply_predicted_sync(
+            interpolated_signals,
+            sync_output['timing_offset'],
+            sync_output['freq_offset'],
+            sync_output['phase_offset']
+        )
+
+        # Calculate step-wise sync loss
+        alpha_current = self.get_interpolation_alpha(timesteps).to(self.device)
+        next_timesteps = torch.clamp(timesteps - 1, 0, self.hparams.num_train_timesteps - 1)
+        alpha_next = self.get_interpolation_alpha(next_timesteps).to(self.device)
+        step_alpha = torch.where(timesteps == 0, torch.zeros_like(alpha_current), alpha_current - alpha_next)
+
+        target_timing = norm_true_timing * step_alpha
+        target_freq = norm_true_freq * step_alpha
+        target_phase = norm_true_phase * step_alpha
+
+        sync_loss = (
+            F.mse_loss(sync_output['timing_offset'].squeeze(), target_timing) +
+            F.mse_loss(sync_output['freq_offset'].squeeze(), target_freq) +
+            F.mse_loss(sync_output['phase_offset'].squeeze(), target_phase)
+        )
+
+        # Get classification loss
+        class_logits = self.classifier(synchronized_signals)
+        classification_loss = self.classification_criterion(class_logits, labels)
+
+        return sync_loss, classification_loss, synchronized_signals, class_logits
+
+    def evaluate_sync_quality(self, signals: torch.Tensor, reference_signals: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Evaluate synchronization quality metrics"""
+        with torch.no_grad():
+            # Convert to complex
+            signals_complex = signals[:, 0] + 1j * signals[:, 1]
+            reference_complex = reference_signals[:, 0] + 1j * reference_signals[:, 1]
+
+            # Calculate EVM (Error Vector Magnitude)
+            error_vectors = signals_complex - reference_complex
+            evm = torch.mean(torch.abs(error_vectors) ** 2, dim=1)
+
+            # Calculate constellation tightness (standard deviation of points)
+            constellation_std = torch.std(signals_complex, dim=1)
+
+            # Calculate phase coherence
+            phase_diff = torch.angle(signals_complex[:, 1:]) - torch.angle(signals_complex[:, :-1])
+            phase_coherence = torch.mean(torch.abs(phase_diff), dim=1)
+
+            return {
+                'evm': evm,
+                'constellation_std': constellation_std,
+                'phase_coherence': phase_coherence
+            }
 
 class BaselineClassifier(L.LightningModule):
     """
@@ -1396,7 +1612,9 @@ class HybridConvTransformer(nn.Module):
             d_model=trans_dim,
             nhead=n_heads,
             dim_feedforward=trans_dim * 4,
+            dropout=0.1,
             activation="gelu",
+            batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
