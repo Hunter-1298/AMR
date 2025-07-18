@@ -1,4 +1,5 @@
 import torch
+import umap
 import matplotlib.animation as animation
 from matplotlib.animation import PillowWriter
 import tempfile  # Add this missing import
@@ -98,11 +99,12 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         conv_hidden: tuple = (32,64,128),
         trans_dim: int = 256,
         n_heads: int = 8,
-        n_layers: int = 3,
+        n_layers: int = 4,
         mlp_hidden: int = 256,
 
         # Loss weights for joint training
-        lambda_sync: float = 1.0,      # Synchronization loss weight
+        # lambda_sync: float = 5.0,      # Synchronization loss weight
+        lambda_sync: float = 0.0,      # Synchronization loss weight
         lambda_class: float = 1.0,     # Classification loss weight
 
         # Training schedule
@@ -227,19 +229,18 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             true_timing, true_freq, true_phase
         )
 
-        # === SYNCHRONIZATION LOSS (STEP-WISE FOR EFFICIENCY) ===
+        # === SYNCHRONIZATION LOSS (STEP-WISE) ===
         timesteps = torch.randint(0, self.hparams.num_train_timesteps, (batch_size,), device=self.device)
         interpolated_signals = self.create_sync_interpolation(sync_signals, unsync_signals, timesteps)
 
-        # Get sync model predictions
         sync_output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
 
-        # Calculate step-wise targets
+        # STEP-WISE TARGETS: How much to correct to get to the next step
         alpha_current = self.get_interpolation_alpha(timesteps).to(self.device)
         next_timesteps = torch.clamp(timesteps - 1, 0, self.hparams.num_train_timesteps - 1)
         alpha_next = self.get_interpolation_alpha(next_timesteps).to(self.device)
 
-        # For t=0, step should be zero
+        # For t=0, step should be zero (already at target)
         step_alpha = torch.where(timesteps == 0,
                                 torch.zeros_like(alpha_current),
                                 alpha_current - alpha_next)
@@ -252,7 +253,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         timing_mse = F.mse_loss(sync_output['timing_offset'].squeeze(), target_timing)
         freq_mse = F.mse_loss(sync_output['freq_offset'].squeeze(), target_freq)
         phase_mse = F.mse_loss(sync_output['phase_offset'].squeeze(), target_phase)
-
         sync_loss = timing_mse + freq_mse + phase_mse
 
         # === CLASSIFICATION LOSS (FULLY SYNCHRONIZED SIGNALS) ===
@@ -260,14 +260,13 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         classification_acc = torch.tensor(0.0, device=self.device)
 
         # Run FULL iterative synchronization for classification training
-        # Use the same function as visualization but enable gradients
-        with torch.enable_grad():  # Explicitly enable gradients
-            fully_synchronized_signals, _ = self.iterative_synchronization_for_gif(
-                unsync_signals, labels, num_steps=5
-            )
+        fully_synchronized_signals, _ = self.iterative_synchronization_for_gif(
+            unsync_signals, labels, num_steps=10
+        )
 
         # Train classifier on FULLY synchronized signals
         class_logits = self.classifier(fully_synchronized_signals)
+        # class_logits = self.classifier(unsync_signals)
         classification_loss = self.classification_criterion(class_logits, labels)
 
         # Calculate accuracy
@@ -298,25 +297,10 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         self.log('train/avg_step_freq', avg_step_freq)
         self.log('train/avg_step_phase', avg_step_phase)
 
-        # Log by timestep ranges
-        high_t_mask = timesteps >= 15
-        med_t_mask = (timesteps >= 5) & (timesteps < 15)
-        low_t_mask = timesteps < 5
-
-        if high_t_mask.any():
-            self.log('train/step_size_high_t', torch.mean(step_alpha[high_t_mask]))
-            self.log('train/pred_timing_high_t', torch.mean(torch.abs(sync_output['timing_offset'][high_t_mask])))
-        if med_t_mask.any():
-            self.log('train/step_size_med_t', torch.mean(step_alpha[med_t_mask]))
-            self.log('train/pred_timing_med_t', torch.mean(torch.abs(sync_output['timing_offset'][med_t_mask])))
-        if low_t_mask.any():
-            self.log('train/step_size_low_t', torch.mean(step_alpha[low_t_mask]))
-            self.log('train/pred_timing_low_t', torch.mean(torch.abs(sync_output['timing_offset'][low_t_mask])))
-
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation with full iterative synchronization for consistent evaluation"""
+        """Validation with step-wise corrections"""
         sync_signals, unsync_signals, labels, snrs, sync_params = batch
         batch_size = sync_signals.shape[0]
 
@@ -326,13 +310,13 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             true_timing, true_freq, true_phase
         )
 
-        # Store first batch for visualization (with normalized params)
+        # # Store first batch for visualization
         if batch_idx == 0 and not self.val_samples_stored:
             self.stored_val_data = {
                 'sync_signals': sync_signals[:self.hparams.vis_batch_size].cpu(),
                 'unsync_signals': unsync_signals[:self.hparams.vis_batch_size].cpu(),
-                'labels': labels[:self.hparams.vis_batch_size].cpu(),
                 'snrs': snrs[:self.hparams.vis_batch_size].cpu(),
+                'labels': labels[:self.hparams.vis_batch_size].cpu(),
                 'sync_params': (
                     norm_true_timing[:self.hparams.vis_batch_size].cpu(),
                     norm_true_freq[:self.hparams.vis_batch_size].cpu(),
@@ -365,12 +349,10 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             )
 
             # === CLASSIFICATION ON FULLY SYNCHRONIZED SIGNALS ===
-            # Run FULL iterative synchronization - same as training
             fully_synchronized_signals, progression = self.iterative_synchronization_for_gif(
-                unsync_signals, labels, num_steps=5
+                unsync_signals, labels, num_steps=10
             )
 
-            # Classify the fully synchronized signals
             class_logits = self.classifier(fully_synchronized_signals)
             class_loss = self.classification_criterion(class_logits, labels)
             class_preds = torch.argmax(class_logits, dim=1)
@@ -391,7 +373,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         self.log('val/class_loss', class_loss, on_epoch=True)
         self.log('val/class_acc', class_acc, on_epoch=True, prog_bar=True)
 
-        # Log per-class accuracy - UPDATED TO USE ACTUAL LABEL NAMES
+        # Log per-class accuracy
         for i, label_name in enumerate(self.label_names):
             class_mask = labels == i
             if class_mask.sum() > 0:
@@ -418,7 +400,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         progression = []
         cumulative_timing = torch.zeros(current_signal.shape[0], device=device)  # Track cumulative timing
 
-        # Reverse diffusion schedule
+        # # Reverse diffusion schedule
         timesteps = torch.linspace(
             self.hparams.num_train_timesteps - 1, 0, num_steps
         ).long().to(device)
@@ -558,7 +540,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         print("Expected: step sizes should decrease as timestep decreases")
         print("-" * 80)
 
-        for t in [19, 15, 10, 5, 0]:
+        for t in [9, 7, 5 ,2,0]:
             t_batch = torch.full((1,), t, device=device)
 
             output = self.model(unsync_signal, t_batch, modulation, return_dict=True)
@@ -585,66 +567,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         print("-" * 80)
 
-    @torch.no_grad()
-    def iterative_synchronization_for_gif(
-        self,
-        unsync_signal: torch.Tensor,
-        modulation: torch.Tensor,
-        num_steps: int = 10
-    ) -> Tuple[torch.Tensor, List[Dict]]:
-        """Iterative synchronization with step-wise corrections for visualization"""
-        device = unsync_signal.device
-        current_signal = unsync_signal.clone()
-
-        progression = []
-
-        # Reverse diffusion schedule
-        timesteps = torch.linspace(
-            self.hparams.num_train_timesteps - 1, 0, num_steps
-        ).long().to(device)
-
-        for step, t in enumerate(timesteps):
-            t_batch = torch.full((current_signal.shape[0],), t, device=device)
-
-            # Get model prediction (should be step-wise correction)
-            output = self.model(current_signal, t_batch, modulation, return_dict=True)
-
-            # Apply step-wise corrections to current signal
-            corrected_signal = self.apply_predicted_sync(
-                current_signal,
-                output['timing_offset'],
-                output['freq_offset'],
-                output['phase_offset']
-            )
-
-            # Get classification for this step
-            if self.should_do_classification():
-                class_logits = self.classifier(corrected_signal)
-                class_probs = F.softmax(class_logits, dim=-1)
-                class_preds = torch.argmax(class_logits, dim=1)
-            else:
-                class_probs = torch.zeros((corrected_signal.shape[0], self.hparams.num_classes))
-                class_preds = torch.zeros((corrected_signal.shape[0],), dtype=torch.long)
-
-            # Store step info
-            step_info = {
-                'step': step,
-                'timestep': t.item(),
-                'signal': corrected_signal.cpu().clone(),
-                'input_signal': current_signal.cpu().clone(),
-                'timing_offset': output['timing_offset'].cpu().clone(),
-                'freq_offset': output['freq_offset'].cpu().clone(),
-                'phase_offset': output['phase_offset'].cpu().clone(),
-                'class_probs': class_probs.cpu().clone(),
-                'class_preds': class_preds.cpu().clone(),
-            }
-
-            progression.append(step_info)
-
-            # Update for next iteration (key: step-wise application)
-            current_signal = corrected_signal.detach()
-
-        return current_signal, progression
 
     def create_snr_vs_accuracy_plot(self):
         """Create SNR vs Classification Accuracy plot"""
@@ -793,7 +715,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             param_lines = []
 
             # Base symbol stride and calculate corrected indices for each step
-            symbol_stride = 16
+            symbol_stride = 8
             signal_length = unsync_signals.shape[2]
             base_symbol_indices = torch.arange(0, signal_length, symbol_stride)
 
@@ -1027,11 +949,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
             print(f"Generated {len(progression)} progression steps")
 
-            # DEBUG: Check if cumulative data exists
-            if progression and 'cumulative_timing_offset' in progression[0]:
-                print("✓ Cumulative timing data found in progression")
-            else:
-                print("⚠ Cumulative timing data missing - using fallback calculation")
 
             # Create enhanced animation with classification
             result = self.create_sync_animation_with_classification(
@@ -1097,6 +1014,705 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             import traceback
             traceback.print_exc()
 
+    def create_umap_visualization(self):
+        """Create UMAP visualization of bottleneck features"""
+        if not self.val_samples_stored or self.stored_val_data is None:
+            print("No validation data stored for UMAP visualization")
+            return
+
+        try:
+            # Get stored validation data
+            unsync_signals = self.stored_val_data['unsync_signals'].to(self.device)
+            labels = self.stored_val_data['labels'].to(self.device)
+            snrs = self.stored_val_data['snrs']
+
+            # Use more samples for better UMAP (up to 100)
+            max_samples = min(100, len(unsync_signals))
+            unsync_signals = unsync_signals[:max_samples]
+            labels = labels[:max_samples]
+            snrs = snrs[:max_samples]
+
+            print(f"Creating UMAP visualization with {max_samples} samples...")
+
+            # Collect bottleneck features from different timesteps
+            all_features = []
+            all_labels = []
+            all_snrs = []
+            all_timesteps = []
+
+            # Test multiple timesteps to see how bottleneck space changes
+            test_timesteps = [0, 2, 5, 7, 9]  # From synchronized to unsynchronized
+
+            with torch.no_grad():
+                for t in test_timesteps:
+                    t_batch = torch.full((max_samples,), t, device=self.device)
+
+                    # Get bottleneck features by extracting from UNet
+                    bottleneck_features = self.extract_bottleneck_features(
+                        unsync_signals, t_batch, labels
+                    )
+
+                    # Store features and metadata
+                    all_features.append(bottleneck_features.cpu().numpy())
+                    all_labels.extend(labels.cpu().numpy())
+                    all_snrs.extend(snrs.numpy())
+                    all_timesteps.extend([t] * max_samples)
+
+            # Concatenate all features
+            all_features = np.vstack(all_features)  # Shape: [num_samples * num_timesteps, feature_dim]
+            all_labels = np.array(all_labels)
+            all_snrs = np.array(all_snrs)
+            all_timesteps = np.array(all_timesteps)
+
+            print(f"UMAP input shape: {all_features.shape}")
+
+            # Apply UMAP
+            umap_reducer = umap.UMAP(
+                n_neighbors=15,
+                min_dist=0.1,
+                n_components=2,
+                metric='euclidean',
+                random_state=42
+            )
+
+            umap_embedding = umap_reducer.fit_transform(all_features)
+
+            # Create visualizations
+            self.plot_umap_by_class(umap_embedding, all_labels, all_timesteps, all_snrs)
+            self.plot_umap_by_timestep(umap_embedding, all_labels, all_timesteps, all_snrs)
+
+            print("UMAP visualization completed successfully")
+
+        except Exception as e:
+            print(f"Error creating UMAP visualization: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def extract_bottleneck_features(self, sample, timestep, modulation):
+        """Extract bottleneck features from UNet without parameter prediction"""
+        # Ensure correct dtypes
+        sample = sample.float()
+        timestep = timestep.long()
+        modulation = modulation.long()
+
+        # Time embedding
+        t_emb = self.model.time_proj(timestep)
+        t_emb = self.model.time_embedding(t_emb)
+
+        # Modulation conditioning
+        context = None
+        if self.model.mod_embedding is not None:
+            mod_emb = self.model.mod_embedding(modulation)
+            t_emb = t_emb + mod_emb
+
+        # Down path
+        x = sample
+        for down_block in self.model.down_blocks:
+            x, _ = down_block(hidden_states=x, temb=t_emb, context=context)
+
+        # Bottleneck
+        bottleneck_features = self.model.mid_block(hidden_states=x, temb=t_emb, context=context)
+
+        # Global average pooling to get fixed-size features
+        pooled_features = F.adaptive_avg_pool1d(bottleneck_features, 1).squeeze(-1)
+
+        return pooled_features
+
+    def plot_umap_by_class(self, umap_embedding, labels, timesteps, snrs):
+        """Plot UMAP colored by modulation class"""
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+        # Plot 1: Colored by class
+        ax1 = axes[0]
+        colors = ['red', 'blue', 'green', 'orange', 'purple']
+        class_names = self.label_names if hasattr(self, 'label_names') else [f'Class_{i}' for i in range(3)]
+
+        for class_idx, class_name in enumerate(class_names):
+            mask = labels == class_idx
+            if mask.sum() > 0:
+                ax1.scatter(
+                    umap_embedding[mask, 0],
+                    umap_embedding[mask, 1],
+                    c=colors[class_idx % len(colors)],
+                    label=class_name,
+                    alpha=0.7,
+                    s=30
+                )
+
+        ax1.set_xlabel('UMAP Dimension 1', fontsize=12)
+        ax1.set_ylabel('UMAP Dimension 2', fontsize=12)
+        ax1.set_title('UNet Bottleneck Features by Modulation Class', fontsize=14, fontweight='bold')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # Plot 2: Colored by SNR
+        ax2 = axes[1]
+        scatter = ax2.scatter(
+            umap_embedding[:, 0],
+            umap_embedding[:, 1],
+            c=snrs,
+            cmap='viridis',
+            alpha=0.7,
+            s=30
+        )
+
+        ax2.set_xlabel('UMAP Dimension 1', fontsize=12)
+        ax2.set_ylabel('UMAP Dimension 2', fontsize=12)
+        ax2.set_title('UNet Bottleneck Features by SNR', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+
+        # Add colorbar
+        plt.colorbar(scatter, ax=ax2, label='SNR (dB)')
+
+        plt.tight_layout()
+
+        # Log to wandb
+        if hasattr(self, 'logger') and self.logger is not None:
+            logger_class_name = self.logger.__class__.__name__
+            if 'WandbLogger' in logger_class_name:
+                self.logger.experiment.log({
+                    "umap_bottleneck_by_class": wandb.Image(fig),
+                    "epoch": self.current_epoch
+                })
+                print("UMAP by class plot logged to WandB")
+
+        # Save locally
+        plot_filename = f'umap_by_class_epoch_{self.current_epoch}.png'
+        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"UMAP by class plot saved as {plot_filename}")
+
+        plt.close(fig)
+
+    def plot_umap_by_timestep(self, umap_embedding, labels, timesteps, snrs):
+        """Plot UMAP colored by timestep"""
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+        # Plot 1: Colored by timestep
+        ax1 = axes[0]
+        scatter1 = ax1.scatter(
+            umap_embedding[:, 0],
+            umap_embedding[:, 1],
+            c=timesteps,
+            cmap='plasma',
+            alpha=0.7,
+            s=30
+        )
+
+        ax1.set_xlabel('UMAP Dimension 1', fontsize=12)
+        ax1.set_ylabel('UMAP Dimension 2', fontsize=12)
+        ax1.set_title('UNet Bottleneck Features by Timestep', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        plt.colorbar(scatter1, ax=ax1, label='Timestep')
+
+        # Plot 2: Separate by timestep with different markers
+        ax2 = axes[1]
+        timestep_colors = ['purple', 'blue', 'green', 'orange', 'red']
+        markers = ['o', 's', '^', 'D', 'v']
+
+        unique_timesteps = np.unique(timesteps)
+        for i, t in enumerate(unique_timesteps):
+            mask = timesteps == t
+            ax2.scatter(
+                umap_embedding[mask, 0],
+                umap_embedding[mask, 1],
+                c=timestep_colors[i % len(timestep_colors)],
+                marker=markers[i % len(markers)],
+                label=f't={t}',
+                alpha=0.7,
+                s=30
+            )
+
+        ax2.set_xlabel('UMAP Dimension 1', fontsize=12)
+        ax2.set_ylabel('UMAP Dimension 2', fontsize=12)
+        ax2.set_title('UNet Bottleneck Features by Timestep (Detailed)', fontsize=14, fontweight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # Log to wandb
+        if hasattr(self, 'logger') and self.logger is not None:
+            logger_class_name = self.logger.__class__.__name__
+            if 'WandbLogger' in logger_class_name:
+                self.logger.experiment.log({
+                    "umap_bottleneck_by_timestep": wandb.Image(fig),
+                    "epoch": self.current_epoch
+                })
+                print("UMAP by timestep plot logged to WandB")
+
+        # Save locally
+        plot_filename = f'umap_by_timestep_epoch_{self.current_epoch}.png'
+        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"UMAP by timestep plot saved as {plot_filename}")
+
+        plt.close(fig)
+
+    def calculate_ber_analysis(self):
+        """Calculate BER for synchronized vs unsynchronized signals"""
+        if not self.val_samples_stored or self.stored_val_data is None:
+            print("No validation data stored for BER analysis")
+            return
+
+        try:
+            # Get stored validation data
+            sync_signals = self.stored_val_data['sync_signals'].to(self.device)
+            unsync_signals = self.stored_val_data['unsync_signals'].to(self.device)
+            labels = self.stored_val_data['labels'].to(self.device)
+            snrs = self.stored_val_data['snrs']
+
+            # Use more samples for better BER statistics
+            max_samples = min(200, len(unsync_signals))
+            sync_signals = sync_signals[:max_samples]
+            unsync_signals = unsync_signals[:max_samples]
+            labels = labels[:max_samples]
+            snrs = snrs[:max_samples]
+
+            print(f"Calculating BER for {max_samples} samples...")
+
+            with torch.no_grad():
+                # Get fully synchronized signals from diffusion model
+                diffusion_sync_signals, _ = self.iterative_synchronization_for_gif(
+                    unsync_signals, labels, num_steps=10
+                )
+
+                # Calculate BER for each condition
+                ber_results = {
+                    'snrs': snrs.numpy(),
+                    'labels': labels.cpu().numpy(),
+                    'unsync_ber': [],
+                    'perfect_sync_ber': [],
+                    'diffusion_sync_ber': [],
+                }
+
+                for i in range(max_samples):
+                    # Get signals for this sample
+                    unsync_sig = unsync_signals[i].cpu().numpy()
+                    perfect_sync_sig = sync_signals[i].cpu().numpy()
+                    diffusion_sync_sig = diffusion_sync_signals[i].cpu().numpy()
+
+                    modulation_type = labels[i].item()
+                    snr_db = snrs[i].item()
+
+                    # Generate reference bits for this sample
+                    ref_bits = self.generate_reference_bits(perfect_sync_sig, modulation_type)
+
+                    # Calculate BER for each condition
+                    unsync_ber = self.calculate_ber_for_signal(unsync_sig, ref_bits, modulation_type)
+                    perfect_ber = self.calculate_ber_for_signal(perfect_sync_sig, ref_bits, modulation_type)
+                    diffusion_ber = self.calculate_ber_for_signal(diffusion_sync_sig, ref_bits, modulation_type)
+
+                    ber_results['unsync_ber'].append(unsync_ber)
+                    ber_results['perfect_sync_ber'].append(perfect_ber)
+                    ber_results['diffusion_sync_ber'].append(diffusion_ber)
+
+                # Convert to numpy arrays
+                for key in ['unsync_ber', 'perfect_sync_ber', 'diffusion_sync_ber']:
+                    ber_results[key] = np.array(ber_results[key])
+
+                # Create BER plots
+                self.plot_ber_vs_snr(ber_results)
+                self.plot_ber_by_modulation(ber_results)
+                self.plot_ber_improvement(ber_results)
+
+                print("BER analysis completed successfully")
+
+        except Exception as e:
+            print(f"Error in BER analysis: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def generate_reference_bits(self, perfect_sync_signal: np.ndarray, modulation_type: int) -> np.ndarray:
+        """Generate reference bits from the perfectly synchronized signal"""
+        # Convert to complex
+        complex_signal = perfect_sync_signal[0] + 1j * perfect_sync_signal[1]
+
+        # Simple symbol detection (downsample to symbol rate)
+        # Assuming 8 samples per symbol
+        sps = 8
+        symbols = complex_signal[::sps]
+
+        # Demodulate based on modulation type
+        if modulation_type == 0:  # QPSK
+            bits = self.demodulate_qpsk(symbols)
+        elif modulation_type == 1:  # 8PSK
+            bits = self.demodulate_8psk(symbols)
+        elif modulation_type == 2:  # 16PSK
+            bits = self.demodulate_16psk(symbols)
+        else:
+            bits = np.array([])
+
+        return bits
+
+    def calculate_ber_for_signal(self, signal: np.ndarray, ref_bits: np.ndarray, modulation_type: int) -> float:
+        """Calculate BER for a given signal compared to reference bits"""
+        if len(ref_bits) == 0:
+            return 1.0  # Maximum error rate
+
+        try:
+            # Convert to complex
+            complex_signal = signal[0] + 1j * signal[1]
+
+            # Simple symbol detection
+            sps = 8
+            symbols = complex_signal[::sps]
+
+            # Ensure same length as reference
+            min_len = min(len(symbols), len(ref_bits) // self.bits_per_symbol(modulation_type))
+            symbols = symbols[:min_len]
+            ref_bits = ref_bits[:min_len * self.bits_per_symbol(modulation_type)]
+
+            # Demodulate
+            if modulation_type == 0:  # QPSK
+                demod_bits = self.demodulate_qpsk(symbols)
+            elif modulation_type == 1:  # 8PSK
+                demod_bits = self.demodulate_8psk(symbols)
+            elif modulation_type == 2:  # 16PSK
+                demod_bits = self.demodulate_16psk(symbols)
+            else:
+                return 1.0
+
+            # Calculate BER
+            if len(demod_bits) == 0 or len(ref_bits) == 0:
+                return 1.0
+
+            min_bits = min(len(demod_bits), len(ref_bits))
+            errors = np.sum(demod_bits[:min_bits] != ref_bits[:min_bits])
+            ber = errors / min_bits
+
+            return ber
+
+        except Exception as e:
+            print(f"Error calculating BER: {e}")
+            return 1.0
+
+    def bits_per_symbol(self, modulation_type: int) -> int:
+        """Return bits per symbol for each modulation type"""
+        if modulation_type == 0:  # QPSK
+            return 2
+        elif modulation_type == 1:  # 8PSK
+            return 3
+        elif modulation_type == 2:  # 16PSK
+            return 4
+        else:
+            return 1
+
+    def demodulate_qpsk(self, symbols: np.ndarray) -> np.ndarray:
+        """Simple QPSK demodulation"""
+        # Normalize symbols
+        symbols = symbols / (np.abs(symbols) + 1e-8)
+
+        # Decision regions
+        bits = []
+        for symbol in symbols:
+            if symbol.real > 0 and symbol.imag > 0:  # Q1
+                bits.extend([0, 0])
+            elif symbol.real < 0 and symbol.imag > 0:  # Q2
+                bits.extend([0, 1])
+            elif symbol.real < 0 and symbol.imag < 0:  # Q3
+                bits.extend([1, 1])
+            else:  # Q4
+                bits.extend([1, 0])
+
+        return np.array(bits)
+
+    def demodulate_8psk(self, symbols: np.ndarray) -> np.ndarray:
+        """Simple 8PSK demodulation"""
+        # Normalize symbols
+        symbols = symbols / (np.abs(symbols) + 1e-8)
+
+        # Calculate angles
+        angles = np.angle(symbols)
+
+        # 8PSK decision regions (0 to 2π divided into 8 regions)
+        bits = []
+        for angle in angles:
+            # Convert to 0-2π range
+            if angle < 0:
+                angle += 2 * np.pi
+
+            # Determine symbol (0-7)
+            symbol_idx = int(np.round(angle / (2 * np.pi / 8))) % 8
+
+            # Convert to 3 bits
+            bit_pattern = [
+                (symbol_idx >> 2) & 1,
+                (symbol_idx >> 1) & 1,
+                symbol_idx & 1
+            ]
+            bits.extend(bit_pattern)
+
+        return np.array(bits)
+
+    def demodulate_16psk(self, symbols: np.ndarray) -> np.ndarray:
+        """Simple 16PSK demodulation"""
+        # Normalize symbols
+        symbols = symbols / (np.abs(symbols) + 1e-8)
+
+        # Calculate angles
+        angles = np.angle(symbols)
+
+        # 16PSK decision regions
+        bits = []
+        for angle in angles:
+            # Convert to 0-2π range
+            if angle < 0:
+                angle += 2 * np.pi
+
+            # Determine symbol (0-15)
+            symbol_idx = int(np.round(angle / (2 * np.pi / 16))) % 16
+
+            # Convert to 4 bits
+            bit_pattern = [
+                (symbol_idx >> 3) & 1,
+                (symbol_idx >> 2) & 1,
+                (symbol_idx >> 1) & 1,
+                symbol_idx & 1
+            ]
+            bits.extend(bit_pattern)
+
+        return np.array(bits)
+    def plot_ber_vs_snr(self, ber_results: Dict):
+        """Plot BER vs SNR for different synchronization conditions"""
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        # Define SNR bins
+        snr_bins = [(-20, -15), (-15, -10), (-10, -5), (-5, 0), (0, 5), (5, 10),
+                    (10, 15), (15, 20), (20, 25), (25, 30)]
+        snr_centers = [(low + high) / 2 for low, high in snr_bins]
+
+        # Calculate average BER per SNR bin
+        avg_ber = {condition: [] for condition in ['unsync_ber', 'perfect_sync_ber', 'diffusion_sync_ber']}
+
+        for snr_min, snr_max in snr_bins:
+            mask = (ber_results['snrs'] >= snr_min) & (ber_results['snrs'] < snr_max)
+
+            for condition in avg_ber.keys():
+                if mask.sum() > 0:
+                    avg_ber[condition].append(np.mean(ber_results[condition][mask]))
+                else:
+                    avg_ber[condition].append(np.nan)
+
+        # Plot overall BER comparison
+        ax1 = axes[0]
+        ax1.semilogy(snr_centers, avg_ber['unsync_ber'], 'r-o', label='Unsynchronized', linewidth=2, markersize=6)
+        ax1.semilogy(snr_centers, avg_ber['perfect_sync_ber'], 'g-s', label='Perfect Sync', linewidth=2, markersize=6)
+        ax1.semilogy(snr_centers, avg_ber['diffusion_sync_ber'], 'b-^', label='Diffusion Sync', linewidth=2, markersize=6)
+
+        ax1.set_xlabel('SNR (dB)', fontsize=12)
+        ax1.set_ylabel('Bit Error Rate', fontsize=12)
+        ax1.set_title('BER vs SNR Comparison', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(fontsize=10)
+        ax1.set_xlim(-22, 32)
+
+        # Plot BER improvement (diffusion vs unsync)
+        ax2 = axes[1]
+        improvement = np.array(avg_ber['unsync_ber']) / (np.array(avg_ber['diffusion_sync_ber']) + 1e-10)
+        ax2.semilogy(snr_centers, improvement, 'purple', linewidth=3, marker='o', markersize=8)
+        ax2.axhline(y=1, color='gray', linestyle='--', alpha=0.5, label='No Improvement')
+
+        ax2.set_xlabel('SNR (dB)', fontsize=12)
+        ax2.set_ylabel('BER Improvement Factor', fontsize=12)
+        ax2.set_title('BER Improvement: Unsync/Diffusion', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(fontsize=10)
+        ax2.set_xlim(-22, 32)
+
+        # Plot synchronization efficiency
+        ax3 = axes[2]
+        perfect_improvement = np.array(avg_ber['unsync_ber']) / (np.array(avg_ber['perfect_sync_ber']) + 1e-10)
+        diffusion_improvement = np.array(avg_ber['unsync_ber']) / (np.array(avg_ber['diffusion_sync_ber']) + 1e-10)
+        efficiency = diffusion_improvement / (perfect_improvement + 1e-10)
+
+        ax3.plot(snr_centers, efficiency, 'orange', linewidth=3, marker='s', markersize=8)
+        ax3.axhline(y=1, color='gray', linestyle='--', alpha=0.5, label='Perfect Efficiency')
+        ax3.axhline(y=0.5, color='red', linestyle=':', alpha=0.5, label='50% Efficiency')
+
+        ax3.set_xlabel('SNR (dB)', fontsize=12)
+        ax3.set_ylabel('Sync Efficiency', fontsize=12)
+        ax3.set_title('Synchronization Efficiency', fontsize=14, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(fontsize=10)
+        ax3.set_xlim(-22, 32)
+        ax3.set_ylim(0, 1.2)
+
+        plt.tight_layout()
+
+        # Log to wandb
+        if hasattr(self, 'logger') and self.logger is not None:
+            logger_class_name = self.logger.__class__.__name__
+            if 'WandbLogger' in logger_class_name:
+                self.logger.experiment.log({
+                    "ber_vs_snr": wandb.Image(fig),
+                    "epoch": self.current_epoch
+                })
+                print("BER vs SNR plot logged to WandB")
+
+        # Save locally
+        plot_filename = f'ber_vs_snr_epoch_{self.current_epoch}.png'
+        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"BER vs SNR plot saved as {plot_filename}")
+
+        plt.close(fig)
+
+    def plot_ber_by_modulation(self, ber_results: Dict):
+        """Plot BER by modulation type"""
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        modulation_names = ['QPSK', '8PSK', '16PSK']
+        colors = ['red', 'blue', 'green']
+
+        for mod_idx, (mod_name, color) in enumerate(zip(modulation_names, colors)):
+            ax = axes[mod_idx]
+
+            # Filter by modulation type
+            mask = ber_results['labels'] == mod_idx
+
+            if mask.sum() > 0:
+                snrs = ber_results['snrs'][mask]
+                unsync_ber = ber_results['unsync_ber'][mask]
+                perfect_ber = ber_results['perfect_sync_ber'][mask]
+                diffusion_ber = ber_results['diffusion_sync_ber'][mask]
+
+                # Sort by SNR for better plotting
+                sort_idx = np.argsort(snrs)
+                snrs = snrs[sort_idx]
+                unsync_ber = unsync_ber[sort_idx]
+                perfect_ber = perfect_ber[sort_idx]
+                diffusion_ber = diffusion_ber[sort_idx]
+
+                # Plot with some smoothing
+                ax.semilogy(snrs, unsync_ber, 'r-o', alpha=0.7, label='Unsynchronized', markersize=4)
+                ax.semilogy(snrs, perfect_ber, 'g-s', alpha=0.7, label='Perfect Sync', markersize=4)
+                ax.semilogy(snrs, diffusion_ber, 'b-^', alpha=0.7, label='Diffusion Sync', markersize=4)
+
+            ax.set_xlabel('SNR (dB)', fontsize=12)
+            ax.set_ylabel('Bit Error Rate', fontsize=12)
+            ax.set_title(f'{mod_name} BER Performance', fontsize=14, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=10)
+            ax.set_xlim(-22, 32)
+
+        plt.tight_layout()
+
+        # Log to wandb
+        if hasattr(self, 'logger') and self.logger is not None:
+            logger_class_name = self.logger.__class__.__name__
+            if 'WandbLogger' in logger_class_name:
+                self.logger.experiment.log({
+                    "ber_by_modulation": wandb.Image(fig),
+                    "epoch": self.current_epoch
+                })
+                print("BER by modulation plot logged to WandB")
+
+        # Save locally
+        plot_filename = f'ber_by_modulation_epoch_{self.current_epoch}.png'
+        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"BER by modulation plot saved as {plot_filename}")
+
+        plt.close(fig)
+
+    def plot_ber_improvement(self, ber_results: Dict):
+        """Plot BER improvement statistics"""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # Calculate improvements
+        ber_improvement = ber_results['unsync_ber'] / (ber_results['diffusion_sync_ber'] + 1e-10)
+        perfect_improvement = ber_results['unsync_ber'] / (ber_results['perfect_sync_ber'] + 1e-10)
+
+        # Plot 1: Improvement vs SNR scatter
+        ax1 = axes[0, 0]
+        scatter = ax1.scatter(ber_results['snrs'], ber_improvement,
+                                c=ber_results['labels'], cmap='tab10', alpha=0.6)
+        ax1.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
+        ax1.set_xlabel('SNR (dB)')
+        ax1.set_ylabel('BER Improvement Factor')
+        ax1.set_title('BER Improvement vs SNR')
+        ax1.grid(True, alpha=0.3)
+        plt.colorbar(scatter, ax=ax1, label='Modulation Type')
+
+        # Plot 2: Improvement histogram
+        ax2 = axes[0, 1]
+        ax2.hist(ber_improvement, bins=50, alpha=0.7, color='blue', edgecolor='black')
+        ax2.axvline(x=1, color='red', linestyle='--', linewidth=2, label='No Improvement')
+        ax2.axvline(x=np.median(ber_improvement), color='green', linestyle='-', linewidth=2,
+                    label=f'Median: {np.median(ber_improvement):.2f}')
+        ax2.set_xlabel('BER Improvement Factor')
+        ax2.set_ylabel('Count')
+        ax2.set_title('Distribution of BER Improvements')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+        # Plot 3: Success rate by SNR
+        ax3 = axes[1, 0]
+        snr_bins = np.arange(-20, 31, 5)
+        success_rates = []
+        snr_centers = []
+
+        for i in range(len(snr_bins) - 1):
+            mask = (ber_results['snrs'] >= snr_bins[i]) & (ber_results['snrs'] < snr_bins[i+1])
+            if mask.sum() > 0:
+                success_rate = np.mean(ber_improvement[mask] > 1.0)
+                success_rates.append(success_rate)
+                snr_centers.append((snr_bins[i] + snr_bins[i+1]) / 2)
+
+        ax3.plot(snr_centers, success_rates, 'o-', linewidth=2, markersize=8, color='purple')
+        ax3.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
+        ax3.set_xlabel('SNR (dB)')
+        ax3.set_ylabel('Success Rate (BER Improvement > 1)')
+        ax3.set_title('Synchronization Success Rate vs SNR')
+        ax3.grid(True, alpha=0.3)
+        ax3.set_ylim(0, 1)
+
+        # Plot 4: Summary statistics
+        ax4 = axes[1, 1]
+        ax4.axis('off')
+
+        # Calculate statistics
+        mean_improvement = np.mean(ber_improvement)
+        median_improvement = np.median(ber_improvement)
+        success_rate_overall = np.mean(ber_improvement > 1.0)
+        best_improvement = np.max(ber_improvement)
+        worst_improvement = np.min(ber_improvement)
+
+        stats_text = f"""
+        BER Improvement Statistics:
+
+        Mean Improvement: {mean_improvement:.2f}x
+        Median Improvement: {median_improvement:.2f}x
+        Success Rate: {success_rate_overall:.1%}
+        Best Improvement: {best_improvement:.2f}x
+        Worst Case: {worst_improvement:.2f}x
+
+        Total Samples: {len(ber_improvement)}
+        Samples Improved: {np.sum(ber_improvement > 1.0)}
+        Samples Degraded: {np.sum(ber_improvement < 1.0)}
+        """
+
+        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=12,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+
+        plt.tight_layout()
+
+        # Log to wandb
+        if hasattr(self, 'logger') and self.logger is not None:
+            logger_class_name = self.logger.__class__.__name__
+            if 'WandbLogger' in logger_class_name:
+                self.logger.experiment.log({
+                    "ber_improvement_analysis": wandb.Image(fig),
+                    "epoch": self.current_epoch,
+                    "mean_ber_improvement": mean_improvement,
+                    "median_ber_improvement": median_improvement,
+                    "ber_success_rate": success_rate_overall,
+                })
+                print("BER improvement analysis logged to WandB")
+
+        # Save locally
+        plot_filename = f'ber_improvement_epoch_{self.current_epoch}.png'
+        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"BER improvement analysis saved as {plot_filename}")
+
+        plt.close(fig)
     def on_train_epoch_start(self):
         """Log joint training status"""
         print(f"\nEpoch {self.current_epoch}: Joint Training (Sync + Classification)")
@@ -1113,6 +1729,8 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         # Create animations periodically
         if self.current_epoch % self.hparams.log_every_n_epochs == 0:
             self.visualize_sync_progression()
+            self.create_umap_visualization()  # Add UMAP visualization
+            self.calculate_ber_analysis()  # Add BER analysis
 
     def configure_optimizers(self):
         """Configure optimizer for joint training"""
@@ -1549,9 +2167,10 @@ class ConvFeatureExtractor(nn.Module):
         prev = in_ch
         for h in hidden_chs:
             layers += [
-                nn.Conv1d(prev, h, kernel_size=3, padding=1, bias=False),
+                nn.Conv1d(prev, h, kernel_size=5, padding=2, bias=False),
                 nn.BatchNorm1d(h),
-                nn.ReLU(inplace=True),
+                nn.GELU(),
+                nn.Dropout(p=0.1),
                 nn.MaxPool1d(kernel_size=2, stride=2),
             ]
             prev = h
@@ -1563,141 +2182,72 @@ class ConvFeatureExtractor(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    """Adds sinusoidal positional encodings to the transformer input."""
-
-    def __init__(self, d_model, max_len=128):
+    def __init__(self, d_model, max_len=5000):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(
-            torch.arange(0, d_model, 2).float()
-            * (-torch.log(torch.tensor(10000.0)) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))  # [1, max_len, d_model]
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # shape [1, max_len, d_model]
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x: [B, L, d_model]
-        L = x.size(1)
-        return x + self.pe[:, :L]
-
+        # x: [batch, seq_len, d_model]
+        x = x + self.pe[:, :x.size(1), :]
+        return x
 
 class HybridConvTransformer(nn.Module):
-    """
-    Hybrid Convolutional Transformer feature extractor + classifier
-    with feature extraction capability for VGG/perceptual losses
-    """
-
-    def __init__(
-        self,
-        in_ch: int = 2,
-        num_classes: int = 24,
-        conv_hidden: tuple = (64, 128, 256),
-        trans_dim: int = 256,
-        n_heads: int = 4,
-        n_layers: int = 3,
-        mlp_hidden: int = 128,
-    ):
+    def __init__(self, in_ch=2, num_classes=24, conv_hidden=(64, 128, 256),
+                 trans_dim=256, n_heads=4, n_layers=3, mlp_hidden=128,
+                 use_cls_token=True):
         super().__init__()
+        self.use_cls_token = use_cls_token
 
-        # Stage A: Conv1D feature extractor
+        # Conv Feature Extractor
         self.conv_extractor = ConvFeatureExtractor(in_ch, conv_hidden)
-        # After 3 x MaxPool(stride=2): sequence length = 1024 / 2^3 = 128
 
-        # Stage B: Transformer Encoder
+        # Class Token
+        if use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, trans_dim))
+
+        # Transformer Input Projection
         self.input_proj = nn.Linear(conv_hidden[-1], trans_dim)
-        self.pos_enc = PositionalEncoding(trans_dim, max_len=128)
+        self.pos_enc = PositionalEncoding(trans_dim, max_len=129)  # +1 for CLS
+
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=trans_dim,
-            nhead=n_heads,
+            d_model=trans_dim, nhead=n_heads,
             dim_feedforward=trans_dim * 4,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True
-        )
+            dropout=0.1, activation="gelu", batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        # Stage C: Pooling and Classification head
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        # LayerNorm before classifier
+        self.norm = nn.LayerNorm(trans_dim)
+
+        # Classifier Head with Residual MLP
         self.classifier = nn.Sequential(
             nn.Linear(trans_dim, mlp_hidden),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
+            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(mlp_hidden, num_classes),
         )
+    def forward(self, x):
+        conv_features = self.conv_extractor(x).permute(0, 2, 1)  # [B, 128, C]
+        y = self.input_proj(conv_features)
 
-    def forward(self, x: torch.Tensor, return_features: bool = False) -> torch.Tensor:
-        """
-        Args:
-            x: [B, 2, 1024]  real and imag as two channels
-            return_features: if True, return both features and logits
-        Returns:
-            logits: [B, num_classes] or (features, logits) if return_features=True
-        """
-        # Conv feature extraction
-        conv_features = self.conv_extractor(x)  # [B, C, 128]
+        if self.use_cls_token:
+            cls = self.cls_token.expand(x.size(0), -1, -1)
+            y = torch.cat((cls, y), dim=1)  # [B, 129, trans_dim]
 
-        # Prepare for transformer: -> [B, 128, C]
-        y = conv_features.permute(0, 2, 1)
-
-        # Project to transformer dimension
-        y = self.input_proj(y)  # [B, 128, trans_dim]
-
-        # Add positional encodings
         y = self.pos_enc(y)
+        y = self.transformer(y)
 
-        # Transformer encoder - THIS IS OUR RICH FEATURE REPRESENTATION
-        transformer_features = self.transformer(y)  # [B, 128, trans_dim]
-
-        # For classification: pool and classify
-        # Back to [B, trans_dim, 128] for pooling
-        pooled_input = transformer_features.permute(0, 2, 1)
-        pooled = self.pool(pooled_input).squeeze(-1)  # [B, trans_dim]
-        logits = self.classifier(pooled)  # [B, num_classes]
-
-        if return_features:
-            # Return rich transformer features before pooling
-            return transformer_features, logits  # [B, 128, trans_dim], [B, num_classes]
+        if self.use_cls_token:
+            y = y[:, 0]  # [CLS] token
         else:
-            return logits
+            y = y.mean(dim=1)
 
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Extract rich features for perceptual/VGG loss
+        y = self.norm(y)
+        logits = self.classifier(y)
 
-        Args:
-            x: [B, 2, 1024] input signal
-        Returns:
-            features: [B, 128, trans_dim] rich spatial features
-        """
-        with torch.no_grad():
-            features, _ = self.forward(x, return_features=True)
-        return features
-
-    def get_feature_layers(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Extract features from multiple layers for multi-scale perceptual loss
-
-        Args:
-            x: [B, 2, 1024] input signal
-        Returns:
-            Dictionary of features from different layers
-        """
-        features = {}
-
-        # Conv features (early spatial features)
-        conv_features = self.conv_extractor(x)  # [B, 256, 128]
-        features['conv'] = conv_features
-
-        # Transformer input features
-        y = conv_features.permute(0, 2, 1)
-        y = self.input_proj(y)
-        y = self.pos_enc(y)
-        features['transformer_input'] = y  # [B, 128, trans_dim]
-
-        # Transformer output features (richest representation)
-        transformer_out = self.transformer(y)
-        features['transformer_output'] = transformer_out  # [B, 128, trans_dim]
-
-        return features
+        return logits

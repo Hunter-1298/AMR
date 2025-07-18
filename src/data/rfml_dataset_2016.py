@@ -123,18 +123,10 @@ class RFMLDataset(Dataset):
         # Modulation-specific parameters
         mod_params = {
             "QPSK": {"sps": 8, "mod_order": 4, "costas_bw": 0.01, "costas_damp": 0.707},
-            "8PSK": {
-                "sps": 8,
-                "mod_order": 8,
-                "costas_bw": 0.005,
-                "costas_damp": 0.707,
-            },
-            "16PSK": {
-                "sps": 8,
-                "mod_order": 16,
-                "costas_bw": 0.0025,
-                "costas_damp": 0.707,
-            },
+            "8PSK": {"sps": 8, "mod_order": 8, "costas_bw": 0.005, "costas_damp": 0.707},
+            "16PSK": {"sps": 8, "mod_order": 16, "costas_bw": 0.0025, "costas_damp": 0.707},
+            "16QAM": {"sps": 8, "mod_order": 16, "costas_bw": 0.005, "costas_damp": 0.707},
+            "64QAM": {"sps": 8, "mod_order": 64, "costas_bw": 0.002, "costas_damp": 0.707},
         }
         assert mod_type in mod_params, f"Unsupported modulation: {mod_type}"
         params = mod_params[mod_type]
