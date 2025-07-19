@@ -106,6 +106,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         # lambda_sync: float = 5.0,      # Synchronization loss weight
         lambda_sync: float = 0.0,      # Synchronization loss weight
         lambda_class: float = 1.0,     # Classification loss weight
+        lambda_ber: float = 0.0,
 
         # Training schedule
         classification_start_epoch: int = 0,  # Start classification after sync has some progress
@@ -157,6 +158,56 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         # Store validation outputs for SNR analysis
         self.validation_step_outputs = []
 
+
+    def calculate_soft_ber_loss(self, synchronized_signals: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Calculate differentiable BER proxy using soft symbol decisions"""
+        batch_size = synchronized_signals.shape[0]
+        device = synchronized_signals.device
+
+        # Convert to complex
+        complex_signals = synchronized_signals[:, 0] + 1j * synchronized_signals[:, 1]
+
+        # Downsample to symbol rate (every 8 samples)
+        symbols = complex_signals[:, ::8]  # [batch_size, num_symbols]
+
+        ber_losses = []
+
+        for i in range(batch_size):
+            modulation_type = labels[i].item()
+            sample_symbols = symbols[i]
+
+            # Calculate soft BER based/training on modulation type using unified function
+            if modulation_type == 0:  # QPSK
+                soft_ber = self.soft_psk_ber(sample_symbols, 4)
+            elif modulation_type == 1:  # 8PSK
+                soft_ber = self.soft_psk_ber(sample_symbols, 8)
+            elif modulation_type == 2:  # 16PSK
+                soft_ber = self.soft_psk_ber(sample_symbols, 16)
+            else:
+                soft_ber = torch.tensor(0.0, device=device)
+
+            ber_losses.append(soft_ber)
+
+        return torch.stack(ber_losses).mean()
+
+    def soft_psk_ber(self, symbols: torch.Tensor, modulation_order: int) -> torch.Tensor:
+        """Unified soft BER calculation for any PSK modulation order"""
+        # Generate constellation points
+        angles = torch.arange(0, modulation_order, device=symbols.device) * 2 * torch.pi / modulation_order
+        constellation = torch.exp(1j * angles)
+
+        # Calculate distances from each symbol to all constellation points
+        # symbols: [num_symbols], constellation: [modulation_order]
+        # Result: [num_symbols, modulation_order]
+        dists = torch.abs(symbols.unsqueeze(-1) - constellation.unsqueeze(0)) ** 2
+
+        # Soft minimum using softmax (acts like differentiable min)
+        softmin_weights = torch.softmax(-dists, dim=-1)  # Negative for minimum
+
+        # Weighted average distance (soft minimum distance)
+        soft_dist = (softmin_weights * dists).sum(dim=-1).mean()
+
+        return soft_dist
     def normalize_sync_params(self, timing, freq, phase):
         """Normalize synchronization parameters for training"""
         if not self.hparams.normalize_params:
@@ -219,7 +270,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         return self.current_epoch >= self.hparams.classification_start_epoch
 
     def training_step(self, batch, batch_idx):
-        """Joint training with step-wise sync corrections + classification on fully synchronized signals"""
+        """Joint training with sync + classification + BER losses"""
         sync_signals, unsync_signals, labels, snrs, sync_params = batch
         batch_size = sync_signals.shape[0]
 
@@ -235,15 +286,11 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         sync_output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
 
-        # STEP-WISE TARGETS: How much to correct to get to the next step
+        # Step-wise targets
         alpha_current = self.get_interpolation_alpha(timesteps).to(self.device)
         next_timesteps = torch.clamp(timesteps - 1, 0, self.hparams.num_train_timesteps - 1)
         alpha_next = self.get_interpolation_alpha(next_timesteps).to(self.device)
-
-        # For t=0, step should be zero (already at target)
-        step_alpha = torch.where(timesteps == 0,
-                                torch.zeros_like(alpha_current),
-                                alpha_current - alpha_next)
+        step_alpha = torch.where(timesteps == 0, torch.zeros_like(alpha_current), alpha_current - alpha_next)
 
         target_timing = norm_true_timing * step_alpha
         target_freq = norm_true_freq * step_alpha
@@ -256,51 +303,41 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         sync_loss = timing_mse + freq_mse + phase_mse
 
         # === CLASSIFICATION LOSS (FULLY SYNCHRONIZED SIGNALS) ===
-        classification_loss = torch.tensor(0.0, device=self.device)
-        classification_acc = torch.tensor(0.0, device=self.device)
-
-        # Run FULL iterative synchronization for classification training
         fully_synchronized_signals, _ = self.iterative_synchronization_for_gif(
             unsync_signals, labels, num_steps=10
         )
 
-        # Train classifier on FULLY synchronized signals
         class_logits = self.classifier(fully_synchronized_signals)
-        # class_logits = self.classifier(unsync_signals)
         classification_loss = self.classification_criterion(class_logits, labels)
-
-        # Calculate accuracy
         class_preds = torch.argmax(class_logits, dim=1)
         classification_acc = (class_preds == labels).float().mean()
+
+        # === BER LOSS (UNIFIED SOFT PSK) ===
+        ber_loss = self.calculate_soft_ber_loss(fully_synchronized_signals, labels)
 
         # === TOTAL LOSS ===
         total_loss = (
             self.hparams.lambda_sync * sync_loss +
-            self.hparams.lambda_class * classification_loss
+            self.hparams.lambda_class * classification_loss +
+            self.hparams.lambda_ber * ber_loss
         )
 
-        # === ENHANCED LOGGING ===
+        # === LOGGING ===
         self.log('train/sync_loss', sync_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train/timing_mse', timing_mse, on_step=True)
-        self.log('train/freq_mse', freq_mse, on_step=True)
-        self.log('train/phase_mse', phase_mse, on_step=True)
         self.log('train/class_loss', classification_loss, on_step=True, on_epoch=True)
+        self.log('train/ber_loss', ber_loss, on_step=True, on_epoch=True)
         self.log('train/class_acc', classification_acc, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train/total_loss', total_loss, on_step=True, on_epoch=True)
 
-        # Log step-wise behavior
-        avg_step_timing = torch.mean(torch.abs(target_timing))
-        avg_step_freq = torch.mean(torch.abs(target_freq))
-        avg_step_phase = torch.mean(torch.abs(target_phase))
-
-        self.log('train/avg_step_timing', avg_step_timing)
-        self.log('train/avg_step_freq', avg_step_freq)
-        self.log('train/avg_step_phase', avg_step_phase)
+        # Log individual loss components for monitoring
+        self.log('train/timing_mse', timing_mse, on_step=True)
+        self.log('train/freq_mse', freq_mse, on_step=True)
+        self.log('train/phase_mse', phase_mse, on_step=True)
 
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation with step-wise corrections"""
+        """Validation with step-wise corrections + BER loss evaluation"""
         sync_signals, unsync_signals, labels, snrs, sync_params = batch
         batch_size = sync_signals.shape[0]
 
@@ -310,13 +347,13 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             true_timing, true_freq, true_phase
         )
 
-        # # Store first batch for visualization
+        # Store first batch for visualization
         if batch_idx == 0 and not self.val_samples_stored:
             self.stored_val_data = {
                 'sync_signals': sync_signals[:self.hparams.vis_batch_size].cpu(),
                 'unsync_signals': unsync_signals[:self.hparams.vis_batch_size].cpu(),
-                'snrs': snrs[:self.hparams.vis_batch_size].cpu(),
                 'labels': labels[:self.hparams.vis_batch_size].cpu(),
+                'snrs': snrs[:self.hparams.vis_batch_size].cpu(),
                 'sync_params': (
                     norm_true_timing[:self.hparams.vis_batch_size].cpu(),
                     norm_true_freq[:self.hparams.vis_batch_size].cpu(),
@@ -359,6 +396,17 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             class_acc = (class_preds == labels).float().mean()
             class_probs = F.softmax(class_logits, dim=-1)
 
+            # === BER LOSS EVALUATION ===
+            ber_loss = self.calculate_soft_ber_loss(fully_synchronized_signals, labels)
+            unsync_ber_loss = self.calculate_soft_ber_loss(unsync_signals, labels)
+
+            # === TOTAL VALIDATION LOSS ===
+            total_val_loss = (
+                self.hparams.lambda_sync * sync_loss +
+                self.hparams.lambda_class * class_loss +
+                self.hparams.lambda_ber * ber_loss
+            )
+
             # Store outputs for SNR analysis
             self.validation_step_outputs.append({
                 'predictions': class_preds.cpu(),
@@ -366,12 +414,25 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
                 'snrs': snrs.cpu(),
                 'probabilities': class_probs.cpu(),
                 'sync_loss': sync_loss.cpu(),
+                'class_loss': class_loss.cpu(),
+                'ber_loss': ber_loss.cpu(),
+                'unsync_ber_loss': unsync_ber_loss.cpu(),
+                'total_loss': total_val_loss.cpu(),
             })
 
-        # Log metrics
+        # === LOGGING ===
         self.log('val/sync_loss', sync_loss, on_epoch=True, prog_bar=True)
         self.log('val/class_loss', class_loss, on_epoch=True)
         self.log('val/class_acc', class_acc, on_epoch=True, prog_bar=True)
+        self.log('val/total_loss', total_val_loss, on_epoch=True, prog_bar=True)
+
+        # Log BER losses
+        self.log('val/ber_loss', ber_loss, on_epoch=True)
+        self.log('val/unsync_ber_loss', unsync_ber_loss, on_epoch=True)
+
+        # Calculate and log BER improvement ratio
+        ber_improvement = unsync_ber_loss / (ber_loss + 1e-8)
+        self.log('val/ber_improvement_ratio', ber_improvement, on_epoch=True, prog_bar=True)
 
         # Log per-class accuracy
         for i, label_name in enumerate(self.label_names):
@@ -384,7 +445,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         if batch_idx == 0:
             self.debug_timestep_conditioning_stepwise(unsync_signals[:1], labels[:1])
 
-        return sync_loss + class_loss
+        return total_val_loss
 
     @torch.no_grad()
     def iterative_synchronization_for_gif(
@@ -1247,79 +1308,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         plt.close(fig)
 
-    def calculate_ber_analysis(self):
-        """Calculate BER for synchronized vs unsynchronized signals"""
-        if not self.val_samples_stored or self.stored_val_data is None:
-            print("No validation data stored for BER analysis")
-            return
-
-        try:
-            # Get stored validation data
-            sync_signals = self.stored_val_data['sync_signals'].to(self.device)
-            unsync_signals = self.stored_val_data['unsync_signals'].to(self.device)
-            labels = self.stored_val_data['labels'].to(self.device)
-            snrs = self.stored_val_data['snrs']
-
-            # Use more samples for better BER statistics
-            max_samples = min(200, len(unsync_signals))
-            sync_signals = sync_signals[:max_samples]
-            unsync_signals = unsync_signals[:max_samples]
-            labels = labels[:max_samples]
-            snrs = snrs[:max_samples]
-
-            print(f"Calculating BER for {max_samples} samples...")
-
-            with torch.no_grad():
-                # Get fully synchronized signals from diffusion model
-                diffusion_sync_signals, _ = self.iterative_synchronization_for_gif(
-                    unsync_signals, labels, num_steps=10
-                )
-
-                # Calculate BER for each condition
-                ber_results = {
-                    'snrs': snrs.numpy(),
-                    'labels': labels.cpu().numpy(),
-                    'unsync_ber': [],
-                    'perfect_sync_ber': [],
-                    'diffusion_sync_ber': [],
-                }
-
-                for i in range(max_samples):
-                    # Get signals for this sample
-                    unsync_sig = unsync_signals[i].cpu().numpy()
-                    perfect_sync_sig = sync_signals[i].cpu().numpy()
-                    diffusion_sync_sig = diffusion_sync_signals[i].cpu().numpy()
-
-                    modulation_type = labels[i].item()
-                    snr_db = snrs[i].item()
-
-                    # Generate reference bits for this sample
-                    ref_bits = self.generate_reference_bits(perfect_sync_sig, modulation_type)
-
-                    # Calculate BER for each condition
-                    unsync_ber = self.calculate_ber_for_signal(unsync_sig, ref_bits, modulation_type)
-                    perfect_ber = self.calculate_ber_for_signal(perfect_sync_sig, ref_bits, modulation_type)
-                    diffusion_ber = self.calculate_ber_for_signal(diffusion_sync_sig, ref_bits, modulation_type)
-
-                    ber_results['unsync_ber'].append(unsync_ber)
-                    ber_results['perfect_sync_ber'].append(perfect_ber)
-                    ber_results['diffusion_sync_ber'].append(diffusion_ber)
-
-                # Convert to numpy arrays
-                for key in ['unsync_ber', 'perfect_sync_ber', 'diffusion_sync_ber']:
-                    ber_results[key] = np.array(ber_results[key])
-
-                # Create BER plots
-                self.plot_ber_vs_snr(ber_results)
-                self.plot_ber_by_modulation(ber_results)
-                self.plot_ber_improvement(ber_results)
-
-                print("BER analysis completed successfully")
-
-        except Exception as e:
-            print(f"Error in BER analysis: {e}")
-            import traceback
-            traceback.print_exc()
 
     def generate_reference_bits(self, perfect_sync_signal: np.ndarray, modulation_type: int) -> np.ndarray:
         """Generate reference bits from the perfectly synchronized signal"""
@@ -1343,47 +1331,76 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         return bits
 
-    def calculate_ber_for_signal(self, signal: np.ndarray, ref_bits: np.ndarray, modulation_type: int) -> float:
-        """Calculate BER for a given signal compared to reference bits"""
-        if len(ref_bits) == 0:
-            return 1.0  # Maximum error rate
+    def calculate_ber_analysis(self):
+        """Calculate BER using existing soft BER loss function"""
+        if not self.val_samples_stored or self.stored_val_data is None:
+            print("No validation data stored for BER analysis")
+            return
 
         try:
-            # Convert to complex
-            complex_signal = signal[0] + 1j * signal[1]
+            # Get stored validation data
+            unsync_signals = self.stored_val_data['unsync_signals'].to(self.device)
+            labels = self.stored_val_data['labels'].to(self.device)
+            snrs = self.stored_val_data['snrs']
 
-            # Simple symbol detection
-            sps = 8
-            symbols = complex_signal[::sps]
+            max_samples = min(100, len(unsync_signals))
+            unsync_signals = unsync_signals[:max_samples]
+            labels = labels[:max_samples]
+            snrs = snrs[:max_samples]
 
-            # Ensure same length as reference
-            min_len = min(len(symbols), len(ref_bits) // self.bits_per_symbol(modulation_type))
-            symbols = symbols[:min_len]
-            ref_bits = ref_bits[:min_len * self.bits_per_symbol(modulation_type)]
+            print(f"Calculating Soft BER for {max_samples} samples...")
 
-            # Demodulate
-            if modulation_type == 0:  # QPSK
-                demod_bits = self.demodulate_qpsk(symbols)
-            elif modulation_type == 1:  # 8PSK
-                demod_bits = self.demodulate_8psk(symbols)
-            elif modulation_type == 2:  # 16PSK
-                demod_bits = self.demodulate_16psk(symbols)
-            else:
-                return 1.0
+            with torch.no_grad():
+                # Get fully synchronized signals from diffusion model
+                diffusion_sync_signals, _ = self.iterative_synchronization_for_gif(
+                    unsync_signals, labels, num_steps=10
+                )
 
-            # Calculate BER
-            if len(demod_bits) == 0 or len(ref_bits) == 0:
-                return 1.0
+                # Calculate soft BER for both conditions using your existing function
+                ber_results = {
+                    'snrs': snrs.numpy(),
+                    'labels': labels.cpu().numpy(),
+                    'unsync_soft_ber': [],
+                    'diffusion_soft_ber': [],
+                }
 
-            min_bits = min(len(demod_bits), len(ref_bits))
-            errors = np.sum(demod_bits[:min_bits] != ref_bits[:min_bits])
-            ber = errors / min_bits
+                print(f"Signal shapes - Unsync: {unsync_signals.shape}, Diffusion: {diffusion_sync_signals.shape}")
 
-            return ber
+                # Calculate soft BER for each sample individually
+                for i in range(max_samples):
+                    # Get single sample and expand to batch dimension
+                    unsync_sample = unsync_signals[i:i+1]  # [1, 2, 1024]
+                    diffusion_sample = diffusion_sync_signals[i:i+1]  # [1, 2, 1024]
+                    label_sample = labels[i:i+1]  # [1]
+                    snr_sample = snrs[i]
+
+                    # Calculate soft BER using your existing function
+                    unsync_soft_ber = self.calculate_soft_ber_loss(unsync_sample, label_sample).item()
+                    diffusion_soft_ber = self.calculate_soft_ber_loss(diffusion_sample, label_sample).item()
+
+                    ber_results['unsync_soft_ber'].append(unsync_soft_ber)
+                    ber_results['diffusion_soft_ber'].append(diffusion_soft_ber)
+
+                    # Debug output for first few samples
+                    if i < 5:
+                        print(f"Sample {i} (SNR={snr_sample:.1f}dB, {self.label_names[label_sample.item()]}): "
+                            f"Unsync Soft BER={unsync_soft_ber:.6f}, "
+                            f"Diffusion Soft BER={diffusion_soft_ber:.6f}")
+
+                # Convert to numpy arrays
+                for key in ['unsync_soft_ber', 'diffusion_soft_ber']:
+                    ber_results[key] = np.array(ber_results[key])
+
+                # Update the plot functions to use soft BER
+                self.plot_soft_ber_vs_snr(ber_results)
+                self.plot_soft_ber_by_modulation(ber_results)
+
+                print("Soft BER analysis completed successfully")
 
         except Exception as e:
-            print(f"Error calculating BER: {e}")
-            return 1.0
+            print(f"Error in soft BER analysis: {e}")
+            import traceback
+            traceback.print_exc()
 
     def bits_per_symbol(self, modulation_type: int) -> int:
         """Return bits per symbol for each modulation type"""
@@ -1396,6 +1413,211 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         else:
             return 1
 
+    def plot_soft_ber_vs_snr(self, ber_results: Dict):
+        """Plot Soft BER vs SNR comparing unsynchronized vs diffusion synchronized"""
+        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+
+        # Define SNR bins
+        snr_bins = [(-20, -15), (-15, -10), (-10, -5), (-5, 0), (0, 5), (5, 10),
+                    (10, 15), (15, 20), (20, 25), (25, 30)]
+        snr_centers = [(low + high) / 2 for low, high in snr_bins]
+
+        # Calculate average soft BER per SNR bin
+        avg_unsync_ber = []
+        avg_diffusion_ber = []
+        sample_counts = []
+
+        print("\n=== SOFT BER ANALYSIS ===")
+        for snr_min, snr_max in snr_bins:
+            mask = (ber_results['snrs'] >= snr_min) & (ber_results['snrs'] < snr_max)
+            count = mask.sum()
+            sample_counts.append(count)
+
+            if count > 0:
+                unsync_mean = np.mean(ber_results['unsync_soft_ber'][mask])
+                diffusion_mean = np.mean(ber_results['diffusion_soft_ber'][mask])
+
+                avg_unsync_ber.append(unsync_mean)
+                avg_diffusion_ber.append(diffusion_mean)
+
+                improvement = unsync_mean / (diffusion_mean + 1e-10)
+                print(f"SNR {snr_min:3.0f}-{snr_max:3.0f}dB ({count:3d} samples): "
+                    f"Unsync={unsync_mean:.6f}, Diffusion={diffusion_mean:.6f}, "
+                    f"Improvement={improvement:.2f}x")
+            else:
+                avg_unsync_ber.append(np.nan)
+                avg_diffusion_ber.append(np.nan)
+
+        # Convert to numpy arrays and remove NaN values
+        snr_centers = np.array(snr_centers)
+        avg_unsync_ber = np.array(avg_unsync_ber)
+        avg_diffusion_ber = np.array(avg_diffusion_ber)
+
+        # Find valid (non-NaN) points
+        valid_mask = ~(np.isnan(avg_unsync_ber) | np.isnan(avg_diffusion_ber))
+
+        if valid_mask.sum() > 0:
+            # Plot both lines with clear differentiation
+            ax.plot(snr_centers[valid_mask], avg_unsync_ber[valid_mask],
+                    'r-o', linewidth=4, markersize=10, label='Unsynchronized',
+                    alpha=0.8, markerfacecolor='red', markeredgecolor='darkred',
+                    markeredgewidth=2, zorder=2)
+
+            ax.plot(snr_centers[valid_mask], avg_diffusion_ber[valid_mask],
+                    'b--^', linewidth=4, markersize=10, label='Diffusion Synchronized',
+                    alpha=0.8, markerfacecolor='blue', markeredgecolor='darkblue',
+                    markeredgewidth=2, zorder=3)
+
+            # Add scatter points for extra visibility
+            ax.scatter(snr_centers[valid_mask], avg_unsync_ber[valid_mask],
+                    c='red', s=120, alpha=0.9, marker='o', edgecolor='white',
+                    linewidth=2, zorder=4)
+            ax.scatter(snr_centers[valid_mask], avg_diffusion_ber[valid_mask],
+                    c='blue', s=120, alpha=0.9, marker='^', edgecolor='white',
+                    linewidth=2, zorder=5)
+
+            # Add sample count annotations
+            for i, (snr, count) in enumerate(zip(snr_centers[valid_mask], np.array(sample_counts)[valid_mask])):
+                if count > 0:
+                    y_pos = max(avg_unsync_ber[valid_mask][i], avg_diffusion_ber[valid_mask][i]) * 1.1
+                    ax.annotate(f'n={count}', (snr, y_pos), ha='center', fontsize=9, alpha=0.7)
+
+        # Formatting
+        ax.set_xlabel('SNR (dB)', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Soft Bit Error Rate', fontsize=14, fontweight='bold')
+        ax.set_title(f'Soft BER vs SNR - Epoch {self.current_epoch}\n'
+                    f'Diffusion Synchronization Performance (Unified PSK Soft BER)',
+                    fontsize=16, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=12, loc='upper right')
+        ax.set_xlim(-22, 32)
+
+        # Set y-axis limits based on data range
+        if valid_mask.sum() > 0:
+            y_min = min(np.min(avg_unsync_ber[valid_mask]), np.min(avg_diffusion_ber[valid_mask]))
+            y_max = max(np.max(avg_unsync_ber[valid_mask]), np.max(avg_diffusion_ber[valid_mask]))
+            ax.set_ylim(y_min * 0.8, y_max * 1.2)
+
+        # Add improvement statistics
+        if valid_mask.sum() > 0:
+            overall_improvement = np.mean(ber_results['unsync_soft_ber']) / (np.mean(ber_results['diffusion_soft_ber']) + 1e-10)
+            success_rate = np.mean(ber_results['diffusion_soft_ber'] < ber_results['unsync_soft_ber'])
+
+            stats_text = f'Avg Soft BER Improvement: {overall_improvement:.2f}x\n'
+            stats_text += f'Success Rate: {success_rate:.1%}\n'
+            stats_text += f'Total Samples: {len(ber_results["snrs"])}\n'
+            stats_text += f'Avg Unsync Soft BER: {np.mean(ber_results["unsync_soft_ber"]):.6f}\n'
+            stats_text += f'Avg Sync Soft BER: {np.mean(ber_results["diffusion_soft_ber"]):.6f}'
+
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=11,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
+
+        plt.tight_layout()
+
+        # Log to wandb
+        if hasattr(self, 'logger') and self.logger is not None:
+            logger_class_name = self.logger.__class__.__name__
+            if 'WandbLogger' in logger_class_name:
+                self.logger.experiment.log({
+                    "soft_ber_vs_snr": wandb.Image(fig),
+                    "epoch": self.current_epoch,
+                    "soft_ber_improvement": overall_improvement if valid_mask.sum() > 0 else 0,
+                    "soft_ber_success_rate": success_rate if valid_mask.sum() > 0 else 0,
+                })
+                print("Soft BER vs SNR plot logged to WandB")
+
+        # Save locally
+        plot_filename = f'soft_ber_vs_snr_epoch_{self.current_epoch}.png'
+        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"Soft BER vs SNR plot saved as {plot_filename}")
+
+        plt.close(fig)
+
+    def plot_soft_ber_by_modulation(self, ber_results: Dict):
+        """Plot Soft BER by modulation type"""
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        modulation_names = ['QPSK', '8PSK', '16PSK']
+
+        print("\n=== SOFT BER BY MODULATION ===")
+
+        for mod_idx, mod_name in enumerate(modulation_names):
+            ax = axes[mod_idx]
+
+            # Filter by modulation type
+            mask = ber_results['labels'] == mod_idx
+
+            if mask.sum() > 0:
+                snrs = ber_results['snrs'][mask]
+                unsync_ber = ber_results['unsync_soft_ber'][mask]
+                diffusion_ber = ber_results['diffusion_soft_ber'][mask]
+
+                print(f"\n{mod_name} ({mask.sum()} samples):")
+                print(f"  Unsync Soft BER range: {np.min(unsync_ber):.6f} - {np.max(unsync_ber):.6f}")
+                print(f"  Diffusion Soft BER range: {np.min(diffusion_ber):.6f} - {np.max(diffusion_ber):.6f}")
+                print(f"  Average improvement: {np.mean(unsync_ber)/(np.mean(diffusion_ber)+1e-10):.2f}x")
+
+                # Sort by SNR for better plotting
+                sort_idx = np.argsort(snrs)
+                snrs = snrs[sort_idx]
+                unsync_ber = unsync_ber[sort_idx]
+                diffusion_ber = diffusion_ber[sort_idx]
+
+                # Plot with clear differentiation
+                ax.plot(snrs, unsync_ber, 'r-o', alpha=0.9, label='Unsynchronized',
+                    markersize=6, linewidth=3, markerfacecolor='red',
+                    markeredgecolor='darkred', markeredgewidth=1, zorder=2)
+
+                ax.plot(snrs, diffusion_ber, 'b--^', alpha=0.9, label='Diffusion Sync',
+                    markersize=6, linewidth=3, markerfacecolor='blue',
+                    markeredgecolor='darkblue', markeredgewidth=1, zorder=3)
+
+                # Add scatter points for visibility
+                ax.scatter(snrs, unsync_ber, c='red', s=50, alpha=0.9,
+                        marker='o', edgecolor='white', linewidth=1, zorder=4)
+                ax.scatter(snrs, diffusion_ber, c='blue', s=50, alpha=0.9,
+                        marker='^', edgecolor='white', linewidth=1, zorder=5)
+
+                # Statistics
+                improvement_ratio = np.mean(unsync_ber) / (np.mean(diffusion_ber) + 1e-10)
+                better_count = np.sum(diffusion_ber < unsync_ber)
+
+                stats_text = f'Samples: {mask.sum()}\n'
+                stats_text += f'Improvement: {improvement_ratio:.2f}x\n'
+                stats_text += f'Better points: {better_count}/{len(unsync_ber)}\n'
+                stats_text += f'Avg Unsync: {np.mean(unsync_ber):.5f}\n'
+                stats_text += f'Avg Sync: {np.mean(diffusion_ber):.5f}'
+
+                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+                    verticalalignment='top', bbox=dict(boxstyle='round',
+                    facecolor='lightgray', alpha=0.9))
+
+            ax.set_xlabel('SNR (dB)', fontsize=12)
+            ax.set_ylabel('Soft Bit Error Rate', fontsize=12)
+            ax.set_title(f'{mod_name} Soft BER Performance\n({mask.sum()} samples)',
+                        fontsize=14, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=10, loc='upper right')
+            ax.set_xlim(-22, 32)
+
+        plt.tight_layout()
+
+        # Log to wandb
+        if hasattr(self, 'logger') and self.logger is not None:
+            logger_class_name = self.logger.__class__.__name__
+            if 'WandbLogger' in logger_class_name:
+                self.logger.experiment.log({
+                    "soft_ber_by_modulation": wandb.Image(fig),
+                    "epoch": self.current_epoch
+                })
+                print("Soft BER by modulation plot logged to WandB")
+
+        # Save locally
+        plot_filename = f'soft_ber_by_modulation_epoch_{self.current_epoch}.png'
+        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"Soft BER by modulation plot saved as {plot_filename}")
+
+        plt.close(fig)
     def demodulate_qpsk(self, symbols: np.ndarray) -> np.ndarray:
         """Simple QPSK demodulation"""
         # Normalize symbols
@@ -1472,8 +1694,8 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         return np.array(bits)
     def plot_ber_vs_snr(self, ber_results: Dict):
-        """Plot BER vs SNR for different synchronization conditions"""
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        """Plot BER vs SNR comparing unsynchronized vs diffusion synchronized"""
+        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
 
         # Define SNR bins
         snr_bins = [(-20, -15), (-15, -10), (-10, -5), (-5, 0), (0, 5), (5, 10),
@@ -1481,60 +1703,140 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         snr_centers = [(low + high) / 2 for low, high in snr_bins]
 
         # Calculate average BER per SNR bin
-        avg_ber = {condition: [] for condition in ['unsync_ber', 'perfect_sync_ber', 'diffusion_sync_ber']}
+        avg_unsync_ber = []
+        avg_diffusion_ber = []
+        sample_counts = []
 
+        print("\n=== BER ANALYSIS DEBUG ===")
         for snr_min, snr_max in snr_bins:
             mask = (ber_results['snrs'] >= snr_min) & (ber_results['snrs'] < snr_max)
+            count = mask.sum()
+            sample_counts.append(count)
 
-            for condition in avg_ber.keys():
-                if mask.sum() > 0:
-                    avg_ber[condition].append(np.mean(ber_results[condition][mask]))
-                else:
-                    avg_ber[condition].append(np.nan)
+            if count > 0:
+                unsync_mean = np.mean(ber_results['unsync_ber'][mask])
+                diffusion_mean = np.mean(ber_results['diffusion_sync_ber'][mask])
 
-        # Plot overall BER comparison
-        ax1 = axes[0]
-        ax1.semilogy(snr_centers, avg_ber['unsync_ber'], 'r-o', label='Unsynchronized', linewidth=2, markersize=6)
-        ax1.semilogy(snr_centers, avg_ber['perfect_sync_ber'], 'g-s', label='Perfect Sync', linewidth=2, markersize=6)
-        ax1.semilogy(snr_centers, avg_ber['diffusion_sync_ber'], 'b-^', label='Diffusion Sync', linewidth=2, markersize=6)
+                avg_unsync_ber.append(unsync_mean)
+                avg_diffusion_ber.append(diffusion_mean)
 
-        ax1.set_xlabel('SNR (dB)', fontsize=12)
-        ax1.set_ylabel('Bit Error Rate', fontsize=12)
-        ax1.set_title('BER vs SNR Comparison', fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
-        ax1.legend(fontsize=10)
-        ax1.set_xlim(-22, 32)
+                # ENHANCED DEBUG OUTPUT
+                print(f"SNR {snr_min:3.0f}-{snr_max:3.0f}dB ({count:3d} samples): "
+                        f"Unsync={unsync_mean:.6f}, Diffusion={diffusion_mean:.6f}, "
+                        f"Ratio={unsync_mean/(diffusion_mean+1e-10):.2f}x")
+            else:
+                avg_unsync_ber.append(np.nan)
+                avg_diffusion_ber.append(np.nan)
 
-        # Plot BER improvement (diffusion vs unsync)
-        ax2 = axes[1]
-        improvement = np.array(avg_ber['unsync_ber']) / (np.array(avg_ber['diffusion_sync_ber']) + 1e-10)
-        ax2.semilogy(snr_centers, improvement, 'purple', linewidth=3, marker='o', markersize=8)
-        ax2.axhline(y=1, color='gray', linestyle='--', alpha=0.5, label='No Improvement')
+        # Convert to numpy arrays and remove NaN values
+        snr_centers = np.array(snr_centers)
+        avg_unsync_ber = np.array(avg_unsync_ber)
+        avg_diffusion_ber = np.array(avg_diffusion_ber)
 
-        ax2.set_xlabel('SNR (dB)', fontsize=12)
-        ax2.set_ylabel('BER Improvement Factor', fontsize=12)
-        ax2.set_title('BER Improvement: Unsync/Diffusion', fontsize=14, fontweight='bold')
-        ax2.grid(True, alpha=0.3)
-        ax2.legend(fontsize=10)
-        ax2.set_xlim(-22, 32)
+        # Find valid (non-NaN) points
+        valid_mask = ~(np.isnan(avg_unsync_ber) | np.isnan(avg_diffusion_ber))
 
-        # Plot synchronization efficiency
-        ax3 = axes[2]
-        perfect_improvement = np.array(avg_ber['unsync_ber']) / (np.array(avg_ber['perfect_sync_ber']) + 1e-10)
-        diffusion_improvement = np.array(avg_ber['unsync_ber']) / (np.array(avg_ber['diffusion_sync_ber']) + 1e-10)
-        efficiency = diffusion_improvement / (perfect_improvement + 1e-10)
+        print(f"\nTotal valid SNR bins: {valid_mask.sum()}")
+        print(f"Overall stats:")
+        print(f"  Unsync BER range: {np.nanmin(avg_unsync_ber):.6f} - {np.nanmax(avg_unsync_ber):.6f}")
+        print(f"  Diffusion BER range: {np.nanmin(avg_diffusion_ber):.6f} - {np.nanmax(avg_diffusion_ber):.6f}")
 
-        ax3.plot(snr_centers, efficiency, 'orange', linewidth=3, marker='s', markersize=8)
-        ax3.axhline(y=1, color='gray', linestyle='--', alpha=0.5, label='Perfect Efficiency')
-        ax3.axhline(y=0.5, color='red', linestyle=':', alpha=0.5, label='50% Efficiency')
+        if valid_mask.sum() > 0:
+            # PLOT WITH VERY DIFFERENT STYLES AND OFFSET
+            # Plot unsynchronized first (will be on bottom layer)
+            line1 = ax.semilogy(snr_centers[valid_mask], avg_unsync_ber[valid_mask],
+                                color='red', linestyle='-', marker='o', linewidth=5,
+                                markersize=12, label='Unsynchronized', alpha=0.9,
+                                markerfacecolor='red', markeredgecolor='darkred',
+                                markeredgewidth=2, zorder=1)
 
-        ax3.set_xlabel('SNR (dB)', fontsize=12)
-        ax3.set_ylabel('Sync Efficiency', fontsize=12)
-        ax3.set_title('Synchronization Efficiency', fontsize=14, fontweight='bold')
-        ax3.grid(True, alpha=0.3)
-        ax3.legend(fontsize=10)
-        ax3.set_xlim(-22, 32)
-        ax3.set_ylim(0, 1.2)
+            # Plot synchronized with OFFSET to make it visible even if values are similar
+            # Add small offset to x-position for synchronized points
+            offset_x = 0.5  # Small horizontal offset
+            line2 = ax.semilogy(snr_centers[valid_mask] + offset_x, avg_diffusion_ber[valid_mask],
+                                color='blue', linestyle='--', marker='^', linewidth=5,
+                                markersize=12, label='Diffusion Synchronized', alpha=0.9,
+                                markerfacecolor='blue', markeredgecolor='darkblue',
+                                markeredgewidth=2, zorder=2)
+
+            # ALTERNATIVE: Plot on separate y-axis if values are too close
+            max_ratio = np.nanmax(avg_unsync_ber) / (np.nanmin(avg_diffusion_ber) + 1e-10)
+            if max_ratio < 2.0:  # If improvement is less than 2x, use dual y-axis
+                print(f"Values too close (max ratio: {max_ratio:.2f}), using dual y-axis")
+                ax2 = ax.twinx()
+
+                # Clear the previous synchronized plot
+                line2.remove()
+
+                # Plot synchronized on right y-axis
+                line2 = ax2.semilogy(snr_centers[valid_mask], avg_diffusion_ber[valid_mask],
+                                    color='blue', linestyle='--', marker='^', linewidth=5,
+                                    markersize=12, label='Diffusion Synchronized', alpha=0.9,
+                                    markerfacecolor='blue', markeredgecolor='darkblue',
+                                    markeredgewidth=2, zorder=2)
+
+                ax2.set_ylabel('Synchronized BER', fontsize=14, fontweight='bold', color='blue')
+                ax2.tick_params(axis='y', labelcolor='blue')
+                ax2.set_ylim(np.nanmin(avg_diffusion_ber[valid_mask]) * 0.1,
+                            np.nanmax(avg_diffusion_ber[valid_mask]) * 10)
+
+                # Update legend to include both axes
+                lines1, labels1 = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines1 + lines2, labels1 + labels2, fontsize=12, loc='upper right')
+            else:
+                # Normal single axis legend
+                ax.legend(fontsize=12, loc='upper right')
+
+            # Add sample count annotations
+            for i, (snr, count) in enumerate(zip(snr_centers[valid_mask], np.array(sample_counts)[valid_mask])):
+                if count > 0:
+                    ax.annotate(f'n={count}', (snr, 1e-4), ha='center', fontsize=9, alpha=0.7)
+
+            # ADD DETAILED VALUE TABLE
+            for i, (snr, unsync_ber, diff_ber) in enumerate(zip(snr_centers[valid_mask],
+                                                                avg_unsync_ber[valid_mask],
+                                                                avg_diffusion_ber[valid_mask])):
+                if not (np.isnan(unsync_ber) or np.isnan(diff_ber)):
+                    improvement = unsync_ber / (diff_ber + 1e-10)
+                    print(f"  SNR {snr:5.1f}dB: U={unsync_ber:.6f}, D={diff_ber:.6f}, Imp={improvement:.2f}x")
+
+        else:
+            print("Warning: No valid BER data to plot")
+            ax.text(0.5, 0.5, 'No valid BER data available',
+                    transform=ax.transAxes, ha='center', va='center', fontsize=14)
+
+        # Formatting
+        ax.set_xlabel('SNR (dB)', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Unsynchronized BER', fontsize=14, fontweight='bold', color='red')
+        ax.tick_params(axis='y', labelcolor='red')
+        ax.set_title(f'Bit Error Rate vs SNR - Epoch {self.current_epoch}\n'
+                    f'Impact of Diffusion Synchronization on Demodulation',
+                    fontsize=16, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(-22, 32)
+        ax.set_ylim(1e-5, 1)
+
+        # Add improvement statistics
+        if valid_mask.sum() > 0:
+            # Calculate overall statistics
+            overall_improvement = np.mean(ber_results['unsync_ber']) / (np.mean(ber_results['diffusion_sync_ber']) + 1e-10)
+            success_rate = np.mean(ber_results['diffusion_sync_ber'] < ber_results['unsync_ber'])
+
+            # Count how many points show improvement
+            valid_unsync = avg_unsync_ber[valid_mask]
+            valid_diffusion = avg_diffusion_ber[valid_mask]
+            improvement_points = np.sum(valid_diffusion < valid_unsync)
+
+            stats_text = f'Average BER Improvement: {overall_improvement:.2f}x\n'
+            stats_text += f'Success Rate: {success_rate:.1%}\n'
+            stats_text += f'SNR bins with improvement: {improvement_points}/{valid_mask.sum()}\n'
+            stats_text += f'Total Samples: {len(ber_results["snrs"])}\n'
+            stats_text += f'Avg Unsync BER: {np.mean(ber_results["unsync_ber"]):.6f}\n'
+            stats_text += f'Avg Sync BER: {np.mean(ber_results["diffusion_sync_ber"]):.6f}'
+
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
 
         plt.tight_layout()
 
@@ -1544,7 +1846,9 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             if 'WandbLogger' in logger_class_name:
                 self.logger.experiment.log({
                     "ber_vs_snr": wandb.Image(fig),
-                    "epoch": self.current_epoch
+                    "epoch": self.current_epoch,
+                    "ber_improvement": overall_improvement if valid_mask.sum() > 0 else 0,
+                    "ber_success_rate": success_rate if valid_mask.sum() > 0 else 0,
                 })
                 print("BER vs SNR plot logged to WandB")
 
@@ -1556,13 +1860,14 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         plt.close(fig)
 
     def plot_ber_by_modulation(self, ber_results: Dict):
-        """Plot BER by modulation type"""
+        """Plot BER by modulation type with enhanced visibility"""
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
         modulation_names = ['QPSK', '8PSK', '16PSK']
-        colors = ['red', 'blue', 'green']
 
-        for mod_idx, (mod_name, color) in enumerate(zip(modulation_names, colors)):
+        print("\n=== BER BY MODULATION DEBUG ===")
+
+        for mod_idx, mod_name in enumerate(modulation_names):
             ax = axes[mod_idx]
 
             # Filter by modulation type
@@ -1571,26 +1876,86 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             if mask.sum() > 0:
                 snrs = ber_results['snrs'][mask]
                 unsync_ber = ber_results['unsync_ber'][mask]
-                perfect_ber = ber_results['perfect_sync_ber'][mask]
                 diffusion_ber = ber_results['diffusion_sync_ber'][mask]
+
+                print(f"\n{mod_name} ({mask.sum()} samples):")
+                print(f"  Unsync BER range: {np.min(unsync_ber):.6f} - {np.max(unsync_ber):.6f}")
+                print(f"  Diffusion BER range: {np.min(diffusion_ber):.6f} - {np.max(diffusion_ber):.6f}")
+                print(f"  Average improvement: {np.mean(unsync_ber)/(np.mean(diffusion_ber)+1e-10):.2f}x")
 
                 # Sort by SNR for better plotting
                 sort_idx = np.argsort(snrs)
                 snrs = snrs[sort_idx]
                 unsync_ber = unsync_ber[sort_idx]
-                perfect_ber = perfect_ber[sort_idx]
                 diffusion_ber = diffusion_ber[sort_idx]
 
-                # Plot with some smoothing
-                ax.semilogy(snrs, unsync_ber, 'r-o', alpha=0.7, label='Unsynchronized', markersize=4)
-                ax.semilogy(snrs, perfect_ber, 'g-s', alpha=0.7, label='Perfect Sync', markersize=4)
-                ax.semilogy(snrs, diffusion_ber, 'b-^', alpha=0.7, label='Diffusion Sync', markersize=4)
+                # Check if we need dual y-axis for this modulation
+                max_ratio = np.max(unsync_ber) / (np.min(diffusion_ber) + 1e-10)
+
+                if max_ratio < 2.0:  # Values too close, use dual y-axis
+                    print(f"  Using dual y-axis (ratio: {max_ratio:.2f})")
+
+                    # Plot unsynchronized on left axis
+                    ax.semilogy(snrs, unsync_ber, 'r-o', alpha=0.9, label='Unsynchronized',
+                                markersize=8, linewidth=4, markerfacecolor='red',
+                                markeredgecolor='darkred', markeredgewidth=2, zorder=2)
+
+                    # Create second y-axis for synchronized
+                    ax2 = ax.twinx()
+                    ax2.semilogy(snrs, diffusion_ber, 'b--^', alpha=0.9, label='Diffusion Sync',
+                                markersize=8, linewidth=4, markerfacecolor='blue',
+                                markeredgecolor='darkblue', markeredgewidth=2, zorder=3)
+
+                    # Style the axes
+                    ax.set_ylabel('Unsynchronized BER', fontsize=12, color='red')
+                    ax.tick_params(axis='y', labelcolor='red')
+                    ax2.set_ylabel('Synchronized BER', fontsize=12, color='blue')
+                    ax2.tick_params(axis='y', labelcolor='blue')
+
+                    # Combined legend
+                    lines1, labels1 = ax.get_legend_handles_labels()
+                    lines2, labels2 = ax2.get_legend_handles_labels()
+                    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='upper right')
+
+                else:
+                    # Normal single axis with horizontal offset
+                    print(f"  Using single y-axis with offset (ratio: {max_ratio:.2f})")
+
+                    ax.semilogy(snrs, unsync_ber, 'r-o', alpha=0.9, label='Unsynchronized',
+                                markersize=8, linewidth=4, markerfacecolor='red',
+                                markeredgecolor='darkred', markeredgewidth=2, zorder=2)
+
+                    # Add small horizontal offset to synchronized points
+                    ax.semilogy(snrs + 0.5, diffusion_ber, 'b--^', alpha=0.9, label='Diffusion Sync',
+                                markersize=8, linewidth=4, markerfacecolor='blue',
+                                markeredgecolor='darkblue', markeredgewidth=2, zorder=3)
+
+                    ax.legend(fontsize=10, loc='upper right')
+                    ax.set_ylabel('Bit Error Rate', fontsize=12)
+
+                # Sample count and statistics
+                improvement_ratio = np.mean(unsync_ber) / (np.mean(diffusion_ber) + 1e-10)
+                better_count = np.sum(diffusion_ber < unsync_ber)
+
+                stats_text = f'Samples: {mask.sum()}\n'
+                stats_text += f'Improvement: {improvement_ratio:.2f}x\n'
+                stats_text += f'Better points: {better_count}/{len(unsync_ber)}\n'
+                stats_text += f'Avg Unsync: {np.mean(unsync_ber):.5f}\n'
+                stats_text += f'Avg Sync: {np.mean(diffusion_ber):.5f}'
+
+                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+                        verticalalignment='top', bbox=dict(boxstyle='round',
+                        facecolor='lightgray', alpha=0.9))
+
+            else:
+                print(f"\n{mod_name}: No samples found!")
+                ax.text(0.5, 0.5, f'No {mod_name} samples', transform=ax.transAxes,
+                        ha='center', va='center', fontsize=12)
 
             ax.set_xlabel('SNR (dB)', fontsize=12)
-            ax.set_ylabel('Bit Error Rate', fontsize=12)
-            ax.set_title(f'{mod_name} BER Performance', fontsize=14, fontweight='bold')
+            ax.set_title(f'{mod_name} BER Performance\n({mask.sum()} samples)',
+                        fontsize=14, fontweight='bold')
             ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=10)
             ax.set_xlim(-22, 32)
 
         plt.tight_layout()
@@ -1612,107 +1977,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         plt.close(fig)
 
-    def plot_ber_improvement(self, ber_results: Dict):
-        """Plot BER improvement statistics"""
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-        # Calculate improvements
-        ber_improvement = ber_results['unsync_ber'] / (ber_results['diffusion_sync_ber'] + 1e-10)
-        perfect_improvement = ber_results['unsync_ber'] / (ber_results['perfect_sync_ber'] + 1e-10)
-
-        # Plot 1: Improvement vs SNR scatter
-        ax1 = axes[0, 0]
-        scatter = ax1.scatter(ber_results['snrs'], ber_improvement,
-                                c=ber_results['labels'], cmap='tab10', alpha=0.6)
-        ax1.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-        ax1.set_xlabel('SNR (dB)')
-        ax1.set_ylabel('BER Improvement Factor')
-        ax1.set_title('BER Improvement vs SNR')
-        ax1.grid(True, alpha=0.3)
-        plt.colorbar(scatter, ax=ax1, label='Modulation Type')
-
-        # Plot 2: Improvement histogram
-        ax2 = axes[0, 1]
-        ax2.hist(ber_improvement, bins=50, alpha=0.7, color='blue', edgecolor='black')
-        ax2.axvline(x=1, color='red', linestyle='--', linewidth=2, label='No Improvement')
-        ax2.axvline(x=np.median(ber_improvement), color='green', linestyle='-', linewidth=2,
-                    label=f'Median: {np.median(ber_improvement):.2f}')
-        ax2.set_xlabel('BER Improvement Factor')
-        ax2.set_ylabel('Count')
-        ax2.set_title('Distribution of BER Improvements')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-
-        # Plot 3: Success rate by SNR
-        ax3 = axes[1, 0]
-        snr_bins = np.arange(-20, 31, 5)
-        success_rates = []
-        snr_centers = []
-
-        for i in range(len(snr_bins) - 1):
-            mask = (ber_results['snrs'] >= snr_bins[i]) & (ber_results['snrs'] < snr_bins[i+1])
-            if mask.sum() > 0:
-                success_rate = np.mean(ber_improvement[mask] > 1.0)
-                success_rates.append(success_rate)
-                snr_centers.append((snr_bins[i] + snr_bins[i+1]) / 2)
-
-        ax3.plot(snr_centers, success_rates, 'o-', linewidth=2, markersize=8, color='purple')
-        ax3.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
-        ax3.set_xlabel('SNR (dB)')
-        ax3.set_ylabel('Success Rate (BER Improvement > 1)')
-        ax3.set_title('Synchronization Success Rate vs SNR')
-        ax3.grid(True, alpha=0.3)
-        ax3.set_ylim(0, 1)
-
-        # Plot 4: Summary statistics
-        ax4 = axes[1, 1]
-        ax4.axis('off')
-
-        # Calculate statistics
-        mean_improvement = np.mean(ber_improvement)
-        median_improvement = np.median(ber_improvement)
-        success_rate_overall = np.mean(ber_improvement > 1.0)
-        best_improvement = np.max(ber_improvement)
-        worst_improvement = np.min(ber_improvement)
-
-        stats_text = f"""
-        BER Improvement Statistics:
-
-        Mean Improvement: {mean_improvement:.2f}x
-        Median Improvement: {median_improvement:.2f}x
-        Success Rate: {success_rate_overall:.1%}
-        Best Improvement: {best_improvement:.2f}x
-        Worst Case: {worst_improvement:.2f}x
-
-        Total Samples: {len(ber_improvement)}
-        Samples Improved: {np.sum(ber_improvement > 1.0)}
-        Samples Degraded: {np.sum(ber_improvement < 1.0)}
-        """
-
-        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=12,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-
-        plt.tight_layout()
-
-        # Log to wandb
-        if hasattr(self, 'logger') and self.logger is not None:
-            logger_class_name = self.logger.__class__.__name__
-            if 'WandbLogger' in logger_class_name:
-                self.logger.experiment.log({
-                    "ber_improvement_analysis": wandb.Image(fig),
-                    "epoch": self.current_epoch,
-                    "mean_ber_improvement": mean_improvement,
-                    "median_ber_improvement": median_improvement,
-                    "ber_success_rate": success_rate_overall,
-                })
-                print("BER improvement analysis logged to WandB")
-
-        # Save locally
-        plot_filename = f'ber_improvement_epoch_{self.current_epoch}.png'
-        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
-        print(f"BER improvement analysis saved as {plot_filename}")
-
-        plt.close(fig)
     def on_train_epoch_start(self):
         """Log joint training status"""
         print(f"\nEpoch {self.current_epoch}: Joint Training (Sync + Classification)")

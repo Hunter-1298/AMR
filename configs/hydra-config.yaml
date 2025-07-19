@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: UMAP
+run_name: class_&_BER
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -64,14 +64,14 @@ data_dir: data/
 
 BaselineClassifier:
     _target_: models.latent_encoder_models.psk.BaselineClassifier
-    learning_rate: .0001
+    learning_rate: .0005
     classifier:
         _target_: models.latent_encoder_models.psk.HybridConvTransformer
         in_ch: 2
         num_classes: 3
 Encoder:
     _target_: models.latent_encoder_models.psk.SelfConditioningDiffusionWithClassifier
-    learning_rate: .00005
+    learning_rate: .0001
     vis_batch_size: ${hyperparams.batch_size}
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
