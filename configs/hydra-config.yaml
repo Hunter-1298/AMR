@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: class_&_BER
+run_name: Grads_Unet
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -73,6 +73,9 @@ Encoder:
     _target_: models.latent_encoder_models.psk.SelfConditioningDiffusionWithClassifier
     learning_rate: .0001
     vis_batch_size: ${hyperparams.batch_size}
+    num_train_timesteps: 10
+    num_classes: 3
+
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
         # sample_size: 1024

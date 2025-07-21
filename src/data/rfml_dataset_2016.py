@@ -293,9 +293,26 @@ class RFMLDataset(Dataset):
             "GMSK",
             "OQPSK",
         ]
+        easy_classes = [
+            "OOK",
+            "4ASK",
+            "BPSK",
+            "QPSK",
+            "8PSK",
+            "16QAM",
+            "AM-SSB-WC",
+            "AM-DSB-SC",
+            "FM",
+            "GMSK",
+            "OQPSK",
+        ]
         data_path = "/home/hshayde/Projects/MIT/AMR/Dataset/2018.01/2018_RFML.hdf5"
         data_dict = {}
-        choosen_classes = ["QPSK", "8PSK", "16PSK"]
+        # choosen_classes = easy_classes        # choosen_classes = easy_classes
+        choosen_classes =["QPSK",
+            "8PSK",
+            "16PSK"]
+        # choosen_classes = easy_classes
         min_snr_level = -20
 
         if sync:  # load synchronized data, should be a dict of synchonized data
@@ -312,6 +329,7 @@ class RFMLDataset(Dataset):
                     # Decode byte labels to string if necessary
                     if isinstance(Y[0], bytes):
                         Y = [y.decode("utf-8") for y in Y]
+                    i = 0
                     for x, y, z in tqdm(zip(X, Y, Z)):
                         if (
                             classes[np.argmax(y)] in choosen_classes
@@ -322,7 +340,8 @@ class RFMLDataset(Dataset):
                                 data_dict[key] = []
 
                             # _sync now returns (synced_signal, timing_offset, freq_offset, phase_offset)
-                            sync_result = self._sync(x.T, key[0])
+                            # sync_result = self._sync(x.T, key[0])
+                            sync_result = x.T
                             data_dict[key].append(
                                 (sync_result, x.T)
                             )  # Store full sync result and original

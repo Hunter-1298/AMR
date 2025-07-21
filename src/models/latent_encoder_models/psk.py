@@ -17,7 +17,6 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import math
-import seaborn as sns
 
 class DDPMScheduler(nn.Module):
     """Standard DDPM scheduler for AWGN noise"""
@@ -95,7 +94,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         num_train_timesteps: int = 10,
 
         # Classifier parameters
-        num_classes: int = 3,
+        num_classes: int =3,
         conv_hidden: tuple = (32,64,128),
         trans_dim: int = 256,
         n_heads: int = 8,
@@ -158,56 +157,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         # Store validation outputs for SNR analysis
         self.validation_step_outputs = []
 
-
-    def calculate_soft_ber_loss(self, synchronized_signals: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Calculate differentiable BER proxy using soft symbol decisions"""
-        batch_size = synchronized_signals.shape[0]
-        device = synchronized_signals.device
-
-        # Convert to complex
-        complex_signals = synchronized_signals[:, 0] + 1j * synchronized_signals[:, 1]
-
-        # Downsample to symbol rate (every 8 samples)
-        symbols = complex_signals[:, ::8]  # [batch_size, num_symbols]
-
-        ber_losses = []
-
-        for i in range(batch_size):
-            modulation_type = labels[i].item()
-            sample_symbols = symbols[i]
-
-            # Calculate soft BER based/training on modulation type using unified function
-            if modulation_type == 0:  # QPSK
-                soft_ber = self.soft_psk_ber(sample_symbols, 4)
-            elif modulation_type == 1:  # 8PSK
-                soft_ber = self.soft_psk_ber(sample_symbols, 8)
-            elif modulation_type == 2:  # 16PSK
-                soft_ber = self.soft_psk_ber(sample_symbols, 16)
-            else:
-                soft_ber = torch.tensor(0.0, device=device)
-
-            ber_losses.append(soft_ber)
-
-        return torch.stack(ber_losses).mean()
-
-    def soft_psk_ber(self, symbols: torch.Tensor, modulation_order: int) -> torch.Tensor:
-        """Unified soft BER calculation for any PSK modulation order"""
-        # Generate constellation points
-        angles = torch.arange(0, modulation_order, device=symbols.device) * 2 * torch.pi / modulation_order
-        constellation = torch.exp(1j * angles)
-
-        # Calculate distances from each symbol to all constellation points
-        # symbols: [num_symbols], constellation: [modulation_order]
-        # Result: [num_symbols, modulation_order]
-        dists = torch.abs(symbols.unsqueeze(-1) - constellation.unsqueeze(0)) ** 2
-
-        # Soft minimum using softmax (acts like differentiable min)
-        softmin_weights = torch.softmax(-dists, dim=-1)  # Negative for minimum
-
-        # Weighted average distance (soft minimum distance)
-        soft_dist = (softmin_weights * dists).sum(dim=-1).mean()
-
-        return soft_dist
     def normalize_sync_params(self, timing, freq, phase):
         """Normalize synchronization parameters for training"""
         if not self.hparams.normalize_params:
@@ -230,81 +179,15 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         return timing, freq, phase
 
-    def get_interpolation_alpha(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """Get interpolation weights based on timesteps"""
-        alpha = timesteps.float() / (self.hparams.num_train_timesteps - 1)
-
-        if self.hparams.interpolation_type == "linear":
-            return alpha
-        elif self.hparams.interpolation_type == "cosine":
-            return 0.5 * (1 - torch.cos(alpha * torch.pi))
-        else:
-            return alpha
-
-    def create_sync_interpolation(
-        self,
-        sync_signals: torch.Tensor,
-        unsync_signals: torch.Tensor,
-        timesteps: torch.Tensor
-    ) -> torch.Tensor:
-        """Create interpolation between synchronized and unsynchronized signals"""
-        sync_signals = sync_signals.float()
-        unsync_signals = unsync_signals.float()
-
-        alpha = self.get_interpolation_alpha(timesteps)
-        alpha = alpha.view(-1, 1, 1).float()
-
-        # At t=0: fully synchronized (alpha=0)
-        # At t=19: fully unsynchronized (alpha=1)
-        interpolated = (1 - alpha) * sync_signals + alpha * unsync_signals
-
-        if self.training and self.hparams.noise_regularization > 0:
-            noise_scale = self.hparams.noise_regularization * (1 - alpha + 0.1)
-            noise = torch.randn_like(interpolated) * noise_scale
-            interpolated = interpolated + noise
-
-        return interpolated.float()
-
-    def should_do_classification(self) -> bool:
-        """Determine if we should include classification loss"""
-        return self.current_epoch >= self.hparams.classification_start_epoch
+  
 
     def training_step(self, batch, batch_idx):
-        """Joint training with sync + classification + BER losses"""
+        """Training step using classification loss only."""
         sync_signals, unsync_signals, labels, snrs, sync_params = batch
-        batch_size = sync_signals.shape[0]
 
-        # === NORMALIZE SYNC PARAMETERS ===
-        true_timing, true_freq, true_phase = sync_params
-        norm_true_timing, norm_true_freq, norm_true_phase = self.normalize_sync_params(
-            true_timing, true_freq, true_phase
-        )
-
-        # === SYNCHRONIZATION LOSS (STEP-WISE) ===
-        timesteps = torch.randint(0, self.hparams.num_train_timesteps, (batch_size,), device=self.device)
-        interpolated_signals = self.create_sync_interpolation(sync_signals, unsync_signals, timesteps)
-
-        sync_output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
-
-        # Step-wise targets
-        alpha_current = self.get_interpolation_alpha(timesteps).to(self.device)
-        next_timesteps = torch.clamp(timesteps - 1, 0, self.hparams.num_train_timesteps - 1)
-        alpha_next = self.get_interpolation_alpha(next_timesteps).to(self.device)
-        step_alpha = torch.where(timesteps == 0, torch.zeros_like(alpha_current), alpha_current - alpha_next)
-
-        target_timing = norm_true_timing * step_alpha
-        target_freq = norm_true_freq * step_alpha
-        target_phase = norm_true_phase * step_alpha
-
-        # Synchronization loss
-        timing_mse = F.mse_loss(sync_output['timing_offset'].squeeze(), target_timing)
-        freq_mse = F.mse_loss(sync_output['freq_offset'].squeeze(), target_freq)
-        phase_mse = F.mse_loss(sync_output['phase_offset'].squeeze(), target_phase)
-        sync_loss = timing_mse + freq_mse + phase_mse
-
-        # === CLASSIFICATION LOSS (FULLY SYNCHRONIZED SIGNALS) ===
-        fully_synchronized_signals, _ = self.iterative_synchronization_for_gif(
-            unsync_signals, labels, num_steps=10
+        # === CLASSIFICATION LOSS ON SYNCHRONIZED SIGNALS ===
+        fully_synchronized_signals = self.iterative_synchronization_for_training(
+            unsync_signals, labels, num_steps=self.hparams.num_train_timesteps
         )
 
         class_logits = self.classifier(fully_synchronized_signals)
@@ -312,140 +195,88 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         class_preds = torch.argmax(class_logits, dim=1)
         classification_acc = (class_preds == labels).float().mean()
 
-        # === BER LOSS (UNIFIED SOFT PSK) ===
-        ber_loss = self.calculate_soft_ber_loss(fully_synchronized_signals, labels)
-
-        # === TOTAL LOSS ===
-        total_loss = (
-            self.hparams.lambda_sync * sync_loss +
-            self.hparams.lambda_class * classification_loss +
-            self.hparams.lambda_ber * ber_loss
-        )
-
         # === LOGGING ===
-        self.log('train/sync_loss', sync_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train/class_loss', classification_loss, on_step=True, on_epoch=True)
-        self.log('train/ber_loss', ber_loss, on_step=True, on_epoch=True)
+        self.log('train/class_loss', classification_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train/class_acc', classification_acc, on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train/total_loss', total_loss, on_step=True, on_epoch=True)
 
-        # Log individual loss components for monitoring
-        self.log('train/timing_mse', timing_mse, on_step=True)
-        self.log('train/freq_mse', freq_mse, on_step=True)
-        self.log('train/phase_mse', phase_mse, on_step=True)
-
-        return total_loss
-
+        return classification_loss
+         
     def validation_step(self, batch, batch_idx):
-        """Validation with step-wise corrections + BER loss evaluation"""
-        sync_signals, unsync_signals, labels, snrs, sync_params = batch
-        batch_size = sync_signals.shape[0]
+        """Validation step using classification only."""
+        _, unsync_signals, labels, snrs, _ = batch
 
-        # === NORMALIZE SYNC PARAMETERS ===
-        true_timing, true_freq, true_phase = sync_params
-        norm_true_timing, norm_true_freq, norm_true_phase = self.normalize_sync_params(
-            true_timing, true_freq, true_phase
-        )
-
-        # Store first batch for visualization
+        # Store first batch for visualization if needed
         if batch_idx == 0 and not self.val_samples_stored:
             self.stored_val_data = {
-                'sync_signals': sync_signals[:self.hparams.vis_batch_size].cpu(),
                 'unsync_signals': unsync_signals[:self.hparams.vis_batch_size].cpu(),
                 'labels': labels[:self.hparams.vis_batch_size].cpu(),
                 'snrs': snrs[:self.hparams.vis_batch_size].cpu(),
-                'sync_params': (
-                    norm_true_timing[:self.hparams.vis_batch_size].cpu(),
-                    norm_true_freq[:self.hparams.vis_batch_size].cpu(),
-                    norm_true_phase[:self.hparams.vis_batch_size].cpu(),
-                )
             }
             self.val_samples_stored = True
 
         with torch.no_grad():
-            # === SYNCHRONIZATION LOSS (at t=0 for best case) ===
-            timesteps = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
-            interpolated_signals = self.create_sync_interpolation(sync_signals, unsync_signals, timesteps)
-
-            sync_output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
-
-            # Step-wise sync loss (for t=0, step_alpha should be 0)
-            alpha_current = self.get_interpolation_alpha(timesteps).to(self.device)
-            next_timesteps = torch.clamp(timesteps - 1, 0, self.hparams.num_train_timesteps - 1)
-            alpha_next = self.get_interpolation_alpha(next_timesteps).to(self.device)
-            step_alpha = torch.where(timesteps == 0, torch.zeros_like(alpha_current), alpha_current - alpha_next)
-
-            target_timing = norm_true_timing * step_alpha
-            target_freq = norm_true_freq * step_alpha
-            target_phase = norm_true_phase * step_alpha
-
-            sync_loss = (
-                F.mse_loss(sync_output['timing_offset'].squeeze(), target_timing) +
-                F.mse_loss(sync_output['freq_offset'].squeeze(), target_freq) +
-                F.mse_loss(sync_output['phase_offset'].squeeze(), target_phase)
+            # Fully synchronize signals for validation
+            fully_synchronized_signals = self.iterative_synchronization_for_training(
+                unsync_signals, labels,num_steps = self.hparams.num_train_timesteps
             )
 
-            # === CLASSIFICATION ON FULLY SYNCHRONIZED SIGNALS ===
-            fully_synchronized_signals, progression = self.iterative_synchronization_for_gif(
-                unsync_signals, labels, num_steps=10
-            )
-
+            # Classification
             class_logits = self.classifier(fully_synchronized_signals)
             class_loss = self.classification_criterion(class_logits, labels)
             class_preds = torch.argmax(class_logits, dim=1)
             class_acc = (class_preds == labels).float().mean()
             class_probs = F.softmax(class_logits, dim=-1)
 
-            # === BER LOSS EVALUATION ===
-            ber_loss = self.calculate_soft_ber_loss(fully_synchronized_signals, labels)
-            unsync_ber_loss = self.calculate_soft_ber_loss(unsync_signals, labels)
-
-            # === TOTAL VALIDATION LOSS ===
-            total_val_loss = (
-                self.hparams.lambda_sync * sync_loss +
-                self.hparams.lambda_class * class_loss +
-                self.hparams.lambda_ber * ber_loss
-            )
-
-            # Store outputs for SNR analysis
+            # Store outputs
             self.validation_step_outputs.append({
                 'predictions': class_preds.cpu(),
                 'labels': labels.cpu(),
                 'snrs': snrs.cpu(),
-                'probabilities': class_probs.cpu(),
-                'sync_loss': sync_loss.cpu(),
                 'class_loss': class_loss.cpu(),
-                'ber_loss': ber_loss.cpu(),
-                'unsync_ber_loss': unsync_ber_loss.cpu(),
-                'total_loss': total_val_loss.cpu(),
+                'class_probs': class_probs.cpu(),
             })
 
-        # === LOGGING ===
-        self.log('val/sync_loss', sync_loss, on_epoch=True, prog_bar=True)
-        self.log('val/class_loss', class_loss, on_epoch=True)
+        # Logging
+        self.log('val/class_loss', class_loss, on_epoch=True, prog_bar=True)
         self.log('val/class_acc', class_acc, on_epoch=True, prog_bar=True)
-        self.log('val/total_loss', total_val_loss, on_epoch=True, prog_bar=True)
 
-        # Log BER losses
-        self.log('val/ber_loss', ber_loss, on_epoch=True)
-        self.log('val/unsync_ber_loss', unsync_ber_loss, on_epoch=True)
-
-        # Calculate and log BER improvement ratio
-        ber_improvement = unsync_ber_loss / (ber_loss + 1e-8)
-        self.log('val/ber_improvement_ratio', ber_improvement, on_epoch=True, prog_bar=True)
-
-        # Log per-class accuracy
+        # Per-class accuracy logging
         for i, label_name in enumerate(self.label_names):
             class_mask = labels == i
             if class_mask.sum() > 0:
                 class_acc_per_class = (class_preds[class_mask] == labels[class_mask]).float().mean()
                 self.log(f'val/class_acc_{label_name}', class_acc_per_class)
 
-        # Debug timestep response for first batch
-        if batch_idx == 0:
-            self.debug_timestep_conditioning_stepwise(unsync_signals[:1], labels[:1])
+        return class_loss
 
-        return total_val_loss
+    def iterative_synchronization_for_training(
+        self,
+        unsync_signal: torch.Tensor,
+        modulation: torch.Tensor,
+        num_steps: int = 10
+    ) -> torch.Tensor:
+        device = unsync_signal.device
+        current_signal = unsync_signal
+        timesteps = torch.linspace(self.hparams.num_train_timesteps - 1, 0, num_steps).long().to(device)
+
+        for step, t in enumerate(timesteps):
+            t_batch = torch.full((current_signal.shape[0],), t, device=device)
+
+            output = self.model(current_signal, t_batch, modulation, return_dict=True)
+
+            corrected_signal = self.apply_predicted_sync(
+                current_signal,
+                output['timing_offset'],
+                output['freq_offset'],
+                output['phase_offset']
+            )
+
+            if step < num_steps - 1:
+                current_signal = corrected_signal.detach()  # no grad tracking for intermediate steps
+            else:
+                current_signal = corrected_signal  # grad tracking on final step
+
+        return current_signal
 
     @torch.no_grad()
     def iterative_synchronization_for_gif(
@@ -453,26 +284,18 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         unsync_signal: torch.Tensor,
         modulation: torch.Tensor,
         num_steps: int = 10
-    ) -> Tuple[torch.Tensor, List[Dict]]:
-        """Iterative synchronization with cumulative timing tracking for visualization"""
+    ):
         device = unsync_signal.device
-        current_signal = unsync_signal.clone()
+        current_signal = unsync_signal
+        timesteps = torch.linspace(self.hparams.num_train_timesteps - 1, 0, num_steps).long().to(device)
+        cumulative_timing = torch.zeros(current_signal.shape[0], device=device)
 
         progression = []
-        cumulative_timing = torch.zeros(current_signal.shape[0], device=device)  # Track cumulative timing
-
-        # # Reverse diffusion schedule
-        timesteps = torch.linspace(
-            self.hparams.num_train_timesteps - 1, 0, num_steps
-        ).long().to(device)
 
         for step, t in enumerate(timesteps):
             t_batch = torch.full((current_signal.shape[0],), t, device=device)
-
-            # Get model prediction
             output = self.model(current_signal, t_batch, modulation, return_dict=True)
 
-            # Apply step-wise corrections to current signal
             corrected_signal = self.apply_predicted_sync(
                 current_signal,
                 output['timing_offset'],
@@ -488,38 +311,44 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
             )
             cumulative_timing += timing_physical
 
-            # Get classification for this step
+            # Classifier run: track grads only on final step
             if hasattr(self, 'classifier'):
-                class_logits = self.classifier(corrected_signal)
-                class_probs = F.softmax(class_logits, dim=-1)
+                if step < num_steps - 1:
+                    with torch.no_grad():
+                        class_logits = self.classifier(corrected_signal)
+                else:
+                    class_logits = self.classifier(corrected_signal)
+
+                class_probs = torch.softmax(class_logits, dim=-1)
                 class_preds = torch.argmax(class_logits, dim=1)
             else:
-                class_probs = torch.zeros((corrected_signal.shape[0], self.hparams.num_classes))
-                class_preds = torch.zeros((corrected_signal.shape[0],), dtype=torch.long)
+                class_probs = torch.zeros((corrected_signal.shape[0], self.hparams.num_classes), device=device)
+                class_preds = torch.zeros((corrected_signal.shape[0],), dtype=torch.long, device=device)
 
-            # Store step info with cumulative timing tracking
+            # Store progression info (detach & move to CPU)
             step_info = {
                 'step': step,
                 'timestep': t.item(),
-                'signal': corrected_signal.cpu().clone(),
-                'input_signal': current_signal.cpu().clone(),
-                'timing_offset': output['timing_offset'].cpu().clone(),
-                'freq_offset': output['freq_offset'].cpu().clone(),
-                'phase_offset': output['phase_offset'].cpu().clone(),
-                'cumulative_timing_offset': cumulative_timing.cpu().clone(),  # Track cumulative timing
-                'cumulative_freq_offset': torch.zeros_like(cumulative_timing.cpu()),  # Placeholder for future
-                'cumulative_phase_offset': torch.zeros_like(cumulative_timing.cpu()),  # Placeholder for future
-                'class_probs': class_probs.cpu().clone(),
-                'class_preds': class_preds.cpu().clone(),
+                'signal': corrected_signal.detach().cpu().clone(),
+                'input_signal': current_signal.detach().cpu().clone(),
+                'timing_offset': output['timing_offset'].detach().cpu().clone(),
+                'freq_offset': output['freq_offset'].detach().cpu().clone(),
+                'phase_offset': output['phase_offset'].detach().cpu().clone(),
+                'cumulative_timing_offset': cumulative_timing.detach().cpu().clone(),
+                'cumulative_freq_offset': torch.zeros_like(cumulative_timing.cpu()),  # placeholder
+                'cumulative_phase_offset': torch.zeros_like(cumulative_timing.cpu()),  # placeholder
+                'class_probs': class_probs.detach().cpu().clone(),
+                'class_preds': class_preds.detach().cpu().clone(),
             }
-
             progression.append(step_info)
 
-            # Update for next iteration
-            current_signal = corrected_signal.detach()
+            # Detach intermediate corrected signals (no grad) except final
+            if step < num_steps - 1:
+                current_signal = corrected_signal.detach()
+            else:
+                current_signal = corrected_signal  # keep grad for final
 
         return current_signal, progression
-
     def apply_predicted_sync(
         self,
         signal: torch.Tensor,
@@ -591,43 +420,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         delayed_signals = torch.fft.ifft(delayed_fft, dim=-1)
 
         return delayed_signals
-
-    @torch.no_grad()
-    def debug_timestep_conditioning_stepwise(self, unsync_signal: torch.Tensor, modulation: torch.Tensor):
-        """Debug function to check step-wise timestep response"""
-        device = unsync_signal.device
-
-        print("\nStep-wise Timestep Response Debug:")
-        print("Expected: step sizes should decrease as timestep decreases")
-        print("-" * 80)
-
-        for t in [9, 7, 5 ,2,0]:
-            t_batch = torch.full((1,), t, device=device)
-
-            output = self.model(unsync_signal, t_batch, modulation, return_dict=True)
-
-            alpha_current = self.get_interpolation_alpha(torch.tensor([t])).item()
-            next_t = max(0, t - 1)
-            alpha_next = self.get_interpolation_alpha(torch.tensor([next_t])).item()
-            step_alpha = alpha_current - alpha_next if t > 0 else 0.0
-
-            print(f"t={t:2d} (α_curr={alpha_current:.3f}, α_next={alpha_next:.3f}, step={step_alpha:.3f}):")
-            print(f"    pred_norm: timing={output['timing_offset'][0,0].item():7.4f}, "
-                  f"freq={output['freq_offset'][0,0].item():7.4f}, "
-                  f"phase={output['phase_offset'][0,0].item():7.4f}")
-
-            # Show denormalized values
-            timing_phys, freq_phys, phase_phys = self.denormalize_sync_params(
-                output['timing_offset'][0,0],
-                output['freq_offset'][0,0],
-                output['phase_offset'][0,0]
-            )
-            print(f"    pred_phys: timing={timing_phys.item():7.4f}, "
-                  f"freq={freq_phys.item():9.6f}, "
-                  f"phase={phase_phys.item():7.4f}")
-
-        print("-" * 80)
-
 
     def create_snr_vs_accuracy_plot(self):
         """Create SNR vs Classification Accuracy plot"""
@@ -992,22 +784,20 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         try:
             # Get stored validation data
-            sync_signals = self.stored_val_data['sync_signals'].to(self.device)
             unsync_signals = self.stored_val_data['unsync_signals'].to(self.device)
             labels = self.stored_val_data['labels'].to(self.device)
             snrs = self.stored_val_data['snrs']
 
-            print(f"Creating animation with shapes: sync={sync_signals.shape}, unsync={unsync_signals.shape}")
 
             # Perform iterative synchronization
-            final_signals, progression = self.iterative_synchronization_for_gif(
-                unsync_signals, labels, num_steps=10
-            )
+            with torch.no_grad():
+                final_signals, progression = self.iterative_synchronization_for_gif(
+                    unsync_signals, labels, num_steps = self.hparams.num_train_timesteps
+                )
 
             if not progression:
                 print("Error: No progression data generated")
                 return
-
             print(f"Generated {len(progression)} progression steps")
 
 
@@ -1305,676 +1095,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         plot_filename = f'umap_by_timestep_epoch_{self.current_epoch}.png'
         fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
         print(f"UMAP by timestep plot saved as {plot_filename}")
-
-        plt.close(fig)
-
-
-    def generate_reference_bits(self, perfect_sync_signal: np.ndarray, modulation_type: int) -> np.ndarray:
-        """Generate reference bits from the perfectly synchronized signal"""
-        # Convert to complex
-        complex_signal = perfect_sync_signal[0] + 1j * perfect_sync_signal[1]
-
-        # Simple symbol detection (downsample to symbol rate)
-        # Assuming 8 samples per symbol
-        sps = 8
-        symbols = complex_signal[::sps]
-
-        # Demodulate based on modulation type
-        if modulation_type == 0:  # QPSK
-            bits = self.demodulate_qpsk(symbols)
-        elif modulation_type == 1:  # 8PSK
-            bits = self.demodulate_8psk(symbols)
-        elif modulation_type == 2:  # 16PSK
-            bits = self.demodulate_16psk(symbols)
-        else:
-            bits = np.array([])
-
-        return bits
-
-    def calculate_ber_analysis(self):
-        """Calculate BER using existing soft BER loss function"""
-        if not self.val_samples_stored or self.stored_val_data is None:
-            print("No validation data stored for BER analysis")
-            return
-
-        try:
-            # Get stored validation data
-            unsync_signals = self.stored_val_data['unsync_signals'].to(self.device)
-            labels = self.stored_val_data['labels'].to(self.device)
-            snrs = self.stored_val_data['snrs']
-
-            max_samples = min(100, len(unsync_signals))
-            unsync_signals = unsync_signals[:max_samples]
-            labels = labels[:max_samples]
-            snrs = snrs[:max_samples]
-
-            print(f"Calculating Soft BER for {max_samples} samples...")
-
-            with torch.no_grad():
-                # Get fully synchronized signals from diffusion model
-                diffusion_sync_signals, _ = self.iterative_synchronization_for_gif(
-                    unsync_signals, labels, num_steps=10
-                )
-
-                # Calculate soft BER for both conditions using your existing function
-                ber_results = {
-                    'snrs': snrs.numpy(),
-                    'labels': labels.cpu().numpy(),
-                    'unsync_soft_ber': [],
-                    'diffusion_soft_ber': [],
-                }
-
-                print(f"Signal shapes - Unsync: {unsync_signals.shape}, Diffusion: {diffusion_sync_signals.shape}")
-
-                # Calculate soft BER for each sample individually
-                for i in range(max_samples):
-                    # Get single sample and expand to batch dimension
-                    unsync_sample = unsync_signals[i:i+1]  # [1, 2, 1024]
-                    diffusion_sample = diffusion_sync_signals[i:i+1]  # [1, 2, 1024]
-                    label_sample = labels[i:i+1]  # [1]
-                    snr_sample = snrs[i]
-
-                    # Calculate soft BER using your existing function
-                    unsync_soft_ber = self.calculate_soft_ber_loss(unsync_sample, label_sample).item()
-                    diffusion_soft_ber = self.calculate_soft_ber_loss(diffusion_sample, label_sample).item()
-
-                    ber_results['unsync_soft_ber'].append(unsync_soft_ber)
-                    ber_results['diffusion_soft_ber'].append(diffusion_soft_ber)
-
-                    # Debug output for first few samples
-                    if i < 5:
-                        print(f"Sample {i} (SNR={snr_sample:.1f}dB, {self.label_names[label_sample.item()]}): "
-                            f"Unsync Soft BER={unsync_soft_ber:.6f}, "
-                            f"Diffusion Soft BER={diffusion_soft_ber:.6f}")
-
-                # Convert to numpy arrays
-                for key in ['unsync_soft_ber', 'diffusion_soft_ber']:
-                    ber_results[key] = np.array(ber_results[key])
-
-                # Update the plot functions to use soft BER
-                self.plot_soft_ber_vs_snr(ber_results)
-                self.plot_soft_ber_by_modulation(ber_results)
-
-                print("Soft BER analysis completed successfully")
-
-        except Exception as e:
-            print(f"Error in soft BER analysis: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def bits_per_symbol(self, modulation_type: int) -> int:
-        """Return bits per symbol for each modulation type"""
-        if modulation_type == 0:  # QPSK
-            return 2
-        elif modulation_type == 1:  # 8PSK
-            return 3
-        elif modulation_type == 2:  # 16PSK
-            return 4
-        else:
-            return 1
-
-    def plot_soft_ber_vs_snr(self, ber_results: Dict):
-        """Plot Soft BER vs SNR comparing unsynchronized vs diffusion synchronized"""
-        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-
-        # Define SNR bins
-        snr_bins = [(-20, -15), (-15, -10), (-10, -5), (-5, 0), (0, 5), (5, 10),
-                    (10, 15), (15, 20), (20, 25), (25, 30)]
-        snr_centers = [(low + high) / 2 for low, high in snr_bins]
-
-        # Calculate average soft BER per SNR bin
-        avg_unsync_ber = []
-        avg_diffusion_ber = []
-        sample_counts = []
-
-        print("\n=== SOFT BER ANALYSIS ===")
-        for snr_min, snr_max in snr_bins:
-            mask = (ber_results['snrs'] >= snr_min) & (ber_results['snrs'] < snr_max)
-            count = mask.sum()
-            sample_counts.append(count)
-
-            if count > 0:
-                unsync_mean = np.mean(ber_results['unsync_soft_ber'][mask])
-                diffusion_mean = np.mean(ber_results['diffusion_soft_ber'][mask])
-
-                avg_unsync_ber.append(unsync_mean)
-                avg_diffusion_ber.append(diffusion_mean)
-
-                improvement = unsync_mean / (diffusion_mean + 1e-10)
-                print(f"SNR {snr_min:3.0f}-{snr_max:3.0f}dB ({count:3d} samples): "
-                    f"Unsync={unsync_mean:.6f}, Diffusion={diffusion_mean:.6f}, "
-                    f"Improvement={improvement:.2f}x")
-            else:
-                avg_unsync_ber.append(np.nan)
-                avg_diffusion_ber.append(np.nan)
-
-        # Convert to numpy arrays and remove NaN values
-        snr_centers = np.array(snr_centers)
-        avg_unsync_ber = np.array(avg_unsync_ber)
-        avg_diffusion_ber = np.array(avg_diffusion_ber)
-
-        # Find valid (non-NaN) points
-        valid_mask = ~(np.isnan(avg_unsync_ber) | np.isnan(avg_diffusion_ber))
-
-        if valid_mask.sum() > 0:
-            # Plot both lines with clear differentiation
-            ax.plot(snr_centers[valid_mask], avg_unsync_ber[valid_mask],
-                    'r-o', linewidth=4, markersize=10, label='Unsynchronized',
-                    alpha=0.8, markerfacecolor='red', markeredgecolor='darkred',
-                    markeredgewidth=2, zorder=2)
-
-            ax.plot(snr_centers[valid_mask], avg_diffusion_ber[valid_mask],
-                    'b--^', linewidth=4, markersize=10, label='Diffusion Synchronized',
-                    alpha=0.8, markerfacecolor='blue', markeredgecolor='darkblue',
-                    markeredgewidth=2, zorder=3)
-
-            # Add scatter points for extra visibility
-            ax.scatter(snr_centers[valid_mask], avg_unsync_ber[valid_mask],
-                    c='red', s=120, alpha=0.9, marker='o', edgecolor='white',
-                    linewidth=2, zorder=4)
-            ax.scatter(snr_centers[valid_mask], avg_diffusion_ber[valid_mask],
-                    c='blue', s=120, alpha=0.9, marker='^', edgecolor='white',
-                    linewidth=2, zorder=5)
-
-            # Add sample count annotations
-            for i, (snr, count) in enumerate(zip(snr_centers[valid_mask], np.array(sample_counts)[valid_mask])):
-                if count > 0:
-                    y_pos = max(avg_unsync_ber[valid_mask][i], avg_diffusion_ber[valid_mask][i]) * 1.1
-                    ax.annotate(f'n={count}', (snr, y_pos), ha='center', fontsize=9, alpha=0.7)
-
-        # Formatting
-        ax.set_xlabel('SNR (dB)', fontsize=14, fontweight='bold')
-        ax.set_ylabel('Soft Bit Error Rate', fontsize=14, fontweight='bold')
-        ax.set_title(f'Soft BER vs SNR - Epoch {self.current_epoch}\n'
-                    f'Diffusion Synchronization Performance (Unified PSK Soft BER)',
-                    fontsize=16, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=12, loc='upper right')
-        ax.set_xlim(-22, 32)
-
-        # Set y-axis limits based on data range
-        if valid_mask.sum() > 0:
-            y_min = min(np.min(avg_unsync_ber[valid_mask]), np.min(avg_diffusion_ber[valid_mask]))
-            y_max = max(np.max(avg_unsync_ber[valid_mask]), np.max(avg_diffusion_ber[valid_mask]))
-            ax.set_ylim(y_min * 0.8, y_max * 1.2)
-
-        # Add improvement statistics
-        if valid_mask.sum() > 0:
-            overall_improvement = np.mean(ber_results['unsync_soft_ber']) / (np.mean(ber_results['diffusion_soft_ber']) + 1e-10)
-            success_rate = np.mean(ber_results['diffusion_soft_ber'] < ber_results['unsync_soft_ber'])
-
-            stats_text = f'Avg Soft BER Improvement: {overall_improvement:.2f}x\n'
-            stats_text += f'Success Rate: {success_rate:.1%}\n'
-            stats_text += f'Total Samples: {len(ber_results["snrs"])}\n'
-            stats_text += f'Avg Unsync Soft BER: {np.mean(ber_results["unsync_soft_ber"]):.6f}\n'
-            stats_text += f'Avg Sync Soft BER: {np.mean(ber_results["diffusion_soft_ber"]):.6f}'
-
-            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=11,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
-
-        plt.tight_layout()
-
-        # Log to wandb
-        if hasattr(self, 'logger') and self.logger is not None:
-            logger_class_name = self.logger.__class__.__name__
-            if 'WandbLogger' in logger_class_name:
-                self.logger.experiment.log({
-                    "soft_ber_vs_snr": wandb.Image(fig),
-                    "epoch": self.current_epoch,
-                    "soft_ber_improvement": overall_improvement if valid_mask.sum() > 0 else 0,
-                    "soft_ber_success_rate": success_rate if valid_mask.sum() > 0 else 0,
-                })
-                print("Soft BER vs SNR plot logged to WandB")
-
-        # Save locally
-        plot_filename = f'soft_ber_vs_snr_epoch_{self.current_epoch}.png'
-        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
-        print(f"Soft BER vs SNR plot saved as {plot_filename}")
-
-        plt.close(fig)
-
-    def plot_soft_ber_by_modulation(self, ber_results: Dict):
-        """Plot Soft BER by modulation type"""
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-        modulation_names = ['QPSK', '8PSK', '16PSK']
-
-        print("\n=== SOFT BER BY MODULATION ===")
-
-        for mod_idx, mod_name in enumerate(modulation_names):
-            ax = axes[mod_idx]
-
-            # Filter by modulation type
-            mask = ber_results['labels'] == mod_idx
-
-            if mask.sum() > 0:
-                snrs = ber_results['snrs'][mask]
-                unsync_ber = ber_results['unsync_soft_ber'][mask]
-                diffusion_ber = ber_results['diffusion_soft_ber'][mask]
-
-                print(f"\n{mod_name} ({mask.sum()} samples):")
-                print(f"  Unsync Soft BER range: {np.min(unsync_ber):.6f} - {np.max(unsync_ber):.6f}")
-                print(f"  Diffusion Soft BER range: {np.min(diffusion_ber):.6f} - {np.max(diffusion_ber):.6f}")
-                print(f"  Average improvement: {np.mean(unsync_ber)/(np.mean(diffusion_ber)+1e-10):.2f}x")
-
-                # Sort by SNR for better plotting
-                sort_idx = np.argsort(snrs)
-                snrs = snrs[sort_idx]
-                unsync_ber = unsync_ber[sort_idx]
-                diffusion_ber = diffusion_ber[sort_idx]
-
-                # Plot with clear differentiation
-                ax.plot(snrs, unsync_ber, 'r-o', alpha=0.9, label='Unsynchronized',
-                    markersize=6, linewidth=3, markerfacecolor='red',
-                    markeredgecolor='darkred', markeredgewidth=1, zorder=2)
-
-                ax.plot(snrs, diffusion_ber, 'b--^', alpha=0.9, label='Diffusion Sync',
-                    markersize=6, linewidth=3, markerfacecolor='blue',
-                    markeredgecolor='darkblue', markeredgewidth=1, zorder=3)
-
-                # Add scatter points for visibility
-                ax.scatter(snrs, unsync_ber, c='red', s=50, alpha=0.9,
-                        marker='o', edgecolor='white', linewidth=1, zorder=4)
-                ax.scatter(snrs, diffusion_ber, c='blue', s=50, alpha=0.9,
-                        marker='^', edgecolor='white', linewidth=1, zorder=5)
-
-                # Statistics
-                improvement_ratio = np.mean(unsync_ber) / (np.mean(diffusion_ber) + 1e-10)
-                better_count = np.sum(diffusion_ber < unsync_ber)
-
-                stats_text = f'Samples: {mask.sum()}\n'
-                stats_text += f'Improvement: {improvement_ratio:.2f}x\n'
-                stats_text += f'Better points: {better_count}/{len(unsync_ber)}\n'
-                stats_text += f'Avg Unsync: {np.mean(unsync_ber):.5f}\n'
-                stats_text += f'Avg Sync: {np.mean(diffusion_ber):.5f}'
-
-                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
-                    verticalalignment='top', bbox=dict(boxstyle='round',
-                    facecolor='lightgray', alpha=0.9))
-
-            ax.set_xlabel('SNR (dB)', fontsize=12)
-            ax.set_ylabel('Soft Bit Error Rate', fontsize=12)
-            ax.set_title(f'{mod_name} Soft BER Performance\n({mask.sum()} samples)',
-                        fontsize=14, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=10, loc='upper right')
-            ax.set_xlim(-22, 32)
-
-        plt.tight_layout()
-
-        # Log to wandb
-        if hasattr(self, 'logger') and self.logger is not None:
-            logger_class_name = self.logger.__class__.__name__
-            if 'WandbLogger' in logger_class_name:
-                self.logger.experiment.log({
-                    "soft_ber_by_modulation": wandb.Image(fig),
-                    "epoch": self.current_epoch
-                })
-                print("Soft BER by modulation plot logged to WandB")
-
-        # Save locally
-        plot_filename = f'soft_ber_by_modulation_epoch_{self.current_epoch}.png'
-        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
-        print(f"Soft BER by modulation plot saved as {plot_filename}")
-
-        plt.close(fig)
-    def demodulate_qpsk(self, symbols: np.ndarray) -> np.ndarray:
-        """Simple QPSK demodulation"""
-        # Normalize symbols
-        symbols = symbols / (np.abs(symbols) + 1e-8)
-
-        # Decision regions
-        bits = []
-        for symbol in symbols:
-            if symbol.real > 0 and symbol.imag > 0:  # Q1
-                bits.extend([0, 0])
-            elif symbol.real < 0 and symbol.imag > 0:  # Q2
-                bits.extend([0, 1])
-            elif symbol.real < 0 and symbol.imag < 0:  # Q3
-                bits.extend([1, 1])
-            else:  # Q4
-                bits.extend([1, 0])
-
-        return np.array(bits)
-
-    def demodulate_8psk(self, symbols: np.ndarray) -> np.ndarray:
-        """Simple 8PSK demodulation"""
-        # Normalize symbols
-        symbols = symbols / (np.abs(symbols) + 1e-8)
-
-        # Calculate angles
-        angles = np.angle(symbols)
-
-        # 8PSK decision regions (0 to 2π divided into 8 regions)
-        bits = []
-        for angle in angles:
-            # Convert to 0-2π range
-            if angle < 0:
-                angle += 2 * np.pi
-
-            # Determine symbol (0-7)
-            symbol_idx = int(np.round(angle / (2 * np.pi / 8))) % 8
-
-            # Convert to 3 bits
-            bit_pattern = [
-                (symbol_idx >> 2) & 1,
-                (symbol_idx >> 1) & 1,
-                symbol_idx & 1
-            ]
-            bits.extend(bit_pattern)
-
-        return np.array(bits)
-
-    def demodulate_16psk(self, symbols: np.ndarray) -> np.ndarray:
-        """Simple 16PSK demodulation"""
-        # Normalize symbols
-        symbols = symbols / (np.abs(symbols) + 1e-8)
-
-        # Calculate angles
-        angles = np.angle(symbols)
-
-        # 16PSK decision regions
-        bits = []
-        for angle in angles:
-            # Convert to 0-2π range
-            if angle < 0:
-                angle += 2 * np.pi
-
-            # Determine symbol (0-15)
-            symbol_idx = int(np.round(angle / (2 * np.pi / 16))) % 16
-
-            # Convert to 4 bits
-            bit_pattern = [
-                (symbol_idx >> 3) & 1,
-                (symbol_idx >> 2) & 1,
-                (symbol_idx >> 1) & 1,
-                symbol_idx & 1
-            ]
-            bits.extend(bit_pattern)
-
-        return np.array(bits)
-    def plot_ber_vs_snr(self, ber_results: Dict):
-        """Plot BER vs SNR comparing unsynchronized vs diffusion synchronized"""
-        fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-
-        # Define SNR bins
-        snr_bins = [(-20, -15), (-15, -10), (-10, -5), (-5, 0), (0, 5), (5, 10),
-                    (10, 15), (15, 20), (20, 25), (25, 30)]
-        snr_centers = [(low + high) / 2 for low, high in snr_bins]
-
-        # Calculate average BER per SNR bin
-        avg_unsync_ber = []
-        avg_diffusion_ber = []
-        sample_counts = []
-
-        print("\n=== BER ANALYSIS DEBUG ===")
-        for snr_min, snr_max in snr_bins:
-            mask = (ber_results['snrs'] >= snr_min) & (ber_results['snrs'] < snr_max)
-            count = mask.sum()
-            sample_counts.append(count)
-
-            if count > 0:
-                unsync_mean = np.mean(ber_results['unsync_ber'][mask])
-                diffusion_mean = np.mean(ber_results['diffusion_sync_ber'][mask])
-
-                avg_unsync_ber.append(unsync_mean)
-                avg_diffusion_ber.append(diffusion_mean)
-
-                # ENHANCED DEBUG OUTPUT
-                print(f"SNR {snr_min:3.0f}-{snr_max:3.0f}dB ({count:3d} samples): "
-                        f"Unsync={unsync_mean:.6f}, Diffusion={diffusion_mean:.6f}, "
-                        f"Ratio={unsync_mean/(diffusion_mean+1e-10):.2f}x")
-            else:
-                avg_unsync_ber.append(np.nan)
-                avg_diffusion_ber.append(np.nan)
-
-        # Convert to numpy arrays and remove NaN values
-        snr_centers = np.array(snr_centers)
-        avg_unsync_ber = np.array(avg_unsync_ber)
-        avg_diffusion_ber = np.array(avg_diffusion_ber)
-
-        # Find valid (non-NaN) points
-        valid_mask = ~(np.isnan(avg_unsync_ber) | np.isnan(avg_diffusion_ber))
-
-        print(f"\nTotal valid SNR bins: {valid_mask.sum()}")
-        print(f"Overall stats:")
-        print(f"  Unsync BER range: {np.nanmin(avg_unsync_ber):.6f} - {np.nanmax(avg_unsync_ber):.6f}")
-        print(f"  Diffusion BER range: {np.nanmin(avg_diffusion_ber):.6f} - {np.nanmax(avg_diffusion_ber):.6f}")
-
-        if valid_mask.sum() > 0:
-            # PLOT WITH VERY DIFFERENT STYLES AND OFFSET
-            # Plot unsynchronized first (will be on bottom layer)
-            line1 = ax.semilogy(snr_centers[valid_mask], avg_unsync_ber[valid_mask],
-                                color='red', linestyle='-', marker='o', linewidth=5,
-                                markersize=12, label='Unsynchronized', alpha=0.9,
-                                markerfacecolor='red', markeredgecolor='darkred',
-                                markeredgewidth=2, zorder=1)
-
-            # Plot synchronized with OFFSET to make it visible even if values are similar
-            # Add small offset to x-position for synchronized points
-            offset_x = 0.5  # Small horizontal offset
-            line2 = ax.semilogy(snr_centers[valid_mask] + offset_x, avg_diffusion_ber[valid_mask],
-                                color='blue', linestyle='--', marker='^', linewidth=5,
-                                markersize=12, label='Diffusion Synchronized', alpha=0.9,
-                                markerfacecolor='blue', markeredgecolor='darkblue',
-                                markeredgewidth=2, zorder=2)
-
-            # ALTERNATIVE: Plot on separate y-axis if values are too close
-            max_ratio = np.nanmax(avg_unsync_ber) / (np.nanmin(avg_diffusion_ber) + 1e-10)
-            if max_ratio < 2.0:  # If improvement is less than 2x, use dual y-axis
-                print(f"Values too close (max ratio: {max_ratio:.2f}), using dual y-axis")
-                ax2 = ax.twinx()
-
-                # Clear the previous synchronized plot
-                line2.remove()
-
-                # Plot synchronized on right y-axis
-                line2 = ax2.semilogy(snr_centers[valid_mask], avg_diffusion_ber[valid_mask],
-                                    color='blue', linestyle='--', marker='^', linewidth=5,
-                                    markersize=12, label='Diffusion Synchronized', alpha=0.9,
-                                    markerfacecolor='blue', markeredgecolor='darkblue',
-                                    markeredgewidth=2, zorder=2)
-
-                ax2.set_ylabel('Synchronized BER', fontsize=14, fontweight='bold', color='blue')
-                ax2.tick_params(axis='y', labelcolor='blue')
-                ax2.set_ylim(np.nanmin(avg_diffusion_ber[valid_mask]) * 0.1,
-                            np.nanmax(avg_diffusion_ber[valid_mask]) * 10)
-
-                # Update legend to include both axes
-                lines1, labels1 = ax.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax.legend(lines1 + lines2, labels1 + labels2, fontsize=12, loc='upper right')
-            else:
-                # Normal single axis legend
-                ax.legend(fontsize=12, loc='upper right')
-
-            # Add sample count annotations
-            for i, (snr, count) in enumerate(zip(snr_centers[valid_mask], np.array(sample_counts)[valid_mask])):
-                if count > 0:
-                    ax.annotate(f'n={count}', (snr, 1e-4), ha='center', fontsize=9, alpha=0.7)
-
-            # ADD DETAILED VALUE TABLE
-            for i, (snr, unsync_ber, diff_ber) in enumerate(zip(snr_centers[valid_mask],
-                                                                avg_unsync_ber[valid_mask],
-                                                                avg_diffusion_ber[valid_mask])):
-                if not (np.isnan(unsync_ber) or np.isnan(diff_ber)):
-                    improvement = unsync_ber / (diff_ber + 1e-10)
-                    print(f"  SNR {snr:5.1f}dB: U={unsync_ber:.6f}, D={diff_ber:.6f}, Imp={improvement:.2f}x")
-
-        else:
-            print("Warning: No valid BER data to plot")
-            ax.text(0.5, 0.5, 'No valid BER data available',
-                    transform=ax.transAxes, ha='center', va='center', fontsize=14)
-
-        # Formatting
-        ax.set_xlabel('SNR (dB)', fontsize=14, fontweight='bold')
-        ax.set_ylabel('Unsynchronized BER', fontsize=14, fontweight='bold', color='red')
-        ax.tick_params(axis='y', labelcolor='red')
-        ax.set_title(f'Bit Error Rate vs SNR - Epoch {self.current_epoch}\n'
-                    f'Impact of Diffusion Synchronization on Demodulation',
-                    fontsize=16, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        ax.set_xlim(-22, 32)
-        ax.set_ylim(1e-5, 1)
-
-        # Add improvement statistics
-        if valid_mask.sum() > 0:
-            # Calculate overall statistics
-            overall_improvement = np.mean(ber_results['unsync_ber']) / (np.mean(ber_results['diffusion_sync_ber']) + 1e-10)
-            success_rate = np.mean(ber_results['diffusion_sync_ber'] < ber_results['unsync_ber'])
-
-            # Count how many points show improvement
-            valid_unsync = avg_unsync_ber[valid_mask]
-            valid_diffusion = avg_diffusion_ber[valid_mask]
-            improvement_points = np.sum(valid_diffusion < valid_unsync)
-
-            stats_text = f'Average BER Improvement: {overall_improvement:.2f}x\n'
-            stats_text += f'Success Rate: {success_rate:.1%}\n'
-            stats_text += f'SNR bins with improvement: {improvement_points}/{valid_mask.sum()}\n'
-            stats_text += f'Total Samples: {len(ber_results["snrs"])}\n'
-            stats_text += f'Avg Unsync BER: {np.mean(ber_results["unsync_ber"]):.6f}\n'
-            stats_text += f'Avg Sync BER: {np.mean(ber_results["diffusion_sync_ber"]):.6f}'
-
-            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
-                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
-
-        plt.tight_layout()
-
-        # Log to wandb
-        if hasattr(self, 'logger') and self.logger is not None:
-            logger_class_name = self.logger.__class__.__name__
-            if 'WandbLogger' in logger_class_name:
-                self.logger.experiment.log({
-                    "ber_vs_snr": wandb.Image(fig),
-                    "epoch": self.current_epoch,
-                    "ber_improvement": overall_improvement if valid_mask.sum() > 0 else 0,
-                    "ber_success_rate": success_rate if valid_mask.sum() > 0 else 0,
-                })
-                print("BER vs SNR plot logged to WandB")
-
-        # Save locally
-        plot_filename = f'ber_vs_snr_epoch_{self.current_epoch}.png'
-        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
-        print(f"BER vs SNR plot saved as {plot_filename}")
-
-        plt.close(fig)
-
-    def plot_ber_by_modulation(self, ber_results: Dict):
-        """Plot BER by modulation type with enhanced visibility"""
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-        modulation_names = ['QPSK', '8PSK', '16PSK']
-
-        print("\n=== BER BY MODULATION DEBUG ===")
-
-        for mod_idx, mod_name in enumerate(modulation_names):
-            ax = axes[mod_idx]
-
-            # Filter by modulation type
-            mask = ber_results['labels'] == mod_idx
-
-            if mask.sum() > 0:
-                snrs = ber_results['snrs'][mask]
-                unsync_ber = ber_results['unsync_ber'][mask]
-                diffusion_ber = ber_results['diffusion_sync_ber'][mask]
-
-                print(f"\n{mod_name} ({mask.sum()} samples):")
-                print(f"  Unsync BER range: {np.min(unsync_ber):.6f} - {np.max(unsync_ber):.6f}")
-                print(f"  Diffusion BER range: {np.min(diffusion_ber):.6f} - {np.max(diffusion_ber):.6f}")
-                print(f"  Average improvement: {np.mean(unsync_ber)/(np.mean(diffusion_ber)+1e-10):.2f}x")
-
-                # Sort by SNR for better plotting
-                sort_idx = np.argsort(snrs)
-                snrs = snrs[sort_idx]
-                unsync_ber = unsync_ber[sort_idx]
-                diffusion_ber = diffusion_ber[sort_idx]
-
-                # Check if we need dual y-axis for this modulation
-                max_ratio = np.max(unsync_ber) / (np.min(diffusion_ber) + 1e-10)
-
-                if max_ratio < 2.0:  # Values too close, use dual y-axis
-                    print(f"  Using dual y-axis (ratio: {max_ratio:.2f})")
-
-                    # Plot unsynchronized on left axis
-                    ax.semilogy(snrs, unsync_ber, 'r-o', alpha=0.9, label='Unsynchronized',
-                                markersize=8, linewidth=4, markerfacecolor='red',
-                                markeredgecolor='darkred', markeredgewidth=2, zorder=2)
-
-                    # Create second y-axis for synchronized
-                    ax2 = ax.twinx()
-                    ax2.semilogy(snrs, diffusion_ber, 'b--^', alpha=0.9, label='Diffusion Sync',
-                                markersize=8, linewidth=4, markerfacecolor='blue',
-                                markeredgecolor='darkblue', markeredgewidth=2, zorder=3)
-
-                    # Style the axes
-                    ax.set_ylabel('Unsynchronized BER', fontsize=12, color='red')
-                    ax.tick_params(axis='y', labelcolor='red')
-                    ax2.set_ylabel('Synchronized BER', fontsize=12, color='blue')
-                    ax2.tick_params(axis='y', labelcolor='blue')
-
-                    # Combined legend
-                    lines1, labels1 = ax.get_legend_handles_labels()
-                    lines2, labels2 = ax2.get_legend_handles_labels()
-                    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='upper right')
-
-                else:
-                    # Normal single axis with horizontal offset
-                    print(f"  Using single y-axis with offset (ratio: {max_ratio:.2f})")
-
-                    ax.semilogy(snrs, unsync_ber, 'r-o', alpha=0.9, label='Unsynchronized',
-                                markersize=8, linewidth=4, markerfacecolor='red',
-                                markeredgecolor='darkred', markeredgewidth=2, zorder=2)
-
-                    # Add small horizontal offset to synchronized points
-                    ax.semilogy(snrs + 0.5, diffusion_ber, 'b--^', alpha=0.9, label='Diffusion Sync',
-                                markersize=8, linewidth=4, markerfacecolor='blue',
-                                markeredgecolor='darkblue', markeredgewidth=2, zorder=3)
-
-                    ax.legend(fontsize=10, loc='upper right')
-                    ax.set_ylabel('Bit Error Rate', fontsize=12)
-
-                # Sample count and statistics
-                improvement_ratio = np.mean(unsync_ber) / (np.mean(diffusion_ber) + 1e-10)
-                better_count = np.sum(diffusion_ber < unsync_ber)
-
-                stats_text = f'Samples: {mask.sum()}\n'
-                stats_text += f'Improvement: {improvement_ratio:.2f}x\n'
-                stats_text += f'Better points: {better_count}/{len(unsync_ber)}\n'
-                stats_text += f'Avg Unsync: {np.mean(unsync_ber):.5f}\n'
-                stats_text += f'Avg Sync: {np.mean(diffusion_ber):.5f}'
-
-                ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
-                        verticalalignment='top', bbox=dict(boxstyle='round',
-                        facecolor='lightgray', alpha=0.9))
-
-            else:
-                print(f"\n{mod_name}: No samples found!")
-                ax.text(0.5, 0.5, f'No {mod_name} samples', transform=ax.transAxes,
-                        ha='center', va='center', fontsize=12)
-
-            ax.set_xlabel('SNR (dB)', fontsize=12)
-            ax.set_title(f'{mod_name} BER Performance\n({mask.sum()} samples)',
-                        fontsize=14, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            ax.set_xlim(-22, 32)
-
-        plt.tight_layout()
-
-        # Log to wandb
-        if hasattr(self, 'logger') and self.logger is not None:
-            logger_class_name = self.logger.__class__.__name__
-            if 'WandbLogger' in logger_class_name:
-                self.logger.experiment.log({
-                    "ber_by_modulation": wandb.Image(fig),
-                    "epoch": self.current_epoch
-                })
-                print("BER by modulation plot logged to WandB")
-
-        # Save locally
-        plot_filename = f'ber_by_modulation_epoch_{self.current_epoch}.png'
-        fig.savefig(plot_filename, dpi=300, bbox_inches='tight')
-        print(f"BER by modulation plot saved as {plot_filename}")
-
         plt.close(fig)
 
     def on_train_epoch_start(self):
@@ -1994,7 +1114,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         if self.current_epoch % self.hparams.log_every_n_epochs == 0:
             self.visualize_sync_progression()
             self.create_umap_visualization()  # Add UMAP visualization
-            self.calculate_ber_analysis()  # Add BER analysis
 
     def configure_optimizers(self):
         """Configure optimizer for joint training"""
@@ -2074,77 +1193,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
         return preds, probs
 
-    def get_sync_and_classification_loss(self, batch):
-        """Get both synchronization and classification losses for analysis"""
-        sync_signals, unsync_signals, labels, snrs, sync_params = batch
-        batch_size = sync_signals.shape[0]
-
-        # Normalize sync parameters
-        true_timing, true_freq, true_phase = sync_params
-        norm_true_timing, norm_true_freq, norm_true_phase = self.normalize_sync_params(
-            true_timing, true_freq, true_phase
-        )
-
-        # Random timesteps for training
-        timesteps = torch.randint(0, self.hparams.num_train_timesteps, (batch_size,), device=self.device)
-        interpolated_signals = self.create_sync_interpolation(sync_signals, unsync_signals, timesteps)
-
-        # Get sync predictions
-        sync_output = self.model(interpolated_signals, timesteps, labels, return_dict=True)
-
-        # Apply corrections
-        synchronized_signals = self.apply_predicted_sync(
-            interpolated_signals,
-            sync_output['timing_offset'],
-            sync_output['freq_offset'],
-            sync_output['phase_offset']
-        )
-
-        # Calculate step-wise sync loss
-        alpha_current = self.get_interpolation_alpha(timesteps).to(self.device)
-        next_timesteps = torch.clamp(timesteps - 1, 0, self.hparams.num_train_timesteps - 1)
-        alpha_next = self.get_interpolation_alpha(next_timesteps).to(self.device)
-        step_alpha = torch.where(timesteps == 0, torch.zeros_like(alpha_current), alpha_current - alpha_next)
-
-        target_timing = norm_true_timing * step_alpha
-        target_freq = norm_true_freq * step_alpha
-        target_phase = norm_true_phase * step_alpha
-
-        sync_loss = (
-            F.mse_loss(sync_output['timing_offset'].squeeze(), target_timing) +
-            F.mse_loss(sync_output['freq_offset'].squeeze(), target_freq) +
-            F.mse_loss(sync_output['phase_offset'].squeeze(), target_phase)
-        )
-
-        # Get classification loss
-        class_logits = self.classifier(synchronized_signals)
-        classification_loss = self.classification_criterion(class_logits, labels)
-
-        return sync_loss, classification_loss, synchronized_signals, class_logits
-
-    def evaluate_sync_quality(self, signals: torch.Tensor, reference_signals: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Evaluate synchronization quality metrics"""
-        with torch.no_grad():
-            # Convert to complex
-            signals_complex = signals[:, 0] + 1j * signals[:, 1]
-            reference_complex = reference_signals[:, 0] + 1j * reference_signals[:, 1]
-
-            # Calculate EVM (Error Vector Magnitude)
-            error_vectors = signals_complex - reference_complex
-            evm = torch.mean(torch.abs(error_vectors) ** 2, dim=1)
-
-            # Calculate constellation tightness (standard deviation of points)
-            constellation_std = torch.std(signals_complex, dim=1)
-
-            # Calculate phase coherence
-            phase_diff = torch.angle(signals_complex[:, 1:]) - torch.angle(signals_complex[:, :-1])
-            phase_coherence = torch.mean(torch.abs(phase_diff), dim=1)
-
-            return {
-                'evm': evm,
-                'constellation_std': constellation_std,
-                'phase_coherence': phase_coherence
-            }
 
 class BaselineClassifier(L.LightningModule):
     """
@@ -2190,6 +1238,7 @@ class BaselineClassifier(L.LightningModule):
         Delegates to the underlying classifier model
         """
         return self.classifier.extract_features(x)
+
     def training_step(self, batch, batch_idx):
         # Unpack batch - use corrupted signals (raw noisy data)
         clean_signals, corrupted_signals, labels, snrs = batch
