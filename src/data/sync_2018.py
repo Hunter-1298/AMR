@@ -205,59 +205,7 @@ def costas_loop(signal, loop_bandwidth=0.05, damping_factor=0.707, modulation_or
         phase_est += freq_est + alpha * error
 
     return output
-def dd_pll(signal, loop_bandwidth=0.005, damping_factor=.707, modulation_order=16):
-    """
-    Decision-Directed PLL for QAM signals.
-    Suitable replacement for Costas Loop when amplitude varies (e.g., QAM16, QAM64).
 
-    Args:
-        signal (np.ndarray): Input complex signal (1D).
-        loop_bandwidth (float): Loop bandwidth (small value like 0.005 or 0.0025).
-        damping_factor (float): Damping factor, typical 0.707.
-        modulation_order (int): QAM order (e.g., 16, 64).
-
-    Returns:
-        corrected_signal: Phase-corrected signal
-        final_freq_offset: Estimated frequency offset (normalized cycles/sample)
-        final_phase_offset: Estimated phase offset (radians)
-    """
-    N = len(signal)
-    phase_est = 0.0
-    freq_est = 0.0
-    output = np.zeros(N, dtype=np.complex64)
-
-    # Loop filter coefficients (same logic as Costas)
-    theta = loop_bandwidth / (damping_factor + 0.25 / damping_factor)
-    d = 1 + 2 * damping_factor * theta + theta**2
-    alpha = (4 * damping_factor * theta) / d
-    beta = (4 * theta**2) / d
-
-    # Generate QAM constellation
-    m = int(np.sqrt(modulation_order))
-    real_levels = np.arange(-(m - 1), m + 1, 2)
-    imag_levels = np.arange(-(m - 1), m + 1, 2)
-    constellation = np.array([r + 1j * i for r in real_levels for i in imag_levels])
-
-    # Normalize constellation energy to 1
-    constellation /= np.sqrt((np.abs(constellation)**2).mean())
-
-    for n in range(N):
-        corrected = signal[n] * np.exp(-1j * phase_est)
-        output[n] = corrected
-
-        # Find nearest QAM symbol
-        nearest = constellation[np.argmin(np.abs(corrected - constellation))]
-        error = np.angle(corrected * np.conj(nearest))
-
-        freq_est += beta * error
-        phase_est += freq_est + alpha * error
-
-    final_phase_offset = (phase_est % (2 * np.pi))
-    if final_phase_offset > np.pi:
-        final_phase_offset -= 2 * np.pi
-    final_freq_offset = freq_est / (2 * np.pi)
-
-    return output, final_freq_offset, final_phase_offset
 # Now we can see that we are not time synces, lets play around with pySDR to lock in these time syncrhinizations first and then go from there
 from scipy import signal
 # Oversample (interpolate) by 16x

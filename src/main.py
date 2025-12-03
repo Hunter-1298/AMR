@@ -1,3 +1,5 @@
+import os
+os.environ['WANDB_API_KEY'] = '7d9e535865aeba7e423af479d17e6a49c14f4f31'
 import hydra
 import sys
 import torch
@@ -20,6 +22,7 @@ from callbacks import (
 )
 from utils.latent_scaling import calculate_latent_scaling_factor
 import os
+from data.torchsig_dataset import get_torchsig_dataloader
 
 
 @hydra.main(config_path="../configs", config_name="hydra-config", version_base="1.1")
@@ -49,7 +52,11 @@ def main(cfg: DictConfig):
     wandb_logger.log_hyperparams(dict(cfg.hyperparams))
 
     # Get original dataloaders
-    train_loader, val_loader, label_names = get_dataloaders(cfg.dataset)
+    if cfg.dataset.torchsig:
+        train_loader, val_loader, label_names = get_torchsig_dataloader()
+        
+    else:
+        train_loader, val_loader, label_names = get_dataloaders(cfg.dataset)
 
     # If we need to train the encoder
     if cfg.train_encoder:
@@ -89,7 +96,6 @@ def main(cfg: DictConfig):
             log_every_n_steps=10,
             accelerator="gpu",
             devices=1,
-            strategy="auto",
             callbacks=[
                 ModelCheckpoint(
                     filename="{dir}{epoch:02d}_{val_loss:.7f}",

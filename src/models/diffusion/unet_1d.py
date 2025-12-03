@@ -17,12 +17,12 @@ class UNet1DModel(nn.Module):
     def __init__(
         self,
         in_channels: int = 2,
-        sample_size: int = 1024,
+        sample_size: int = 4096,
         down_block_types: List[str] = ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"],
         block_out_channels: List[int] = [16, 32, 64],
         layers_per_block: int = 2,
         use_modulation_conditioning: bool = True,
-        num_modulations: int = 3,  # QPSK, 8PSK, 16PSK
+        num_modulations: int = 6,  # QPSK, 8PSK, 16PSK
         num_attention_heads: int = 1,
         # Parameter ranges for normalization
         max_timing_offset: float = 1.0,     # normalized [-1, 1]

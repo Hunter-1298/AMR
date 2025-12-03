@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: Grads_Unet
+run_name: Sync-torchsig0-10epoch-10steps
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -34,16 +34,16 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 20
+    epochs: 7
     classifier_epochs: 100
-    learning_rate: .00001
+    learning_rate: .0001
     batch_size: 64
     contrastive_batch_size: 128
     # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
     hidden_dim: 32
     feature_dim: 16
-    num_classes: 11
+    num_classes: 2
 
 # Paths
 output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
@@ -62,27 +62,36 @@ data_dir: data/
 #     learning_rate: .0001
 #     max_epochs: 5
 
-BaselineClassifier:
-    _target_: models.latent_encoder_models.psk.BaselineClassifier
-    learning_rate: .0005
-    classifier:
-        _target_: models.latent_encoder_models.psk.HybridConvTransformer
-        in_ch: 2
-        num_classes: 3
+# BaselineClassifier:
+#     _target_: models.latent_encoder_models.psk.BaselineClassifier
+#     learning_rate: .0005
+#     classifier:
+#         _target_: models.latent_encoder_models.psk.HybridConvTransformer
+#         in_ch: 2
+#         num_classes: 2
+# Encoder:
+#     _target_: models.latent_encoder_models.psk.BaselineClassifier
+#     learning_rate: .00005
+#     num_classes: 6
+#     classifier:
+#         _target_: models.latent_encoder_models.psk.HybridConvTransformer
+#         in_ch: 2
+#         num_classes: 6
+
 Encoder:
     _target_: models.latent_encoder_models.psk.SelfConditioningDiffusionWithClassifier
-    learning_rate: .0001
+    learning_rate: .00005
     vis_batch_size: ${hyperparams.batch_size}
     num_train_timesteps: 10
-    num_classes: 3
-
+    num_classes: 6
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
-        # sample_size: 1024
-        # in_channels: 2
-        # # out_channels: 2
-        # # out_block: False
-        # # down_block_types:
+        num_modulations: 6
+        sample_size: 4096
+        in_channels: 2
+        # out_channels: 2
+        # out_block: False
+        # down_block_types:
         # #     ["DownResnetBlock1D", "AttnDownBlock1D", "AttnDownBlock1D"]
         # up_block_types: ["AttnUpBlock1D", "AttnUpBlock1D", "UpResnetBlock1D"]
         # mid_block_type: "UNetMidBlock1D"
@@ -113,6 +122,7 @@ ArcFaceLinearProbe:
     embedding_type: "arcface" # 'arcface', 'raw', or 'both'
 
 dataset:
+    torchsig: true
     data: 2018
     iq: true #true
     sync: true

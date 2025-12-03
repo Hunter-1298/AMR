@@ -94,7 +94,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         num_train_timesteps: int = 10,
 
         # Classifier parameters
-        num_classes: int =3,
+        num_classes: int = 4,
         conv_hidden: tuple = (32,64,128),
         trans_dim: int = 256,
         n_heads: int = 8,
@@ -111,7 +111,7 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         classification_start_epoch: int = 0,  # Start classification after sync has some progress
 
         # Normalization parameters
-        sps: int = 8,
+        sps: int = 10,
         max_freq_offset: float = 1e-3,
         normalize_params: bool = True,
 
@@ -183,7 +183,8 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """Training step using classification loss only."""
-        sync_signals, unsync_signals, labels, snrs, sync_params = batch
+        # sync_signals, unsync_signals, labels, snrs, sync_params = batch
+        unsync_signals, (labels, snrs) = batch
 
         # === CLASSIFICATION LOSS ON SYNCHRONIZED SIGNALS ===
         fully_synchronized_signals = self.iterative_synchronization_for_training(
@@ -203,7 +204,8 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
          
     def validation_step(self, batch, batch_idx):
         """Validation step using classification only."""
-        _, unsync_signals, labels, snrs, _ = batch
+        # _, unsync_signals, labels, snrs, _ = batch
+        unsync_signals, (labels, snrs) = batch
 
         # Store first batch for visualization if needed
         if batch_idx == 0 and not self.val_samples_stored:
@@ -1205,7 +1207,7 @@ class BaselineClassifier(L.LightningModule):
         classifier,
         learning_rate: float = 1e-3,
         num_classes: int = 3,
-        label_names: List[str] = ["QPSK", "8PSK", "16PSK"],
+        label_names: List[str] = ["qpsk", "bpsk"],
         **kwargs,
     ):
         super().__init__()
@@ -1218,6 +1220,7 @@ class BaselineClassifier(L.LightningModule):
 
         # Loss function
         self.criterion = nn.CrossEntropyLoss()
+        # self.criterion = nn.CrossEntropyLoss()
 
         # For tracking validation outputs
         self.validation_step_outputs = []
@@ -1241,10 +1244,11 @@ class BaselineClassifier(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # Unpack batch - use corrupted signals (raw noisy data)
-        clean_signals, corrupted_signals, labels, snrs = batch
+        unsync_signals, (labels, snrs) = batch
+
 
         # Classify the raw corrupted signals directly
-        logits = self.classifier(corrupted_signals)
+        logits = self.classifier(unsync_signals)
         loss = self.criterion(logits, labels)
 
         # Calculate accuracy
@@ -1259,10 +1263,10 @@ class BaselineClassifier(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # Unpack batch - use corrupted signals (raw noisy data)
-        clean_signals, corrupted_signals, labels, snrs = batch
+        unsync_signals, (labels, snrs) = batch
 
         # Classify the raw corrupted signals directly
-        logits = self.classifier(corrupted_signals)
+        logits = self.classifier(unsync_signals)
         loss = self.criterion(logits, labels)
 
         # Calculate accuracy
@@ -1302,7 +1306,7 @@ class BaselineClassifier(L.LightningModule):
             "labels": labels.detach().cpu(),
             "snrs": snrs.detach().cpu(),
             "loss": loss.detach().cpu(),
-            "corrupted_signals": corrupted_signals[:4].detach().cpu() if batch_idx == 0 else None,
+            "corrupted_signals": unsync_signals[:4].detach().cpu() if batch_idx == 0 else None,
         })
 
         return loss
@@ -1511,7 +1515,7 @@ class PositionalEncoding(nn.Module):
         return x
 
 class HybridConvTransformer(nn.Module):
-    def __init__(self, in_ch=2, num_classes=24, conv_hidden=(64, 128, 256),
+    def __init__(self, in_ch=2, num_classes=3, conv_hidden=(128, 256, 512),
                  trans_dim=256, n_heads=4, n_layers=3, mlp_hidden=128,
                  use_cls_token=True):
         super().__init__()
@@ -1526,12 +1530,12 @@ class HybridConvTransformer(nn.Module):
 
         # Transformer Input Projection
         self.input_proj = nn.Linear(conv_hidden[-1], trans_dim)
-        self.pos_enc = PositionalEncoding(trans_dim, max_len=129)  # +1 for CLS
+        self.pos_enc = PositionalEncoding(trans_dim, max_len=513)  # +1 for CLS
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=trans_dim, nhead=n_heads,
             dim_feedforward=trans_dim * 4,
-            dropout=0.1, activation="gelu", batch_first=True)
+            dropout=0.2, activation="gelu", batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         # LayerNorm before classifier
@@ -1541,10 +1545,11 @@ class HybridConvTransformer(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(trans_dim, mlp_hidden),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.Linear(mlp_hidden, num_classes),
         )
     def forward(self, x):
+        # x [32,2,4096]
         conv_features = self.conv_extractor(x).permute(0, 2, 1)  # [B, 128, C]
         y = self.input_proj(conv_features)
 

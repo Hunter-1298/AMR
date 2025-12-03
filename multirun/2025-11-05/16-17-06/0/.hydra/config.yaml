@@ -1,0 +1,70 @@
+project_name: Diffusion_Sync_PSK
+run_name: Grads_Unet
+train_encoder: true
+linear_probe_encoder: false
+contrastive_encoder: false
+train_diffusion: false
+conditon: true
+diffusion_contrastive: bottleneck
+vis_diffusion: false
+train_classifier: false
+classifier_free: true
+fine_tune_diffusion: false
+encoder_checkpoint_name: arcface_encoder.ckpt
+diffusion_checkpoint_name: arcface_diffusion.ckpt
+mode: online
+debug: false
+log_model: true
+seed: 42
+hyperparams:
+  epochs: 200
+  classifier_epochs: 100
+  learning_rate: 0.0001
+  batch_size: 64
+  contrastive_batch_size: 128
+  dropout: 0.25
+  hidden_dim: 32
+  feature_dim: 16
+  num_classes: 2
+output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+data_dir: data/
+Encoder:
+  _target_: models.latent_encoder_models.psk.SelfConditioningDiffusionWithClassifier
+  learning_rate: 0.0001
+  vis_batch_size: ${hyperparams.batch_size}
+  num_train_timesteps: 5
+  num_classes: 4
+  unet:
+    _target_: models.diffusion.unet_1d.UNet1DModel
+    num_modulations: 4
+    sample_size: 4096
+    in_channels: 2
+Classifier:
+  _target_: models.classifier.classifier.LatentClassifier
+  learning_rate: 0.0001
+  beta: 0.25
+  fine_tune_diffusion: ${fine_tune_diffusion}
+  num_classes: ${hyperparams.num_classes}
+  classifier_free: ${classifier_free}
+  classifier_head:
+    _target_: models.classifier.rfnet.RFNet
+    num_classes: 11
+    dropout_rate: 0.2
+ArcFaceLinearProbe:
+  _target_: models.classifier.linear_probe.ArcFaceLinearProbe
+  learning_rate: 0.001
+  num_classes: ${hyperparams.num_classes}
+  use_normalized_embeddings: true
+  embedding_type: arcface
+dataset:
+  torchsig: true
+  data: 2018
+  iq: true
+  sync: true
+  batch_size: ${hyperparams.batch_size}
+  contrastive_batch_size: ${hyperparams.contrastive_batch_size}
+  num_workers: 12
+  train_val_split:
+  - 0.8
+  - 0.2
+  random_seed: ${seed}

@@ -1,15 +1,15 @@
 program: src/main.py
-name: testing_timesteps
+name: 0_ timesteps
 method: grid
 metric:
-    name: val/class_loss
+    name: val_acc
     goal: minimize
 parameters:
     Encoder.num_train_timesteps:
-        values: [1, 5, 10, 20]
+        values: [1, 3, 5, 8, 10, 15, 20]
 
 command:
     - ${env}
     - python
     - ${program}
-    - --multirun # allows hydra to accept multiple runs for sweeps
+    - ${args_no_hyphens}

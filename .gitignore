@@ -54,7 +54,7 @@ src/outputs/
 *.json
 *.pkl
 *.h5
-
+datasets/
 # Model checkpoints
 checkpoints/
 *.pt
