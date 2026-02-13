@@ -69,10 +69,11 @@ def get_torchsig_dataloader(
     signal_bandwidth_min: int = 1e6,     
     signal_bandwidth_max: int = 1e6,
     signal_center_freq: int = 0,
-    num_signals_min: int = 2,
-    num_signals_max: int = 2,
-    snr_db_min: float = 0.0,
-    snr_db_max: float = 30.0,
+    num_signals_min: int = 1,
+    num_signals_max: int = 1,
+    snr_db_min: float = 0.00,
+    snr_db_max: float = 30.00,
+    # 4069 / 01 -> 496 -> 10 loops of 64
     sample_rate=10e6,
     seed: int = 123456789
 ):

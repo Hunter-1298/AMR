@@ -1,6 +1,6 @@
 # Global configurations
 project_name: Diffusion_Sync_PSK
-run_name: Sync-torchsig0-10epoch-10steps
+run_name: symbol_Ber
 train_encoder: True
 linear_probe_encoder: False
 # Latent Diffusion Settings #
@@ -34,10 +34,10 @@ seed: 42
 # In your hydra config
 hyperparams:
     # Training
-    epochs: 7
-    classifier_epochs: 100
+    epochs: 200
+    classifier_epochs: 50
     learning_rate: .0001
-    batch_size: 64
+    batch_size: 32
     contrastive_batch_size: 128
     # make this high so we can use all negatives in batch without increase batch for diffusion model
     dropout: 0.25
@@ -80,9 +80,9 @@ data_dir: data/
 
 Encoder:
     _target_: models.latent_encoder_models.psk.SelfConditioningDiffusionWithClassifier
-    learning_rate: .00005
+    learning_rate: .00001
     vis_batch_size: ${hyperparams.batch_size}
-    num_train_timesteps: 10
+    num_train_timesteps: 6
     num_classes: 6
     unet:
         _target_: models.diffusion.unet_1d.UNet1DModel
