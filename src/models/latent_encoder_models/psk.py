@@ -141,7 +141,6 @@ class SelfConditioningDiffusionWithClassifier(L.LightningModule):
         super().__init__()
         # ... (other initializations like model, classifier, loss functions) ...
 
-        # --- FIX: Initialize the Metric ---
         self.val_acc_top1 = Accuracy(task="multiclass", num_classes=num_classes, top_k=1)
         self.save_hyperparameters(ignore=['unet'])
         self.curriculum_epoch = 15
